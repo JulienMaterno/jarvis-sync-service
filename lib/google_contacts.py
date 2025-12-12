@@ -1,5 +1,6 @@
 import os
 import httpx
+import asyncio
 from typing import Dict, Any, List, Optional
 
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -57,6 +58,22 @@ async def get_contact_groups(access_token: str) -> Dict[str, str]:
                 
     return groups_mapping
 
+async def get_contact(access_token: str, resource_name: str) -> Dict[str, Any]:
+    """
+    Fetches a single contact by resource name.
+    """
+    headers = {"Authorization": f"Bearer {access_token}"}
+    fields = "names,emailAddresses,phoneNumbers,birthdays,organizations,urls,memberships,biographies,metadata,addresses"
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{GOOGLE_PEOPLE_API_BASE}/{resource_name}",
+            headers=headers,
+            params={"personFields": fields}
+        )
+        response.raise_for_status()
+        return response.json()
+
 async def get_all_contacts(access_token: str) -> List[Dict[str, Any]]:
     """
     Fetches all connections from Google People API.
@@ -65,7 +82,7 @@ async def get_all_contacts(access_token: str) -> List[Dict[str, Any]]:
     contacts = []
     page_token = None
     
-    fields = "names,emailAddresses,phoneNumbers,birthdays,organizations,urls,memberships,biographies"
+    fields = "names,emailAddresses,phoneNumbers,birthdays,organizations,urls,memberships,biographies,metadata,addresses"
     
     async with httpx.AsyncClient() as client:
         while True:
@@ -98,6 +115,16 @@ def transform_contact(google_contact: Dict[str, Any], group_mapping: Dict[str, s
     Transforms a Google Contact object to the Supabase schema.
     """
     resource_name = google_contact.get("resourceName")
+    etag = google_contact.get("etag")
+    
+    # Metadata for update time
+    metadata = google_contact.get("metadata", {})
+    sources = metadata.get("sources", [])
+    updated_at = None
+    for source in sources:
+        if source.get("type") == "CONTACT":
+            updated_at = source.get("updateTime")
+            break
     
     # Names
     names = google_contact.get("names", [])
@@ -147,6 +174,13 @@ def transform_contact(google_contact: Dict[str, Any], group_mapping: Dict[str, s
     subscribed = False
     location = None
     
+    # Also check addresses for location if not found in groups
+    addresses = google_contact.get("addresses", [])
+    address_location = None
+    if addresses:
+        # Just take the first formatted address or country
+        address_location = addresses[0].get("country") or addresses[0].get("formattedValue")
+
     valid_locations = {'Australia', 'China', 'Germany', 'SEA', 'Other'}
     
     for m in memberships:
@@ -160,6 +194,13 @@ def transform_contact(google_contact: Dict[str, Any], group_mapping: Dict[str, s
                 subscribed = True
             elif group_name in valid_locations:
                 location = group_name
+    
+    # Fallback to address if no group location
+    if not location and address_location:
+        # Simple mapping or just use it if it matches valid locations
+        if address_location in valid_locations:
+            location = address_location
+        # Else maybe map it? For now leave as None if not in valid set
                 
     return {
         "google_resource_name": resource_name,
@@ -174,5 +215,208 @@ def transform_contact(google_contact: Dict[str, Any], group_mapping: Dict[str, s
         "linkedin_url": linkedin_url,
         "notes": notes,
         "subscribed": subscribed,
-        "location": location
+        "location": location,
+        "_etag": etag,
+        "_google_updated_at": updated_at
     }
+
+def transform_to_google_body(data: Dict[str, Any]) -> Dict[str, Any]:
+    body = {}
+    
+    # Names
+    if data.get("first_name") or data.get("last_name"):
+        body["names"] = [{
+            "givenName": data.get("first_name", ""),
+            "familyName": data.get("last_name", "")
+        }]
+        
+    # Emails
+    if data.get("email"):
+        body["emailAddresses"] = [{"value": data["email"]}]
+        
+    # Phones
+    phones = []
+    if data.get("phone"):
+        phones.append({"value": data["phone"]})
+    if data.get("phone_secondary"):
+        phones.append({"value": data["phone_secondary"]})
+    if phones:
+        body["phoneNumbers"] = phones
+        
+    # Orgs
+    if data.get("company") or data.get("job_title"):
+        body["organizations"] = [{
+            "name": data.get("company", ""),
+            "title": data.get("job_title", "")
+        }]
+        
+    # Bio/Notes
+    if data.get("notes"):
+        body["biographies"] = [{"value": data["notes"]}]
+        
+    # Birthday
+    if data.get("birthday"):
+        # Assumes YYYY-MM-DD
+        try:
+            parts = data["birthday"].split("-")
+            if len(parts) == 3:
+                body["birthdays"] = [{
+                    "date": {
+                        "year": int(parts[0]),
+                        "month": int(parts[1]),
+                        "day": int(parts[2])
+                    }
+                }]
+        except:
+            pass
+            
+    # Addresses (Location)
+    if data.get("location"):
+        body["addresses"] = [{"country": data["location"]}]
+
+    return body
+
+def calculate_memberships(
+    target_location: Optional[str], 
+    target_subscribed: bool,
+    existing_memberships: List[Dict[str, Any]],
+    name_to_id_map: Dict[str, str]
+) -> List[Dict[str, Any]]:
+    """
+    Calculates the new list of memberships (labels).
+    Preserves existing labels that are NOT location/subscribed related.
+    """
+    new_memberships = []
+    
+    # Known location labels to remove if switching
+    known_locations = {'Australia', 'China', 'Germany', 'SEA', 'Other'}
+    
+    # 1. Keep existing memberships that are NOT in our managed set
+    for m in existing_memberships:
+        group_info = m.get("contactGroupMembership", {})
+        resource_name = group_info.get("contactGroupResourceName")
+        
+        # We need to know the NAME of this group to decide if we keep it.
+        # But we only have ID -> Name map (inverted).
+        # Wait, we have name_to_id_map. We need id_to_name_map to check existing.
+        # Actually, we can just check if the resource_name matches any of our managed IDs.
+        
+        is_managed = False
+        for loc in known_locations:
+            if name_to_id_map.get(loc) == resource_name:
+                is_managed = True
+                break
+        
+        if name_to_id_map.get("Subscribed") == resource_name:
+            is_managed = True
+            
+        if not is_managed:
+            new_memberships.append(m)
+            
+    # 2. Add new Location label
+    if target_location and target_location in known_locations:
+        group_id = name_to_id_map.get(target_location)
+        if group_id:
+            new_memberships.append({
+                "contactGroupMembership": {
+                    "contactGroupResourceName": group_id
+                }
+            })
+            
+    # 3. Add Subscribed label
+    if target_subscribed:
+        group_id = name_to_id_map.get("Subscribed")
+        if group_id:
+            new_memberships.append({
+                "contactGroupMembership": {
+                    "contactGroupResourceName": group_id
+                }
+            })
+            
+    return new_memberships
+
+async def create_contact(
+    access_token: str, 
+    contact_data: Dict[str, Any],
+    name_to_id_map: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    # Rate limit
+    await asyncio.sleep(0.2) 
+    headers = {"Authorization": f"Bearer {access_token}"}
+    body = transform_to_google_body(contact_data)
+    
+    # Handle Memberships for Create
+    if name_to_id_map:
+        memberships = calculate_memberships(
+            contact_data.get("location"),
+            contact_data.get("subscribed", False),
+            [], # No existing memberships
+            name_to_id_map
+        )
+        if memberships:
+            body["memberships"] = memberships
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{GOOGLE_PEOPLE_API_BASE}/people:createContact",
+            headers=headers,
+            json=body
+        )
+        response.raise_for_status()
+        return response.json()
+
+async def update_contact(
+    access_token: str, 
+    resource_name: str, 
+    contact_data: Dict[str, Any], 
+    etag: str,
+    raw_google_contact: Optional[Dict[str, Any]] = None,
+    name_to_id_map: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    # Rate limit
+    await asyncio.sleep(0.2)
+    headers = {"Authorization": f"Bearer {access_token}"}
+    body = transform_to_google_body(contact_data)
+    body["etag"] = etag
+    
+    # We need to specify which fields to update. 
+    # For simplicity, we'll update all fields we support.
+    update_fields = "names,emailAddresses,phoneNumbers,organizations,biographies,birthdays,addresses"
+    
+    # Handle Memberships for Update
+    if raw_google_contact and name_to_id_map:
+        existing_memberships = raw_google_contact.get("memberships", [])
+        new_memberships = calculate_memberships(
+            contact_data.get("location"),
+            contact_data.get("subscribed", False),
+            existing_memberships,
+            name_to_id_map
+        )
+        body["memberships"] = new_memberships
+        update_fields += ",memberships"
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.patch(
+            f"{GOOGLE_PEOPLE_API_BASE}/{resource_name}:updateContact",
+            headers=headers,
+            params={"updatePersonFields": update_fields},
+            json=body
+        )
+        response.raise_for_status()
+        return response.json()
+
+async def delete_contact(access_token: str, resource_name: str) -> None:
+    """
+    Deletes a contact from Google Contacts.
+    """
+    # Rate limit
+    await asyncio.sleep(0.2)
+    headers = {"Authorization": f"Bearer {access_token}"}
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.delete(
+            f"{GOOGLE_PEOPLE_API_BASE}/{resource_name}:deleteContact",
+            headers=headers
+        )
+        response.raise_for_status()
+
