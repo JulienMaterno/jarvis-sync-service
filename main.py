@@ -1,4 +1,5 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from lib.sync_service import sync_google_contacts_to_supabase
 
 app = FastAPI(title="Jarvis Backend")
 
@@ -12,7 +13,11 @@ async def health_check():
 
 @app.post("/sync/google-contacts")
 async def sync_google_contacts():
-    return {"message": "not implemented"}
+    try:
+        result = await sync_google_contacts_to_supabase()
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/sync/supabase-to-notion")
 async def sync_supabase_to_notion():
