@@ -1,7 +1,13 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.concurrency import run_in_threadpool
 from lib.sync_service import sync_contacts
 from lib.notion_sync import sync_notion_to_supabase, sync_supabase_to_notion
+from backup import backup_contacts
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Jarvis Backend")
 
@@ -48,24 +54,59 @@ async def endpoint_sync_supabase_to_notion():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/sync/all")
-async def sync_everything():
+async def sync_everything(background_tasks: BackgroundTasks):
     """
-    Runs all syncs in order:
-    1. Google -> Supabase (and Supabase -> Google)
-    2. Notion -> Supabase
-    3. Supabase -> Notion
+    Runs all syncs in the correct order:
+    1. Notion -> Supabase (Import new data)
+    2. Google <-> Supabase (Sync with Google)
+    3. Supabase -> Notion (Push updates back)
     """
+    # We run this in the background to avoid timeout on Cloud Run (if it takes > 60s)
+    # However, Cloud Run requires the request to stay open if we want CPU allocated, 
+    # unless we use Cloud Tasks. For simple scheduled jobs, we can just await it 
+    # and increase timeout config.
+    
     results = {}
     try:
-        # 1. Google <-> Supabase (Async)
-        results["google_sync"] = await sync_contacts()
+        logger.info("Starting full sync cycle via API")
         
-        # 2. Notion -> Supabase (Sync, run in threadpool)
+        # 1. Notion -> Supabase (Sync, run in threadpool)
         results["notion_to_supabase"] = await run_in_threadpool(sync_notion_to_supabase)
+        
+        # 2. Google <-> Supabase (Async)
+        results["google_sync"] = await sync_contacts()
         
         # 3. Supabase -> Notion (Sync, run in threadpool)
         results["supabase_to_notion"] = await run_in_threadpool(sync_supabase_to_notion)
         
         return results
     except Exception as e:
+        logger.error(f"Sync failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/backup")
+async def trigger_backup():
+    """
+    Triggers a backup of all contacts to GCS (if configured) and local storage.
+    """
+    try:
+        return await backup_contacts()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Future Modules ---
+
+@app.post("/sync/tasks")
+async def sync_tasks():
+    """
+    Placeholder for Task sync (e.g. Todoist/Notion/Google Tasks)
+    """
+    return {"status": "not_implemented", "message": "Task sync coming soon"}
+
+@app.post("/sync/mail")
+async def sync_mail():
+    """
+    Placeholder for Mail sync (e.g. Gmail -> Supabase)
+    """
+    return {"status": "not_implemented", "message": "Mail sync coming soon"}
+
