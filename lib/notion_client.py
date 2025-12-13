@@ -63,6 +63,7 @@ class NotionClient:
         return response.json()
 
     def retrieve_page(self, page_id: str) -> Dict[str, Any]:
+        """Retrieve a single page by ID to check its archived status."""
         url = f"{self.base_url}/pages/{page_id}"
         response = self.client.get(url)
         response.raise_for_status()
