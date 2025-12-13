@@ -301,6 +301,7 @@ def calculate_memberships(
     """
     Calculates the new list of memberships (labels).
     Preserves existing labels that are NOT location/subscribed related.
+    Always adds "My Contacts" group so contacts appear in the main UI.
     """
     new_memberships = []
     
@@ -309,14 +310,27 @@ def calculate_memberships(
     managed_resource_names = set(name_to_id_map.values())
     
     # 1. Keep existing memberships that are NOT in our managed set
+    # But also preserve "My Contacts" if it exists
+    has_my_contacts = False
     for m in existing_memberships:
         group_info = m.get("contactGroupMembership", {})
         resource_name = group_info.get("contactGroupResourceName")
         
-        if resource_name not in managed_resource_names:
+        if resource_name == "contactGroups/myContacts":
+            has_my_contacts = True
             new_memberships.append(m)
+        elif resource_name not in managed_resource_names:
+            new_memberships.append(m)
+    
+    # 2. Always add "My Contacts" if not already present
+    if not has_my_contacts:
+        new_memberships.append({
+            "contactGroupMembership": {
+                "contactGroupResourceName": "contactGroups/myContacts"
+            }
+        })
             
-    # 2. Add new Location label
+    # 3. Add new Location label
     if target_location:
         # If we have a mapping for this location, add it.
         # If not, the caller should have created it and updated the map!
@@ -328,7 +342,7 @@ def calculate_memberships(
                 }
             })
             
-    # 3. Add Subscribed label
+    # 4. Add Subscribed label
     if target_subscribed:
         group_id = name_to_id_map.get("Subscribed")
         if group_id:
