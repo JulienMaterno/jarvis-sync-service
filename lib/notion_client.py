@@ -62,6 +62,12 @@ class NotionClient:
         response.raise_for_status()
         return response.json()
 
+    def retrieve_page(self, page_id: str) -> Dict[str, Any]:
+        url = f"{self.base_url}/pages/{page_id}"
+        response = self.client.get(url)
+        response.raise_for_status()
+        return response.json()
+
     def search(self, query: Optional[str] = None, filter: Optional[Dict[str, Any]] = None, sort: Optional[Dict[str, Any]] = None, page_size: int = 100, start_cursor: Optional[str] = None) -> Dict[str, Any]:
         url = f"{self.base_url}/search"
         body = {"page_size": page_size}
