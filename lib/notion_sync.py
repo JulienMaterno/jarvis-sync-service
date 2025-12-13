@@ -192,62 +192,55 @@ def transform_supabase_to_notion(contact: Dict[str, Any]) -> Dict[str, Any]:
 def sync_notion_deletions_to_supabase(last_synced_at: Optional[str]):
     """
     Scans for archived Notion pages and soft-deletes them in Supabase.
-    Uses incremental search if last_synced_at is provided.
+    This queries the database directly to check archived status, since archived pages
+    might not update their last_edited_time, causing incremental syncs to miss deletions.
     """
     logger.info("Checking for deleted (archived) pages in Notion...")
     
-    has_more = True
-    start_cursor = None
     deleted_count = 0
     
-    # Sort by last_edited_time desc so we can stop early
-    sort_param = {"direction": "descending", "timestamp": "last_edited_time"}
+    # Strategy: Get all contacts from Supabase that have a notion_page_id,
+    # then check each one in Notion to see if it's archived.
+    # This is more reliable than using the search API with timestamps.
     
-    while has_more:
-        response = notion.search(
-            filter={"property": "object", "value": "page"},
-            sort=sort_param,
-            page_size=100,
-            start_cursor=start_cursor
-        )
+    res = supabase.table("contacts").select("id, notion_page_id, deleted_at").not_.is_("notion_page_id", "null").execute()
+    contacts_with_notion = res.data
+    
+    logger.info(f"Checking {len(contacts_with_notion)} contacts with Notion page IDs...")
+    
+    for contact in contacts_with_notion:
+        page_id = contact.get("notion_page_id")
+        already_deleted = contact.get("deleted_at")
         
-        pages = response.get("results", [])
-        if not pages:
-            break
+        # Skip if already marked as deleted in Supabase
+        if already_deleted:
+            continue
             
-        for page in pages:
-            last_edited = page.get("last_edited_time")
+        try:
+            # Retrieve the page from Notion
+            page = notion.retrieve_page(page_id)
             
-            # Optimization: Stop if we reached pages older than last sync
-            if last_synced_at and last_edited < last_synced_at:
-                has_more = False
-                break
+            # Check if it's archived
+            if page.get("archived"):
+                logger.info(f"Found archived Notion page {page_id}. Soft-deleting in Supabase.")
+                supabase.table("contacts").update({
+                    "deleted_at": datetime.now(timezone.utc).isoformat(),
+                    "last_sync_source": "notion"
+                }).eq("id", contact["id"]).execute()
+                deleted_count += 1
                 
-            # Check if it belongs to our DB
-            parent = page.get("parent", {})
-            p_db_id = parent.get("database_id")
-            
-            # Normalize IDs for comparison
-            if p_db_id and p_db_id.replace("-", "") == notion_database_id.replace("-", ""):
-                if page.get("archived"):
-                    # This page is archived and recent. Soft delete in Supabase.
-                    page_id = page.get("id")
-                    
-                    # Check if it exists and is not already deleted
-                    res = supabase.table("contacts").select("id, deleted_at").eq("notion_page_id", page_id).execute()
-                    if res.data:
-                        contact = res.data[0]
-                        if not contact.get("deleted_at"):
-                            logger.info(f"Found archived Notion page {page_id}. Soft-deleting in Supabase.")
-                            supabase.table("contacts").update({
-                                "deleted_at": datetime.now(timezone.utc).isoformat(),
-                                "last_sync_source": "notion"
-                            }).eq("id", contact["id"]).execute()
-                            deleted_count += 1
-        
-        if has_more:
-            has_more = response.get("has_more")
-            start_cursor = response.get("next_cursor")
+        except Exception as e:
+            # If we get a 404 or "object not found", it means the page was deleted
+            error_msg = str(e).lower()
+            if "404" in error_msg or "could not find" in error_msg or "object not found" in error_msg:
+                logger.info(f"Notion page {page_id} not found (deleted). Soft-deleting in Supabase.")
+                supabase.table("contacts").update({
+                    "deleted_at": datetime.now(timezone.utc).isoformat(),
+                    "last_sync_source": "notion"
+                }).eq("id", contact["id"]).execute()
+                deleted_count += 1
+            else:
+                logger.error(f"Error checking Notion page {page_id}: {e}")
             
     logger.info(f"Processed {deleted_count} Notion deletions.")
 

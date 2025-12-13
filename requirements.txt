@@ -4,5 +4,4 @@ python-dotenv
 supabase
 httpx
 notion-client
-google-cloud-storage
 gunicorn

@@ -12,14 +12,12 @@ This guide explains how to deploy the Jarvis Backend to Google Cloud Run and set
     *   Cloud Scheduler API
     *   Google People API (already done)
 
-## Step 1: Create a GCS Bucket for Backups
+## Step 1: Create a Supabase Storage Bucket
 
 Since Cloud Run is ephemeral, we need a place to store backups.
 
-```bash
-# Replace [YOUR_BUCKET_NAME] with a unique name (e.g., jarvis-backups-123)
-gcloud storage buckets create gs://[YOUR_BUCKET_NAME] --location=us-central1
-```
+1.  Go to your Supabase Dashboard -> Storage.
+2.  Create a new public bucket named `backups`.
 
 ## Step 2: Deploy to Cloud Run
 
@@ -29,9 +27,9 @@ Run the following command to deploy. You will need to provide your environment v
 gcloud run deploy jarvis-backend \
   --source . \
   --platform managed \
-  --region us-central1 \
+  --region asia-southeast1 \
   --allow-unauthenticated \
-  --set-env-vars SUPABASE_URL="[YOUR_URL]",SUPABASE_KEY="[YOUR_KEY]",NOTION_TOKEN="[YOUR_TOKEN]",NOTION_DATABASE_ID="[YOUR_DB_ID]",GOOGLE_CLIENT_ID="[YOUR_ID]",GOOGLE_CLIENT_SECRET="[YOUR_SECRET]",GOOGLE_REFRESH_TOKEN="[YOUR_TOKEN]",GCS_BACKUP_BUCKET="[YOUR_BUCKET_NAME]"
+  --set-env-vars SUPABASE_URL="[YOUR_URL]",SUPABASE_KEY="[YOUR_KEY]",NOTION_TOKEN="[YOUR_TOKEN]",NOTION_DATABASE_ID="[YOUR_DB_ID]",GOOGLE_CLIENT_ID="[YOUR_ID]",GOOGLE_CLIENT_SECRET="[YOUR_SECRET]",GOOGLE_REFRESH_TOKEN="[YOUR_TOKEN]"
 ```
 
 *Note: For better security, use `--no-allow-unauthenticated` and set up a service account for the scheduler, but for simplicity, we start with unauthenticated access if you want to trigger it easily.*
@@ -42,10 +40,11 @@ gcloud run deploy jarvis-backend \
 
 ```bash
 gcloud scheduler jobs create http jarvis-sync-hourly \
-  --schedule "0 * * * *" \
+  --schedule "*/15 * * * *" \
   --uri "https://[YOUR-CLOUD-RUN-URL]/sync/all" \
   --http-method POST \
-  --time-zone "UTC"
+  --time-zone "Asia/Singapore" \
+  --location asia-southeast1
 ```
 
 ### 2. Backup Once a Week (e.g., Sunday at 2 AM)
@@ -55,7 +54,8 @@ gcloud scheduler jobs create http jarvis-backup-weekly \
   --schedule "0 2 * * 0" \
   --uri "https://[YOUR-CLOUD-RUN-URL]/backup" \
   --http-method POST \
-  --time-zone "UTC"
+  --time-zone "Asia/Singapore" \
+  --location asia-southeast1
 ```
 
 ## Future Modules
