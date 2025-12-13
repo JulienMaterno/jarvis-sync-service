@@ -203,6 +203,14 @@ async def sync_contacts():
                                 needs_update = True
                                 break
                         
+                        # Also check if contact needs to be added to My Contacts
+                        if not needs_update:
+                            memberships = google_contact.get("memberships", [])
+                            groups = [m.get("contactGroupMembership", {}).get("contactGroupResourceName") for m in memberships]
+                            if "contactGroups/myContacts" not in groups:
+                                needs_update = True
+                                logger.info(f"Contact {sb_contact.get('email')} needs to be added to My Contacts")
+                        
                         if needs_update:
                             logger.info(f"Updating Google contact {resource_name} (Supabase is newer/different)")
                             
