@@ -6,42 +6,31 @@ from datetime import datetime
 from lib.supabase_client import supabase
 from lib.logging_service import log_sync_event
 
-try:
-    from google.cloud import storage
-    GCS_AVAILABLE = True
-except ImportError:
-    GCS_AVAILABLE = False
-
 BACKUP_DIR = "backups"
+SUPABASE_BUCKET = "backups"
 
-async def upload_to_gcs(filename: str, content: str, content_type: str):
+async def upload_to_supabase_storage(filename: str, content: bytes, content_type: str):
     """
-    Uploads content to Google Cloud Storage.
+    Uploads content to Supabase Storage.
     """
-    bucket_name = os.environ.get("GCS_BACKUP_BUCKET")
-    if not bucket_name:
-        print("Skipping GCS upload: GCS_BACKUP_BUCKET not set.")
-        return
-
-    if not GCS_AVAILABLE:
-        print("Skipping GCS upload: google-cloud-storage not installed.")
-        return
-
     try:
-        client = storage.Client()
-        bucket = client.bucket(bucket_name)
-        blob = bucket.blob(filename)
-        blob.upload_from_string(content, content_type=content_type)
-        print(f"Uploaded {filename} to GCS bucket {bucket_name}")
-        await log_sync_event("backup_upload", "success", f"Uploaded {filename} to GCS")
+        # Note: Supabase Storage operations are synchronous in the Python client
+        # We use 'upsert': 'true' to overwrite if exists (though timestamps make filenames unique)
+        res = supabase.storage.from_(SUPABASE_BUCKET).upload(
+            path=filename,
+            file=content,
+            file_options={"content-type": content_type, "upsert": "true"}
+        )
+        print(f"Uploaded {filename} to Supabase Storage bucket '{SUPABASE_BUCKET}'")
+        await log_sync_event("backup_upload", "success", f"Uploaded {filename} to Supabase Storage")
     except Exception as e:
-        print(f"GCS upload failed: {e}")
-        await log_sync_event("backup_upload", "error", f"GCS upload failed: {str(e)}")
+        print(f"Supabase Storage upload failed: {e}")
+        await log_sync_event("backup_upload", "error", f"Supabase Storage upload failed: {str(e)}")
 
 async def backup_contacts():
     """
     Fetches all contacts from Supabase and saves them to a local JSON and CSV file.
-    Also uploads to GCS if configured.
+    Also uploads to Supabase Storage.
     """
     try:
         print("Starting backup...")
@@ -75,8 +64,9 @@ async def backup_contacts():
             f.write(json_content)
         print(f"Saved JSON backup to {json_path}")
         
-        # Upload JSON to GCS
-        await upload_to_gcs(json_filename, json_content, "application/json")
+        # Upload JSON to Supabase Storage
+        # Convert string to bytes for upload
+        await upload_to_supabase_storage(json_filename, json_content.encode('utf-8'), "application/json")
         
         # 2. Save as CSV
         if contacts:
@@ -99,8 +89,8 @@ async def backup_contacts():
                 f.write(csv_content)
             print(f"Saved CSV backup to {csv_path}")
             
-            # Upload CSV to GCS
-            await upload_to_gcs(csv_filename, csv_content, "text/csv")
+            # Upload CSV to Supabase Storage
+            await upload_to_supabase_storage(csv_filename, csv_content.encode('utf-8'), "text/csv")
             
         await log_sync_event("backup", "success", f"Backup created: {len(contacts)} contacts")
         return {"status": "success", "count": len(contacts), "timestamp": timestamp}
