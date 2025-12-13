@@ -276,6 +276,22 @@ def transform_to_google_body(data: Dict[str, Any]) -> Dict[str, Any]:
 
     return body
 
+async def create_contact_group(access_token: str, name: str) -> Dict[str, Any]:
+    """
+    Creates a new contact group (label).
+    """
+    headers = {"Authorization": f"Bearer {access_token}"}
+    body = {"contactGroup": {"name": name}}
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{GOOGLE_PEOPLE_API_BASE}/contactGroups",
+            headers=headers,
+            json=body
+        )
+        response.raise_for_status()
+        return response.json()
+
 def calculate_memberships(
     target_location: Optional[str], 
     target_subscribed: bool,
@@ -288,33 +304,22 @@ def calculate_memberships(
     """
     new_memberships = []
     
-    # Known location labels to remove if switching
-    known_locations = {'Australia', 'China', 'Germany', 'SEA', 'Other'}
+    # We treat ANY label in our name_to_id_map as "managed" by us.
+    # This allows dynamic locations.
+    managed_resource_names = set(name_to_id_map.values())
     
     # 1. Keep existing memberships that are NOT in our managed set
     for m in existing_memberships:
         group_info = m.get("contactGroupMembership", {})
         resource_name = group_info.get("contactGroupResourceName")
         
-        # We need to know the NAME of this group to decide if we keep it.
-        # But we only have ID -> Name map (inverted).
-        # Wait, we have name_to_id_map. We need id_to_name_map to check existing.
-        # Actually, we can just check if the resource_name matches any of our managed IDs.
-        
-        is_managed = False
-        for loc in known_locations:
-            if name_to_id_map.get(loc) == resource_name:
-                is_managed = True
-                break
-        
-        if name_to_id_map.get("Subscribed") == resource_name:
-            is_managed = True
-            
-        if not is_managed:
+        if resource_name not in managed_resource_names:
             new_memberships.append(m)
             
     # 2. Add new Location label
-    if target_location and target_location in known_locations:
+    if target_location:
+        # If we have a mapping for this location, add it.
+        # If not, the caller should have created it and updated the map!
         group_id = name_to_id_map.get(target_location)
         if group_id:
             new_memberships.append({

@@ -8,23 +8,9 @@ from lib.supabase_client import supabase
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-NOTION_TO_SUPABASE_LOCATION = {
-    "Australia": "Australia",
-    "Germany": "Germany",
-    "China": "China",
-    "🇨🇳": "China",
-    "Singapore": "SEA",
-    "Bali": "SEA",
-    "SEA": "SEA",
-    "Other": "Other",
-}
-
-SUPABASE_TO_NOTION_LOCATION = {
-    "Australia": "Australia",
-    "Germany": "Germany",
-    "China": "China",
-    "SEA": "SEA",
-    "Other": "Other",
+# Core fields that map directly to Supabase columns
+CORE_FIELDS = {
+    "Name", "Mail", "Birthday", "Company", "Position", "LinkedIn URL", "Location", "Subscribed?"
 }
 
 def get_all_notion_contacts(filter_params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -50,9 +36,37 @@ def get_all_notion_contacts(filter_params: Optional[Dict[str, Any]] = None) -> L
         
     return results
 
+def extract_property_value(prop: Dict[str, Any]) -> Any:
+    """
+    Helper to extract raw value from Notion property based on type.
+    """
+    prop_type = prop.get("type")
+    if prop_type == "title":
+        return prop.get("title", [{}])[0].get("plain_text", "") if prop.get("title") else ""
+    elif prop_type == "rich_text":
+        return prop.get("rich_text", [{}])[0].get("plain_text", "") if prop.get("rich_text") else ""
+    elif prop_type == "email":
+        return prop.get("email")
+    elif prop_type == "phone_number":
+        return prop.get("phone_number")
+    elif prop_type == "url":
+        return prop.get("url")
+    elif prop_type == "select":
+        return prop.get("select", {}).get("name") if prop.get("select") else None
+    elif prop_type == "multi_select":
+        return [opt.get("name") for opt in prop.get("multi_select", [])]
+    elif prop_type == "date":
+        return prop.get("date", {}).get("start") if prop.get("date") else None
+    elif prop_type == "checkbox":
+        return prop.get("checkbox")
+    elif prop_type == "number":
+        return prop.get("number")
+    return None
+
 def transform_notion_to_supabase(page: Dict[str, Any]) -> Dict[str, Any]:
     """
     Maps Notion page properties to Supabase columns.
+    Handles dynamic properties via JSONB.
     """
     props = page.get("properties", {})
     
@@ -84,15 +98,22 @@ def transform_notion_to_supabase(page: Dict[str, Any]) -> Dict[str, Any]:
     linkedin_prop = props.get("LinkedIn URL", {}).get("url")
     linkedin_url = linkedin_prop if linkedin_prop else None
     
-    # Location
+    # Location (Dynamic)
     location_prop = props.get("Location", {}).get("select")
-    location_val = location_prop.get("name") if location_prop else None
-    location = NOTION_TO_SUPABASE_LOCATION.get(location_val, "Other") if location_val else None
+    location = location_prop.get("name") if location_prop else None
     
     # Subscribed
     subscribed_prop = props.get("Subscribed?", {}).get("checkbox")
     subscribed = subscribed_prop if subscribed_prop is not None else False
     
+    # Dynamic Properties (JSONB)
+    notion_properties = {}
+    for key, prop in props.items():
+        if key not in CORE_FIELDS:
+            val = extract_property_value(prop)
+            if val is not None and val != "":
+                notion_properties[key] = val
+
     return {
         "notion_page_id": page.get("id"),
         "first_name": first_name,
@@ -104,6 +125,7 @@ def transform_notion_to_supabase(page: Dict[str, Any]) -> Dict[str, Any]:
         "linkedin_url": linkedin_url,
         "location": location,
         "subscribed": subscribed,
+        "notion_properties": notion_properties,
         "notion_updated_at": page.get("last_edited_time"),
         "last_sync_source": "notion"
     }
@@ -139,15 +161,31 @@ def transform_supabase_to_notion(contact: Dict[str, Any]) -> Dict[str, Any]:
     if contact.get("linkedin_url"):
         props["LinkedIn URL"] = {"url": contact["linkedin_url"]}
         
-    # Location
+    # Location (Dynamic)
     sb_loc = contact.get("location")
     if sb_loc:
-        notion_loc = SUPABASE_TO_NOTION_LOCATION.get(sb_loc, "Other")
-        props["Location"] = {"select": {"name": notion_loc}}
+        props["Location"] = {"select": {"name": sb_loc}}
         
     # Subscribed
     if contact.get("subscribed") is not None:
         props["Subscribed?"] = {"checkbox": contact["subscribed"]}
+        
+    # Dynamic Properties (JSONB)
+    # Note: We can't easily create new columns in Notion via API if they don't exist.
+    # But if they exist, we can update them.
+    # For now, we assume the columns exist in Notion if they are in the JSON.
+    # We need to know the TYPE to format the payload correctly.
+    # Since we don't store the type in JSON, this is tricky.
+    # Strategy: We only sync back what we know. 
+    # If the user added a column in Notion, it synced to JSON.
+    # If we want to sync it back, we need to know how to format it.
+    # For this iteration, we will SKIP syncing JSON back to Notion to avoid errors,
+    # unless we implement a schema fetcher.
+    # Given the prompt "This one should then be synced to supabase as well but not to google contacts",
+    # it implies One-Way for extra columns (Notion -> Supabase).
+    # So we don't need to unpack JSON back to Notion.
+    
+    return props
         
     return props
 
