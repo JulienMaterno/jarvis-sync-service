@@ -20,7 +20,6 @@ import os
 import logging
 import argparse
 import time
-import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
@@ -28,15 +27,15 @@ import httpx
 
 load_dotenv()
 
-# Import logging service
+# Import logging service - use sync version to avoid event loop issues
 try:
     import sys
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-    from lib.logging_service import log_sync_event
+    from lib.logging_service import log_sync_event_sync
     HAS_LOGGING_SERVICE = True
 except ImportError:
     HAS_LOGGING_SERVICE = False
-    async def log_sync_event(event_type, status, message, **kwargs):
+    def log_sync_event_sync(event_type, status, message, **kwargs):
         """Fallback if logging service not available"""
         pass
 
@@ -908,10 +907,10 @@ def sync_notion_to_supabase(
                     meeting_data['last_sync_source'] = 'notion'  # Track sync direction
                     supabase.update_meeting(existing['id'], meeting_data)
                     updated += 1
-                    asyncio.create_task(log_sync_event(
+                    log_sync_event_sync(
                         "update_supabase_meeting", "success",
                         f"Updated meeting '{meeting_data['title']}' from Notion"
-                    ))
+                    )
                 else:
                     logger.debug(f"Skipping (content unchanged): {meeting_data['title']}")
                     skipped += 1
@@ -924,10 +923,10 @@ def sync_notion_to_supabase(
                 logger.info(f"Creating: {meeting_data['title']}")
                 supabase.create_meeting(meeting_data)
                 created += 1
-                asyncio.create_task(log_sync_event(
+                log_sync_event_sync(
                     "create_supabase_meeting", "success",
                     f"Created meeting '{meeting_data['title']}' from Notion"
-                ))
+                )
                 
         except Exception as e:
             logger.error(f"Error syncing Notion page {page_id} ({page.get('properties', {}).get('Meeting', {}).get('title', [{}])[0].get('plain_text', 'Unknown')}): {e}")
@@ -1079,10 +1078,10 @@ def sync_supabase_to_notion(
                             'last_sync_source': 'supabase'  # Track sync direction
                         })
                         updated += 1
-                        asyncio.create_task(log_sync_event(
+                        log_sync_event_sync(
                             "update_notion_meeting", "success",
                             f"Updated Notion page for '{meeting['title']}'"
-                        ))
+                        )
                     else:
                         logger.debug(f"Skipping (content unchanged): {meeting['title']}")
                         skipped += 1
@@ -1110,10 +1109,10 @@ def sync_supabase_to_notion(
                         'last_sync_source': 'supabase'  # Track sync direction
                     })
                     created += 1
-                    asyncio.create_task(log_sync_event(
+                    log_sync_event_sync(
                         "create_notion_meeting", "success",
                         f"Created Notion page for '{meeting['title']}'"
-                    ))
+                    )
                 except Exception as create_error:
                     # If creation fails with blocks, try without blocks
                     logger.warning(f"Failed with blocks, trying without: {create_error}")
@@ -1153,10 +1152,10 @@ def run_sync(full_sync: bool = False, since_hours: int = 24):
     logger.info("=" * 60)
     
     # Log sync start
-    asyncio.create_task(log_sync_event(
+    log_sync_event_sync(
         "meeting_sync_start", "info",
         f"Starting {'full' if full_sync else 'incremental'} meeting sync"
-    ))
+    )
     
     try:
         # Initialize clients
@@ -1193,10 +1192,10 @@ def run_sync(full_sync: bool = False, since_hours: int = 24):
         logger.info("=" * 60)
         
         # Log sync completion
-        asyncio.create_task(log_sync_event(
+        log_sync_event_sync(
             "meeting_sync_complete", "success",
             f"Sync complete: {total_ops} operations in {elapsed:.1f}s"
-        ))
+        )
         
         return {
             'success': True,

@@ -1,5 +1,26 @@
+# Environment
 .env
-__pycache__/
-.venv/
+.env.local
 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Local data
 backups/
+*.log
+*.csv
+*.json.backup
+
+# OS
+.DS_Store
+Thumbs.db
