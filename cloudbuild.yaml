@@ -17,7 +17,7 @@ steps:
       - '--image'
       - 'gcr.io/$PROJECT_ID/jarvis-backend:$COMMIT_SHA'
       - '--region'
-      - 'us-central1'
+      - 'asia-southeast1'
       - '--platform'
       - 'managed'
       # We don't set env vars here; they are managed in the Cloud Run service settings

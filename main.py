@@ -5,6 +5,9 @@ from lib.notion_sync import sync_notion_to_supabase, sync_supabase_to_notion
 from backup import backup_contacts
 import logging
 
+# Import meeting sync
+from sync_meetings_bidirectional import run_sync as run_meeting_sync
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -92,6 +95,25 @@ async def trigger_backup():
     try:
         return await backup_contacts()
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Meeting Sync ---
+
+@app.post("/sync/meetings")
+async def sync_meetings(full: bool = False, hours: int = 24):
+    """
+    Bidirectional sync between Notion and Supabase for meetings.
+    
+    Args:
+        full: If True, performs full sync. If False, incremental sync.
+        hours: For incremental sync, how many hours to look back (default 24).
+    """
+    try:
+        logger.info(f"Starting meeting sync via API (full={full}, hours={hours})")
+        result = await run_in_threadpool(run_meeting_sync, full_sync=full, since_hours=hours)
+        return result
+    except Exception as e:
+        logger.error(f"Meeting sync failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # --- Future Modules ---
