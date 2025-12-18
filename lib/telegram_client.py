@@ -2,6 +2,7 @@ import os
 import httpx
 import logging
 import asyncio
+import traceback
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,18 @@ async def send_telegram_message(text: str):
 
 async def notify_error(context: str, error: str):
     """
-    Sends an error alert.
+    Sends an error alert with traceback if available.
     """
-    message = f"🚨 **Error in {context}**\n\n`{error}`"
+    # Get full traceback
+    tb = traceback.format_exc()
+    
+    # If the error string is just the message, the traceback gives more context.
+    # If traceback is "NoneType: None", it means no active exception, so just use the error msg.
+    if "NoneType: None" in tb:
+        details = error
+    else:
+        # Truncate traceback to avoid Telegram message limit (4096 chars)
+        details = f"{error}\n\nTraceback:\n{tb}"[:3000]
+
+    message = f"🚨 **Error in {context}**\n\n```\n{details}\n```"
     await send_telegram_message(message)
