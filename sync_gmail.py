@@ -26,9 +26,12 @@ class GmailSync:
             query = f"after:{date_query}"
             
             # List messages (IDs only)
+            # include_spam_trash=True allows us to track emails moved to Trash/Spam
+            # and update their labels accordingly (e.g. adding 'TRASH' label)
             messages_meta = await self.gmail_client.list_messages(
                 query=query,
-                max_results=max_results
+                max_results=max_results,
+                include_spam_trash=True
             )
             
             if not messages_meta:
@@ -151,26 +154,20 @@ class GmailSync:
                         logger.info(f"Inserted {len(batch)} new emails")
                         
                 if to_update:
-                    for i in range(0, len(to_update), batch_size):
-                        batch = to_update[i:i+batch_size]
-                        # For updates, we can't use upsert easily with partial data if we are unsure of behavior.
-                        # But actually, postgrest `upsert` DOES merge if you provide the ID.
-                        # However, to be 100% safe and efficient:
-                        # We can just upsert them. If I send {"id": 1, "label_ids": [...]}, it should update only label_ids?
-                        # No, PostgREST (Supabase) upsert replaces the row unless you use `ignoreDuplicates`.
-                        # It does NOT do a partial patch on upsert.
-                        # So we must use `.update()` for existing rows.
-                        # But `.update()` doesn't support bulk update with different values easily in one request 
-                        # (unless we use a custom RPC or complex query).
-                        # We have to loop updates? That's slow.
-                        # OR: We fetch the existing row, merge in memory, and upsert full row.
-                        # That defeats the bandwidth saving purpose (we didn't fetch full body).
-                        
-                        # Compromise: For now, let's just loop updates for existing emails. 
-                        # It's 15 mins sync, likely few emails change labels.
-                        for item in batch:
-                            supabase.table("emails").update(item).eq("google_message_id", item["google_message_id"]).execute()
-                        logger.info(f"Updated {len(batch)} existing emails")
+                    # Parallelize updates to speed up processing
+                    # We use a semaphore to limit concurrency to avoid overwhelming Supabase/Network
+                    sem = asyncio.Semaphore(10)
+                    
+                    async def update_item(item):
+                        async with sem:
+                            # We wrap the blocking Supabase call in a thread
+                            await asyncio.to_thread(
+                                lambda: supabase.table("emails").update(item).eq("google_message_id", item["google_message_id"]).execute()
+                            )
+
+                    tasks = [update_item(item) for item in to_update]
+                    await asyncio.gather(*tasks)
+                    logger.info(f"Updated {len(to_update)} existing emails")
 
             await log_sync_event("gmail_sync", "success", f"Synced {len(upsert_data)} emails")
             return {"status": "success", "count": len(upsert_data)}
