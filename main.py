@@ -3,6 +3,8 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.concurrency import run_in_threadpool
 from lib.sync_service import sync_contacts
 from lib.notion_sync import sync_notion_to_supabase, sync_supabase_to_notion
+from lib.telegram_client import notify_error
+from reports import generate_daily_report
 from backup import backup_contacts
 import logging
 
@@ -87,6 +89,8 @@ async def sync_everything(background_tasks: BackgroundTasks):
         except Exception as e:
             logger.error(f"{name} failed: {e}")
             results[name] = {"status": "error", "error": str(e)}
+            # Notify on error
+            background_tasks.add_task(notify_error, name, str(e))
 
     # === CONTACTS SYNC ===
     await run_step("notion_to_supabase", sync_notion_to_supabase)
@@ -109,6 +113,18 @@ async def sync_everything(background_tasks: BackgroundTasks):
     await run_step("gmail_sync", run_gmail_sync)
     
     return results
+
+@app.post("/report/daily")
+async def daily_report(background_tasks: BackgroundTasks):
+    """
+    Generates and sends the daily sync report via Telegram.
+    """
+    try:
+        # Run in background to avoid timeout
+        background_tasks.add_task(generate_daily_report)
+        return {"status": "queued", "message": "Daily report generation started"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/backup")
 async def trigger_backup():
