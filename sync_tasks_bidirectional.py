@@ -20,6 +20,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
 import httpx
+from lib.utils import retry_on_error_sync
 
 load_dotenv()
 
@@ -46,7 +47,7 @@ logger = logging.getLogger('TaskSync')
 # ============================================================================
 
 NOTION_API_TOKEN = os.environ.get('NOTION_API_TOKEN')
-NOTION_TASKS_DB_ID = '2b3cd3f1-eb28-8004-a33a-d26b8bb3fa58'
+NOTION_TASKS_DB_ID = os.environ.get('NOTION_TASKS_DB_ID', '2b3cd3f1-eb28-8004-a33a-d26b8bb3fa58')
 
 SUPABASE_URL = os.environ.get('SUPABASE_URL')
 SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
@@ -80,6 +81,7 @@ class NotionClient:
         }
         self.client = httpx.Client(headers=self.headers, timeout=30.0)
     
+    @retry_on_error_sync()
     def query_database(
         self, 
         database_id: str, 
@@ -119,12 +121,14 @@ class NotionClient:
         
         return results
     
+    @retry_on_error_sync()
     def get_page(self, page_id: str) -> Dict:
         """Get a single page by ID."""
         response = self.client.get(f'https://api.notion.com/v1/pages/{page_id}')
         response.raise_for_status()
         return response.json()
     
+    @retry_on_error_sync()
     def create_page(self, database_id: str, properties: Dict) -> Dict:
         """Create a new page in a database."""
         body = {
@@ -135,6 +139,7 @@ class NotionClient:
         response.raise_for_status()
         return response.json()
     
+    @retry_on_error_sync()
     def update_page(self, page_id: str, properties: Dict) -> Dict:
         """Update an existing page."""
         response = self.client.patch(

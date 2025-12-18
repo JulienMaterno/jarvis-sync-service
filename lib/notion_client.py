@@ -1,9 +1,13 @@
 import os
 import httpx
+import logging
 from dotenv import load_dotenv
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Generator
+from lib.utils import retry_on_error_sync
 
 load_dotenv()
+
+logger = logging.getLogger("NotionClient")
 
 notion_token = os.environ.get("NOTION_API_TOKEN")
 notion_database_id = os.environ.get("NOTION_CRM_DATABASE_ID")
@@ -22,6 +26,7 @@ class NotionClient:
         }
         self.client = httpx.Client(headers=self.headers, timeout=30.0)
 
+    @retry_on_error_sync()
     def query_database(self, database_id: str, page_size: int = 100, start_cursor: Optional[str] = None, filter: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{self.base_url}/databases/{database_id}/query"
         body = {"page_size": page_size}
@@ -34,16 +39,36 @@ class NotionClient:
         response.raise_for_status()
         return response.json()
 
-    def create_page(self, parent: Dict[str, Any], properties: Dict[str, Any]) -> Dict[str, Any]:
+    def query_database_all(self, database_id: str, filter: Optional[Dict[str, Any]] = None) -> Generator[Dict[str, Any], None, None]:
+        """
+        Yields all pages from a database, handling pagination automatically.
+        """
+        has_more = True
+        start_cursor = None
+        
+        while has_more:
+            data = self.query_database(database_id, start_cursor=start_cursor, filter=filter)
+            for page in data.get("results", []):
+                yield page
+            
+            has_more = data.get("has_more", False)
+            start_cursor = data.get("next_cursor")
+
+    @retry_on_error_sync()
+    def create_page(self, parent: Dict[str, Any], properties: Dict[str, Any], children: Optional[List[Dict]] = None) -> Dict[str, Any]:
         url = f"{self.base_url}/pages"
         body = {
             "parent": parent,
             "properties": properties
         }
+        if children:
+            body["children"] = children
+            
         response = self.client.post(url, json=body)
         response.raise_for_status()
         return response.json()
 
+    @retry_on_error_sync()
     def update_page(self, page_id: str, properties: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.base_url}/pages/{page_id}"
         body = {
@@ -53,6 +78,7 @@ class NotionClient:
         response.raise_for_status()
         return response.json()
 
+    @retry_on_error_sync()
     def archive_page(self, page_id: str) -> Dict[str, Any]:
         url = f"{self.base_url}/pages/{page_id}"
         body = {
@@ -62,6 +88,7 @@ class NotionClient:
         response.raise_for_status()
         return response.json()
 
+    @retry_on_error_sync()
     def retrieve_page(self, page_id: str) -> Dict[str, Any]:
         """Retrieve a single page by ID to check its archived status."""
         url = f"{self.base_url}/pages/{page_id}"
@@ -69,6 +96,7 @@ class NotionClient:
         response.raise_for_status()
         return response.json()
 
+    @retry_on_error_sync()
     def search(self, query: Optional[str] = None, filter: Optional[Dict[str, Any]] = None, sort: Optional[Dict[str, Any]] = None, page_size: int = 100, start_cursor: Optional[str] = None) -> Dict[str, Any]:
         url = f"{self.base_url}/search"
         body = {"page_size": page_size}
@@ -82,6 +110,14 @@ class NotionClient:
             body["start_cursor"] = start_cursor
             
         response = self.client.post(url, json=body)
+        response.raise_for_status()
+        return response.json()
+
+    @retry_on_error_sync()
+    def append_block_children(self, block_id: str, children: List[Dict[str, Any]]) -> Dict[str, Any]:
+        url = f"{self.base_url}/blocks/{block_id}/children"
+        body = {"children": children}
+        response = self.client.patch(url, json=body)
         response.raise_for_status()
         return response.json()
 

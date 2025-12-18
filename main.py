@@ -221,6 +221,3 @@ async def sync_gmail():
         logger.error(f"Gmail sync failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    """
-    return {"status": "not_implemented", "message": "Mail sync coming soon"}
-

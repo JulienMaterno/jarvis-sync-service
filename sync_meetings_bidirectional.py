@@ -24,6 +24,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
 import httpx
+from lib.utils import retry_on_error_sync
 
 load_dotenv()
 
@@ -51,36 +52,11 @@ logger = logging.getLogger('MeetingSync')
 # ============================================================================
 
 NOTION_API_TOKEN = os.environ.get('NOTION_API_TOKEN')
-NOTION_MEETING_DB_ID = '297cd3f1-eb28-810f-86f0-f142f7e3a5ca'
-NOTION_CRM_DB_ID = '310acdfc-72d2-42ba-be6b-735ba6057e1c'
+NOTION_MEETING_DB_ID = os.environ.get('NOTION_MEETING_DB_ID', '297cd3f1-eb28-810f-86f0-f142f7e3a5ca')
+NOTION_CRM_DB_ID = os.environ.get('NOTION_CRM_DB_ID', '310acdfc-72d2-42ba-be6b-735ba6057e1c')
 
 SUPABASE_URL = os.environ.get('SUPABASE_URL')
 SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
-
-
-# ============================================================================
-# UTILITY FUNCTIONS
-# ============================================================================
-
-def retry_on_error(func, max_retries=3, backoff_factor=2):
-    """Retry a function with exponential backoff on transient errors."""
-    for attempt in range(max_retries):
-        try:
-            return func()
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
-            if attempt == max_retries - 1:
-                raise
-            
-            # Check if it's a retryable error
-            if isinstance(e, httpx.HTTPStatusError):
-                if e.response.status_code not in [429, 500, 502, 503, 504]:
-                    raise  # Don't retry client errors
-            
-            wait_time = backoff_factor ** attempt
-            logger.warning(f"Transient error: {e}. Retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
-            time.sleep(wait_time)
-    
-    raise Exception(f"Max retries ({max_retries}) exceeded")
 
 
 # ============================================================================
@@ -100,6 +76,7 @@ class NotionClient:
         self._crm_cache: Dict[str, Dict] = {}
         self._crm_by_email: Dict[str, str] = {}  # email -> notion_page_id
     
+    @retry_on_error_sync()
     def query_database(
         self, 
         database_id: str, 
@@ -144,12 +121,14 @@ class NotionClient:
         
         return results
     
+    @retry_on_error_sync()
     def get_page(self, page_id: str) -> Dict:
         """Get a single page by ID."""
         response = self.client.get(f'https://api.notion.com/v1/pages/{page_id}')
         response.raise_for_status()
         return response.json()
     
+    @retry_on_error_sync()
     def create_page(self, database_id: str, properties: Dict, content_blocks: List[Dict] = None) -> Dict:
         """Create a new page in a database."""
         body = {
@@ -166,6 +145,7 @@ class NotionClient:
         response.raise_for_status()
         return response.json()
     
+    @retry_on_error_sync()
     def update_page(self, page_id: str, properties: Dict) -> Dict:
         """Update page properties (not content)."""
         response = self.client.patch(
@@ -175,6 +155,7 @@ class NotionClient:
         response.raise_for_status()
         return response.json()
     
+    @retry_on_error_sync()
     def get_page_blocks(self, page_id: str) -> List[Dict]:
         """Get all blocks from a page."""
         blocks = []
@@ -197,6 +178,7 @@ class NotionClient:
         
         return blocks
     
+    @retry_on_error_sync()
     def append_blocks(self, page_id: str, blocks: List[Dict]) -> List[Dict]:
         """Append blocks to a page."""
         response = self.client.patch(

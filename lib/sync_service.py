@@ -139,12 +139,15 @@ async def sync_contacts():
                     update_direction = None # None, 'to_google', 'to_supabase'
                     
                     if sb_updated_at and google_updated_at:
-                        # Parse timestamps
-                        # Supabase: ISO8601 (e.g. 2023-10-27T10:00:00+00:00)
-                        # Google: RFC3339 (e.g. 2023-10-27T10:00:00.123Z)
-                        sb_dt = datetime.fromisoformat(sb_updated_at.replace('Z', '+00:00'))
-                        # Google often has 'Z' at the end
-                        google_dt = datetime.fromisoformat(google_updated_at.replace('Z', '+00:00'))
+                        # Parse timestamps safely
+                        def parse_iso(ts):
+                            if not ts: return None
+                            if ts.endswith('Z'):
+                                ts = ts[:-1] + '+00:00'
+                            return datetime.fromisoformat(ts)
+
+                        sb_dt = parse_iso(sb_updated_at)
+                        google_dt = parse_iso(google_updated_at)
                         
                         # Buffer for self-updates (5 seconds)
                         last_source = sb_contact.get("last_sync_source")

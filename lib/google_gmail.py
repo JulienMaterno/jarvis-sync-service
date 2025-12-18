@@ -2,6 +2,7 @@ import httpx
 import base64
 from typing import List, Dict, Any, Optional
 from lib.google_auth import get_access_token
+from lib.utils import retry_on_error
 
 GOOGLE_GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
 
@@ -13,6 +14,7 @@ class GmailClient:
         if not self.access_token:
             self.access_token = await get_access_token()
 
+    @retry_on_error()
     async def list_messages(self, 
                           query: str = None, 
                           max_results: int = 100,
@@ -51,6 +53,7 @@ class GmailClient:
             data = response.json()
             return data.get("messages", [])
 
+    @retry_on_error()
     async def get_message(self, message_id: str, format: str = 'full') -> Dict[str, Any]:
         """
         Get full message details.
