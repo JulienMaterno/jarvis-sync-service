@@ -13,6 +13,7 @@ def retry_on_error(
 ):
     """
     Decorator to retry async functions on specific exceptions.
+    Handles rate limiting with exponential backoff.
     """
     def decorator(func: Callable):
         async def wrapper(*args, **kwargs):
@@ -26,6 +27,12 @@ def retry_on_error(
                     if isinstance(e, httpx.HTTPStatusError):
                         if e.response.status_code < 500 and e.response.status_code != 429:
                             raise e
+                        # For rate limiting (429), use longer backoff
+                        if e.response.status_code == 429:
+                            wait_time = (backoff_factor ** attempt) * 5  # 5x longer for rate limits
+                            logger.warning(f"Rate limit hit in {func.__name__}. Retrying in {wait_time}s...")
+                            await asyncio.sleep(wait_time)
+                            continue
                     
                     if attempt == max_retries - 1:
                         break

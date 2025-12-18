@@ -44,6 +44,7 @@ class CalendarSync:
             events = []
             next_sync_token = None
             full_sync = False
+            token_invalid = False
 
             if sync_token:
                 logger.info("Found sync token, attempting incremental sync")
@@ -53,12 +54,14 @@ class CalendarSync:
                     if result.get("expired"):
                         logger.info("Sync token expired, falling back to full sync")
                         full_sync = True
+                        token_invalid = True
                     else:
                         events = result["events"]
                         next_sync_token = result.get("nextSyncToken")
                 except Exception as e:
                     logger.warning(f"Incremental sync failed ({e}), falling back to full sync")
                     full_sync = True
+                    token_invalid = True
             else:
                 full_sync = True
 
@@ -119,6 +122,13 @@ class CalendarSync:
             if next_sync_token:
                 await self.save_sync_token(next_sync_token)
                 logger.info("Saved next sync token")
+            elif token_invalid:
+                # Clear invalid token from database
+                try:
+                    supabase.table("sync_state").delete().eq("key", "calendar_sync_token").execute()
+                    logger.info("Cleared invalid sync token")
+                except Exception as e:
+                    logger.warning(f"Failed to clear invalid token: {e}")
 
             await log_sync_event("calendar_sync", "success", f"Synced {len(upsert_data)} events")
             return {"status": "success", "count": len(upsert_data)}

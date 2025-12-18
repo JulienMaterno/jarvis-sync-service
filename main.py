@@ -4,6 +4,7 @@ from fastapi.concurrency import run_in_threadpool
 from lib.sync_service import sync_contacts
 from lib.notion_sync import sync_notion_to_supabase, sync_supabase_to_notion
 from lib.telegram_client import notify_error
+from lib.health_monitor import check_sync_health, get_sync_statistics
 from reports import generate_daily_report
 from backup import backup_contacts
 import logging
@@ -33,7 +34,33 @@ async def root():
 
 @app.get("/health")
 async def health_check():
+    """Basic health check endpoint."""
     return {"status": "healthy"}
+
+@app.get("/health/sync")
+async def sync_health_check():
+    """
+    Detailed health check for sync services.
+    Returns statistics and checks for consecutive failures.
+    """
+    try:
+        stats = await get_sync_statistics(hours=24)
+        
+        # Check each service for consecutive failures
+        services = ["calendar_sync", "gmail_sync", "meetings_sync", "tasks_sync", "reflections_sync"]
+        service_health = {}
+        
+        for service in services:
+            health = await check_sync_health(service, failure_threshold=5)
+            service_health[service] = health
+        
+        return {
+            "status": "healthy" if all(h.get("healthy", True) for h in service_health.values()) else "degraded",
+            "statistics": stats,
+            "services": service_health
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 @app.post("/sync/contacts")
 async def sync_all_contacts():
