@@ -52,7 +52,7 @@ class GoogleCalendarClient:
                     ts += 'Z'
                 params["timeMax"] = ts
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.get(
                 f"{GOOGLE_CALENDAR_API_BASE}/calendars/{calendar_id}/events",
                 headers=headers,
@@ -70,6 +70,14 @@ class GoogleCalendarClient:
                     headers=headers,
                     params=params
                 )
+            
+            if response.status_code == 400:
+                # Log the actual error for debugging
+                try:
+                    error_data = response.json()
+                    raise ValueError(f"Bad Request from Google Calendar API: {error_data}")
+                except:
+                    raise ValueError(f"Bad Request from Google Calendar API: {response.text}")
                 
             response.raise_for_status()
             data = response.json()

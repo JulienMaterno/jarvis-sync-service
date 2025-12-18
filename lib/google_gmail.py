@@ -33,7 +33,7 @@ class GmailClient:
         if query:
             params["q"] = query
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.get(
                 f"{GOOGLE_GMAIL_API_BASE}/messages",
                 headers=headers,
@@ -62,7 +62,7 @@ class GmailClient:
         await self._ensure_token()
         headers = {"Authorization": f"Bearer {self.access_token}"}
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.get(
                 f"{GOOGLE_GMAIL_API_BASE}/messages/{message_id}",
                 headers=headers,
