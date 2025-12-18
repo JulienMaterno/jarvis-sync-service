@@ -8,6 +8,12 @@ import logging
 # Import meeting sync
 from sync_meetings_bidirectional import run_sync as run_meeting_sync
 
+# Import task sync
+from sync_tasks_bidirectional import run_sync as run_task_sync
+
+# Import reflection sync
+from sync_reflections_bidirectional import run_sync as run_reflection_sync
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -60,9 +66,11 @@ async def endpoint_sync_supabase_to_notion():
 async def sync_everything(background_tasks: BackgroundTasks):
     """
     Runs all syncs in the correct order:
-    1. Notion -> Supabase (Import new data)
-    2. Google <-> Supabase (Sync with Google)
-    3. Supabase -> Notion (Push updates back)
+    1. Contacts: Notion -> Supabase (Import new data)
+    2. Contacts: Google <-> Supabase (Sync with Google)
+    3. Contacts: Supabase -> Notion (Push updates back)
+    4. Meetings: Bidirectional sync (Notion <-> Supabase)
+    5. Tasks: Bidirectional sync (Notion <-> Supabase)
     """
     # We run this in the background to avoid timeout on Cloud Run (if it takes > 60s)
     # However, Cloud Run requires the request to stay open if we want CPU allocated, 
@@ -73,6 +81,7 @@ async def sync_everything(background_tasks: BackgroundTasks):
     try:
         logger.info("Starting full sync cycle via API")
         
+        # === CONTACTS SYNC ===
         # 1. Notion -> Supabase (Sync, run in threadpool)
         results["notion_to_supabase"] = await run_in_threadpool(sync_notion_to_supabase)
         
@@ -81,6 +90,21 @@ async def sync_everything(background_tasks: BackgroundTasks):
         
         # 3. Supabase -> Notion (Sync, run in threadpool)
         results["supabase_to_notion"] = await run_in_threadpool(sync_supabase_to_notion)
+        
+        # === MEETINGS SYNC ===
+        # 4. Bidirectional meeting sync (incremental, last 24h)
+        logger.info("Starting meeting sync...")
+        results["meetings_sync"] = await run_in_threadpool(run_meeting_sync, full_sync=False, since_hours=24)
+        
+        # === TASKS SYNC ===
+        # 5. Bidirectional task sync (incremental, last 24h)
+        logger.info("Starting task sync...")
+        results["tasks_sync"] = await run_in_threadpool(run_task_sync, full_sync=False, since_hours=24)
+        
+        # === REFLECTIONS SYNC ===
+        # 6. Bidirectional reflection sync (incremental, last 24h)
+        logger.info("Starting reflection sync...")
+        results["reflections_sync"] = await run_in_threadpool(run_reflection_sync, full_sync=False, since_hours=24)
         
         return results
     except Exception as e:
@@ -116,14 +140,45 @@ async def sync_meetings(full: bool = False, hours: int = 24):
         logger.error(f"Meeting sync failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- Future Modules ---
+# --- Task Sync ---
 
 @app.post("/sync/tasks")
-async def sync_tasks():
+async def sync_tasks(full: bool = False, hours: int = 24):
     """
-    Placeholder for Task sync (e.g. Todoist/Notion/Google Tasks)
+    Bidirectional sync between Notion and Supabase for tasks.
+    
+    Args:
+        full: If True, performs full sync. If False, incremental sync.
+        hours: For incremental sync, how many hours to look back (default 24).
     """
-    return {"status": "not_implemented", "message": "Task sync coming soon"}
+    try:
+        logger.info(f"Starting task sync via API (full={full}, hours={hours})")
+        result = await run_in_threadpool(run_task_sync, full_sync=full, since_hours=hours)
+        return result
+    except Exception as e:
+        logger.error(f"Task sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Reflection Sync ---
+
+@app.post("/sync/reflections")
+async def sync_reflections(full: bool = False, hours: int = 24):
+    """
+    Bidirectional sync between Notion and Supabase for reflections/thoughts.
+    
+    Args:
+        full: If True, performs full sync. If False, incremental sync.
+        hours: For incremental sync, how many hours to look back (default 24).
+    """
+    try:
+        logger.info(f"Starting reflection sync via API (full={full}, hours={hours})")
+        result = await run_in_threadpool(run_reflection_sync, full_sync=full, since_hours=hours)
+        return result
+    except Exception as e:
+        logger.error(f"Reflection sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Future Modules ---
 
 @app.post("/sync/mail")
 async def sync_mail():
