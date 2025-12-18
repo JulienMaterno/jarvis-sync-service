@@ -18,9 +18,10 @@ class GoogleCalendarClient:
                          time_min: Optional[datetime] = None, 
                          time_max: Optional[datetime] = None,
                          single_events: bool = True,
-                         max_results: int = 2500) -> List[Dict[str, Any]]:
+                         max_results: int = 2500) -> Dict[str, Any]:
         """
         List events from a calendar.
+        Returns {"events": [], "nextSyncToken": str}
         """
         await self._ensure_token()
         headers = {"Authorization": f"Bearer {self.access_token}"}
@@ -44,7 +45,6 @@ class GoogleCalendarClient:
             )
             
             if response.status_code == 401:
-                # Token might be expired, refresh and retry once
                 self.access_token = await get_access_token()
                 headers["Authorization"] = f"Bearer {self.access_token}"
                 response = await client.get(
@@ -55,7 +55,12 @@ class GoogleCalendarClient:
                 
             response.raise_for_status()
             data = response.json()
-            return data.get("items", [])
+            # Note: nextSyncToken is only returned on the last page of the result set.
+            # If we had pagination, we'd need to loop. For now assuming < 2500 events.
+            return {
+                "events": data.get("items", []),
+                "nextSyncToken": data.get("nextSyncToken") 
+            }
 
     async def get_event(self, calendar_id: str, event_id: str) -> Dict[str, Any]:
         await self._ensure_token()

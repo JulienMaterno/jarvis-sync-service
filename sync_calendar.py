@@ -13,22 +13,132 @@ class CalendarSync:
     def __init__(self):
         self.google_client = GoogleCalendarClient()
 
+    async def get_sync_token(self) -> Optional[str]:
+        try:
+            response = supabase.table("sync_state").select("value").eq("key", "calendar_sync_token").execute()
+            if response.data:
+                return response.data[0]["value"]
+            return None
+        except Exception:
+            return None
+
+    async def save_sync_token(self, token: str):
+        try:
+            supabase.table("sync_state").upsert({
+                "key": "calendar_sync_token",
+                "value": token,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }).execute()
+        except Exception as e:
+            logger.warning(f"Failed to save sync token: {e}")
+
     async def sync_events(self, days_past: int = 90, days_future: int = 180):
         """
         Syncs calendar events from Google to Supabase.
+        Uses syncToken for incremental syncs if available.
         """
         try:
-            logger.info(f"Starting calendar sync (-{days_past}d to +{days_future}d)")
+            logger.info(f"Starting calendar sync...")
             
-            time_min = datetime.now(timezone.utc) - timedelta(days=days_past)
-            time_max = datetime.now(timezone.utc) + timedelta(days=days_future)
-            
-            events = await self.google_client.list_events(
-                time_min=time_min,
-                time_max=time_max
-            )
-            
+            sync_token = await self.get_sync_token()
+            events = []
+            next_sync_token = None
+            full_sync = False
+
+            if sync_token:
+                logger.info("Found sync token, attempting incremental sync")
+                try:
+                    # Incremental sync
+                    await self.google_client._ensure_token()
+                    headers = {"Authorization": f"Bearer {self.google_client.access_token}"}
+                    params = {"syncToken": sync_token, "maxResults": 2500}
+                    
+                    async with httpx.AsyncClient() as client:
+                        response = await client.get(
+                            f"{GOOGLE_CALENDAR_API_BASE}/calendars/primary/events",
+                            headers=headers,
+                            params=params
+                        )
+                        
+                        if response.status_code == 410: # Gone (Sync token expired)
+                            logger.info("Sync token expired, falling back to full sync")
+                            full_sync = True
+                        else:
+                            response.raise_for_status()
+                            data = response.json()
+                            events = data.get("items", [])
+                            next_sync_token = data.get("nextSyncToken")
+                except Exception as e:
+                    logger.warning(f"Incremental sync failed ({e}), falling back to full sync")
+                    full_sync = True
+            else:
+                full_sync = True
+
+            if full_sync:
+                logger.info(f"Performing full sync (-{days_past}d to +{days_future}d)")
+                time_min = datetime.now(timezone.utc) - timedelta(days=days_past)
+                time_max = datetime.now(timezone.utc) + timedelta(days=days_future)
+                
+                result = await self.google_client.list_events(
+                    time_min=time_min,
+                    time_max=time_max
+                )
+                events = result["events"]
+                next_sync_token = result.get("nextSyncToken")
+
             logger.info(f"Found {len(events)} events in Google Calendar")
+            
+            upsert_data = []
+            for event in events:
+                # Skip cancelled events if we want, but keeping them with status='cancelled' is better
+                
+                start = event.get('start', {})
+                end = event.get('end', {})
+                
+                # Handle all-day events (date only) vs timed events (dateTime)
+                start_time = start.get('dateTime') or start.get('date')
+                end_time = end.get('dateTime') or end.get('date')
+                
+                # If it's just a date, it might not parse directly into timestamptz in some DBs without casting,
+                # but Supabase/Postgres usually handles ISO strings well. 
+                # For all-day events, 'date' is YYYY-MM-DD. We might want to append T00:00:00Z for consistency if needed.
+                
+                record = {
+                    "google_event_id": event['id'],
+                    "calendar_id": "primary",
+                    "summary": event.get('summary', ''),
+                    "description": event.get('description', ''),
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "location": event.get('location', ''),
+                    "status": event.get('status', ''),
+                    "html_link": event.get('htmlLink', ''),
+                    "attendees": event.get('attendees', []),
+                    "creator": event.get('creator', {}),
+                    "organizer": event.get('organizer', {}),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "last_sync_at": datetime.now(timezone.utc).isoformat()
+                }
+                upsert_data.append(record)
+
+            if upsert_data:
+                # Upsert in batches of 100 to avoid payload limits
+                batch_size = 100
+                for i in range(0, len(upsert_data), batch_size):
+                    batch = upsert_data[i:i+batch_size]
+                    response = supabase.table("calendar_events").upsert(
+                        batch, on_conflict="google_event_id"
+                    ).execute()
+                    logger.info(f"Upserted batch {i//batch_size + 1}: {len(batch)} events")
+
+            # Save sync token for next time
+            if next_sync_token:
+                await self.save_sync_token(next_sync_token)
+                logger.info("Saved next sync token")
+
+            await log_sync_event("calendar_sync", "success", f"Synced {len(upsert_data)} events")
+            return {"status": "success", "count": len(upsert_data)}
+
             
             upsert_data = []
             for event in events:
