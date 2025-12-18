@@ -14,6 +14,10 @@ from sync_tasks_bidirectional import run_sync as run_task_sync
 # Import reflection sync
 from sync_reflections_bidirectional import run_sync as run_reflection_sync
 
+# Import calendar and gmail sync
+from sync_calendar import run_calendar_sync
+from sync_gmail import run_gmail_sync
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -106,6 +110,16 @@ async def sync_everything(background_tasks: BackgroundTasks):
         logger.info("Starting reflection sync...")
         results["reflections_sync"] = await run_in_threadpool(run_reflection_sync, full_sync=False, since_hours=24)
         
+        # === CALENDAR SYNC ===
+        # 7. Google Calendar -> Supabase
+        logger.info("Starting calendar sync...")
+        results["calendar_sync"] = await run_calendar_sync()
+
+        # === GMAIL SYNC ===
+        # 8. Gmail -> Supabase
+        logger.info("Starting gmail sync...")
+        results["gmail_sync"] = await run_gmail_sync()
+        
         return results
     except Exception as e:
         logger.error(f"Sync failed: {e}")
@@ -178,12 +192,34 @@ async def sync_reflections(full: bool = False, hours: int = 24):
         logger.error(f"Reflection sync failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- Future Modules ---
+# --- Calendar Sync ---
 
-@app.post("/sync/mail")
-async def sync_mail():
+@app.post("/sync/calendar")
+async def sync_calendar():
     """
-    Placeholder for Mail sync (e.g. Gmail -> Supabase)
+    Sync Google Calendar events to Supabase.
+    """
+    try:
+        logger.info("Starting calendar sync via API")
+        return await run_calendar_sync()
+    except Exception as e:
+        logger.error(f"Calendar sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Gmail Sync ---
+
+@app.post("/sync/gmail")
+async def sync_gmail():
+    """
+    Sync Gmail messages to Supabase.
+    """
+    try:
+        logger.info("Starting gmail sync via API")
+        return await run_gmail_sync()
+    except Exception as e:
+        logger.error(f"Gmail sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
     """
     return {"status": "not_implemented", "message": "Mail sync coming soon"}
 
