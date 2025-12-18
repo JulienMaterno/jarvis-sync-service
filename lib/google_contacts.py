@@ -2,31 +2,9 @@ import os
 import httpx
 import asyncio
 from typing import Dict, Any, List, Optional
+from lib.google_auth import get_access_token
 
-GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_PEOPLE_API_BASE = "https://people.googleapis.com/v1"
-
-async def get_access_token() -> str:
-    """
-    Exchanges the refresh token for a new access token.
-    """
-    client_id = os.environ.get("GOOGLE_CLIENT_ID")
-    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
-    refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN")
-
-    if not all([client_id, client_secret, refresh_token]):
-        raise ValueError("Missing Google OAuth credentials in environment variables.")
-
-    async with httpx.AsyncClient() as client:
-        response = await client.post(GOOGLE_TOKEN_URL, data={
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "refresh_token": refresh_token,
-            "grant_type": "refresh_token",
-        })
-        response.raise_for_status()
-        data = response.json()
-        return data["access_token"]
 
 async def get_contact_groups(access_token: str) -> Dict[str, str]:
     """

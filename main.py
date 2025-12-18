@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.concurrency import run_in_threadpool
 from lib.sync_service import sync_contacts
@@ -69,61 +70,45 @@ async def endpoint_sync_supabase_to_notion():
 @app.post("/sync/all")
 async def sync_everything(background_tasks: BackgroundTasks):
     """
-    Runs all syncs in the correct order:
-    1. Contacts: Notion -> Supabase (Import new data)
-    2. Contacts: Google <-> Supabase (Sync with Google)
-    3. Contacts: Supabase -> Notion (Push updates back)
-    4. Meetings: Bidirectional sync (Notion <-> Supabase)
-    5. Tasks: Bidirectional sync (Notion <-> Supabase)
+    Runs all syncs in the correct order.
+    Failures in one module do not stop others.
     """
-    # We run this in the background to avoid timeout on Cloud Run (if it takes > 60s)
-    # However, Cloud Run requires the request to stay open if we want CPU allocated, 
-    # unless we use Cloud Tasks. For simple scheduled jobs, we can just await it 
-    # and increase timeout config.
-    
     results = {}
-    try:
-        logger.info("Starting full sync cycle via API")
-        
-        # === CONTACTS SYNC ===
-        # 1. Notion -> Supabase (Sync, run in threadpool)
-        results["notion_to_supabase"] = await run_in_threadpool(sync_notion_to_supabase)
-        
-        # 2. Google <-> Supabase (Async)
-        results["google_sync"] = await sync_contacts()
-        
-        # 3. Supabase -> Notion (Sync, run in threadpool)
-        results["supabase_to_notion"] = await run_in_threadpool(sync_supabase_to_notion)
-        
-        # === MEETINGS SYNC ===
-        # 4. Bidirectional meeting sync (incremental, last 24h)
-        logger.info("Starting meeting sync...")
-        results["meetings_sync"] = await run_in_threadpool(run_meeting_sync, full_sync=False, since_hours=24)
-        
-        # === TASKS SYNC ===
-        # 5. Bidirectional task sync (incremental, last 24h)
-        logger.info("Starting task sync...")
-        results["tasks_sync"] = await run_in_threadpool(run_task_sync, full_sync=False, since_hours=24)
-        
-        # === REFLECTIONS SYNC ===
-        # 6. Bidirectional reflection sync (incremental, last 24h)
-        logger.info("Starting reflection sync...")
-        results["reflections_sync"] = await run_in_threadpool(run_reflection_sync, full_sync=False, since_hours=24)
-        
-        # === CALENDAR SYNC ===
-        # 7. Google Calendar -> Supabase
-        logger.info("Starting calendar sync...")
-        results["calendar_sync"] = await run_calendar_sync()
+    logger.info("Starting full sync cycle via API")
 
-        # === GMAIL SYNC ===
-        # 8. Gmail -> Supabase
-        logger.info("Starting gmail sync...")
-        results["gmail_sync"] = await run_gmail_sync()
-        
-        return results
-    except Exception as e:
-        logger.error(f"Sync failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    async def run_step(name, func, *args, **kwargs):
+        try:
+            logger.info(f"Starting {name}...")
+            if asyncio.iscoroutinefunction(func):
+                res = await func(*args, **kwargs)
+            else:
+                res = await run_in_threadpool(func, *args, **kwargs)
+            results[name] = {"status": "success", "data": res}
+        except Exception as e:
+            logger.error(f"{name} failed: {e}")
+            results[name] = {"status": "error", "error": str(e)}
+
+    # === CONTACTS SYNC ===
+    await run_step("notion_to_supabase", sync_notion_to_supabase)
+    await run_step("google_sync", sync_contacts)
+    await run_step("supabase_to_notion", sync_supabase_to_notion)
+    
+    # === MEETINGS SYNC ===
+    await run_step("meetings_sync", run_meeting_sync, full_sync=False, since_hours=24)
+    
+    # === TASKS SYNC ===
+    await run_step("tasks_sync", run_task_sync, full_sync=False, since_hours=24)
+    
+    # === REFLECTIONS SYNC ===
+    await run_step("reflections_sync", run_reflection_sync, full_sync=False, since_hours=24)
+    
+    # === CALENDAR SYNC ===
+    await run_step("calendar_sync", run_calendar_sync)
+
+    # === GMAIL SYNC ===
+    await run_step("gmail_sync", run_gmail_sync)
+    
+    return results
 
 @app.post("/backup")
 async def trigger_backup():
