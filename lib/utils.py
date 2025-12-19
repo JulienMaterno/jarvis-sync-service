@@ -2,14 +2,32 @@ import time
 import logging
 import asyncio
 import httpx
+import ssl
 from typing import Type, Tuple, Callable, Any
 
 logger = logging.getLogger("Utils")
 
+# Default exceptions to retry on - includes network errors, timeouts, and transient failures
+RETRYABLE_EXCEPTIONS = (
+    httpx.ConnectError,
+    httpx.TimeoutException,
+    httpx.HTTPStatusError,
+    httpx.RemoteProtocolError,  # Server disconnected, malformed responses
+    httpx.ReadError,            # Failed to receive data
+    httpx.WriteError,           # Failed to send data  
+    httpx.NetworkError,         # Base class for network-related errors
+    ConnectionResetError,       # [Errno 104] Connection reset by peer
+    BrokenPipeError,            # [Errno 32] Broken pipe
+    ConnectionAbortedError,     # Connection aborted
+    ConnectionRefusedError,     # Connection refused
+    ssl.SSLError,               # SSL/TLS errors
+    OSError,                    # Covers various socket errors
+)
+
 def retry_on_error(
     max_retries: int = 3,
     backoff_factor: float = 2.0,
-    exceptions: Tuple[Type[Exception], ...] = (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError)
+    exceptions: Tuple[Type[Exception], ...] = RETRYABLE_EXCEPTIONS
 ):
     """
     Decorator to retry async functions on specific exceptions.
@@ -48,7 +66,7 @@ def retry_on_error(
 def retry_on_error_sync(
     max_retries: int = 3,
     backoff_factor: float = 2.0,
-    exceptions: Tuple[Type[Exception], ...] = (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError)
+    exceptions: Tuple[Type[Exception], ...] = RETRYABLE_EXCEPTIONS
 ):
     """
     Decorator to retry synchronous functions on specific exceptions.

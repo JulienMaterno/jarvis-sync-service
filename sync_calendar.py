@@ -70,12 +70,23 @@ class CalendarSync:
                 time_min = datetime.now(timezone.utc) - timedelta(days=days_past)
                 time_max = datetime.now(timezone.utc) + timedelta(days=days_future)
                 
-                result = await self.google_client.list_events(
-                    time_min=time_min,
-                    time_max=time_max
-                )
-                events = result["events"]
-                next_sync_token = result.get("nextSyncToken")
+                try:
+                    result = await self.google_client.list_events(
+                        time_min=time_min,
+                        time_max=time_max
+                    )
+                    events = result["events"]
+                    next_sync_token = result.get("nextSyncToken")
+                except ValueError as e:
+                    # If we get a 400 Bad Request, clear any potentially corrupted sync token
+                    if "400" in str(e) or "Bad Request" in str(e):
+                        logger.warning(f"Got 400 error during full sync, clearing sync token: {e}")
+                        try:
+                            supabase.table("sync_state").delete().eq("key", "calendar_sync_token").execute()
+                            logger.info("Cleared sync token due to 400 error")
+                        except Exception as clear_err:
+                            logger.error(f"Failed to clear sync token: {clear_err}")
+                    raise
 
             logger.info(f"Found {len(events)} events in Google Calendar")
             
