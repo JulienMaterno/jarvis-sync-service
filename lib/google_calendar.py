@@ -40,17 +40,11 @@ class GoogleCalendarClient:
             params["singleEvents"] = str(single_events).lower()
             params["orderBy"] = "startTime"
             if time_min:
-                # Ensure valid RFC3339 format. If aware, isoformat() includes offset.
-                # If naive, we assume UTC and append Z.
-                ts = time_min.isoformat()
-                if time_min.tzinfo is None:
-                    ts += 'Z'
-                params["timeMin"] = ts
+                # Google Calendar API requires RFC3339 format with Z suffix for UTC
+                # Always format as UTC with Z suffix (no +00:00)
+                params["timeMin"] = time_min.strftime('%Y-%m-%dT%H:%M:%SZ')
             if time_max:
-                ts = time_max.isoformat()
-                if time_max.tzinfo is None:
-                    ts += 'Z'
-                params["timeMax"] = ts
+                params["timeMax"] = time_max.strftime('%Y-%m-%dT%H:%M:%SZ')
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.get(
