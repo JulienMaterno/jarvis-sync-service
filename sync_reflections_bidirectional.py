@@ -332,6 +332,7 @@ def sync_notion_to_supabase(
     created = 0
     updated = 0
     skipped = 0
+    errors = 0
     
     since = datetime.now(timezone.utc) - timedelta(hours=since_hours) if not full_sync else None
     
@@ -351,6 +352,16 @@ def sync_notion_to_supabase(
     
     logger.info(f"Found {len(reflections)} reflections in Notion to process")
     
+    # Get existing Supabase reflections for safety valve
+    existing_supabase = supabase.get_all_reflections()
+    logger.info(f"Supabase has {len(existing_supabase)} total reflections")
+    
+    # SAFETY VALVE: If Notion returns empty/few but Supabase has many, abort
+    if full_sync and len(existing_supabase) > 10 and len(reflections) < (len(existing_supabase) * 0.1):
+        msg = f"Safety Valve: Notion returned {len(reflections)} reflections, but Supabase has {len(existing_supabase)}. Aborting to prevent data loss."
+        logger.error(msg)
+        raise Exception(msg)
+    
     for notion_ref in reflections:
         notion_page_id = notion_ref['id']
         last_edited = notion_ref.get('last_edited_time', '')
@@ -364,22 +375,61 @@ def sync_notion_to_supabase(
                 supabase_updated = existing.get('notion_updated_at', '')
                 last_sync_source = existing.get('last_sync_source', '')
                 
-                if last_sync_source == 'supabase':
+                # Parse timestamps for buffer comparison
+                try:
+                    notion_dt = datetime.fromisoformat(last_edited.replace('Z', '+00:00'))
+                    existing_dt = datetime.fromisoformat(supabase_updated.replace('Z', '+00:00')) if supabase_updated else None
+                except:
+                    notion_dt = None
+                    existing_dt = None
+                
+                # Skip if Supabase already has this version
+                # Use 5-second buffer if last update came from Notion to avoid ping-pong
+                if supabase_updated and notion_dt and existing_dt:
+                    if last_sync_source == 'notion':
+                        if notion_dt <= existing_dt + timedelta(seconds=5):
+                            skipped += 1
+                            continue
+                    else:
+                        if last_edited <= supabase_updated:
+                            skipped += 1
+                            continue
+                elif supabase_updated and last_edited <= supabase_updated:
                     skipped += 1
                     continue
                 
-                if supabase_updated and last_edited <= supabase_updated:
-                    skipped += 1
-                    continue
-                
-                # Update Supabase
+                # Parse reflection data
                 ref_data = notion_reflection_to_supabase(notion_ref, notion)
-                ref_data['notion_updated_at'] = last_edited
-                ref_data['last_sync_source'] = 'notion'
                 
-                supabase.update_reflection(existing['id'], ref_data)
-                updated += 1
-                logger.info(f"Updated Supabase reflection: {ref_data['title']}")
+                # Content equality check - avoid unnecessary updates
+                fields_to_check = ['title', 'date', 'location', 'content']
+                needs_update = False
+                for field in fields_to_check:
+                    new_val = ref_data.get(field)
+                    existing_val = existing.get(field)
+                    if (new_val is None and existing_val == "") or (new_val == "" and existing_val is None):
+                        continue
+                    if new_val != existing_val:
+                        needs_update = True
+                        logger.debug(f"Field '{field}' changed")
+                        break
+                
+                # Also check tags (list comparison)
+                if not needs_update:
+                    new_tags = set(ref_data.get('tags', []) or [])
+                    existing_tags = set(existing.get('tags', []) or [])
+                    if new_tags != existing_tags:
+                        needs_update = True
+                
+                if needs_update:
+                    ref_data['notion_updated_at'] = last_edited
+                    ref_data['last_sync_source'] = 'notion'
+                    supabase.update_reflection(existing['id'], ref_data)
+                    updated += 1
+                    logger.info(f"Updated Supabase reflection: {ref_data['title']}")
+                else:
+                    skipped += 1
+                    logger.debug(f"Skipped (content unchanged): {ref_data['title']}")
             else:
                 # Create in Supabase
                 ref_data = notion_reflection_to_supabase(notion_ref, notion)
@@ -415,6 +465,20 @@ def sync_supabase_to_notion(
     # Get all reflections from Supabase
     all_reflections = supabase.get_all_reflections()
     
+    # Get Notion reflections count for safety valve
+    if full_sync:
+        notion_reflections = notion.query_database(
+            NOTION_REFLECTIONS_DB_ID,
+            sorts=[{"timestamp": "last_edited_time", "direction": "descending"}]
+        )
+        logger.info(f"Notion has {len(notion_reflections)} total reflections")
+        
+        # SAFETY VALVE: If Supabase has many but Notion is empty, abort
+        if len(all_reflections) > 10 and len(notion_reflections) < (len(all_reflections) * 0.1):
+            msg = f"Safety Valve: Supabase has {len(all_reflections)} reflections, but Notion has {len(notion_reflections)}. Aborting to prevent data loss."
+            logger.error(msg)
+            raise Exception(msg)
+    
     if not full_sync:
         # Filter to reflections needing sync
         reflections = []
@@ -447,11 +511,26 @@ def sync_supabase_to_notion(
                 notion_updated = reflection.get('notion_updated_at', '')
                 last_sync_source = reflection.get('last_sync_source', '')
                 
-                if last_sync_source == 'notion':
-                    skipped += 1
-                    continue
+                # Parse timestamps for buffer comparison
+                try:
+                    ref_dt = datetime.fromisoformat(ref_updated.replace('Z', '+00:00'))
+                    notion_dt = datetime.fromisoformat(notion_updated.replace('Z', '+00:00')) if notion_updated else None
+                except:
+                    ref_dt = None
+                    notion_dt = None
                 
-                if notion_updated and ref_updated <= notion_updated:
+                # Skip if Notion already has this version
+                # Use 5-second buffer if last update came from Supabase to avoid ping-pong
+                if notion_updated and ref_dt and notion_dt:
+                    if last_sync_source == 'supabase':
+                        if ref_dt <= notion_dt + timedelta(seconds=5):
+                            skipped += 1
+                            continue
+                    else:
+                        if ref_updated <= notion_updated:
+                            skipped += 1
+                            continue
+                elif notion_updated and ref_updated <= notion_updated:
                     skipped += 1
                     continue
                 

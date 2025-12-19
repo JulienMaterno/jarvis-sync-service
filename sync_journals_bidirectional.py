@@ -515,6 +515,7 @@ def sync_notion_to_supabase(
     created = 0
     updated = 0
     skipped = 0
+    errors = 0
     
     since = datetime.now(timezone.utc) - timedelta(hours=since_hours) if not full_sync else None
     
@@ -533,6 +534,16 @@ def sync_notion_to_supabase(
     )
     
     logger.info(f"Found {len(journals)} journals in Notion to process")
+    
+    # Get existing Supabase journals for safety valve
+    existing_supabase = supabase.get_all_journals()
+    logger.info(f"Supabase has {len(existing_supabase)} total journals")
+    
+    # SAFETY VALVE: If Notion returns empty/few but Supabase has many, abort
+    if full_sync and len(existing_supabase) > 10 and len(journals) < (len(existing_supabase) * 0.1):
+        msg = f"Safety Valve: Notion returned {len(journals)} journals, but Supabase has {len(existing_supabase)}. Aborting to prevent data loss."
+        logger.error(msg)
+        raise Exception(msg)
     
     for notion_journal in journals:
         notion_page_id = notion_journal['id']
@@ -556,31 +567,75 @@ def sync_notion_to_supabase(
                 supabase_updated = existing.get('notion_updated_at', '')
                 last_sync_source = existing.get('last_sync_source', '')
                 
+                # Parse timestamps for buffer comparison
+                try:
+                    notion_dt = datetime.fromisoformat(last_edited.replace('Z', '+00:00'))
+                    existing_dt = datetime.fromisoformat(supabase_updated.replace('Z', '+00:00')) if supabase_updated else None
+                except:
+                    notion_dt = None
+                    existing_dt = None
+                
                 # Don't overwrite if Supabase was the last source (AI processed)
                 if last_sync_source == 'supabase':
-                    # But still update tracking fields
+                    # Use 5-second buffer to avoid ping-pong
+                    if notion_dt and existing_dt and notion_dt <= existing_dt + timedelta(seconds=5):
+                        # But still update tracking fields
+                        journal_data['notion_page_id'] = notion_page_id
+                        journal_data['notion_updated_at'] = last_edited
+                        # Don't change last_sync_source
+                        del journal_data['source']
+                        
+                        supabase.update_journal(existing['id'], journal_data)
+                        skipped += 1
+                        logger.debug(f"Skipped (Supabase is source): {journal_date}")
+                        continue
+                
+                # Standard timestamp comparison with 5-second buffer
+                if supabase_updated and notion_dt and existing_dt:
+                    if last_sync_source == 'notion':
+                        if notion_dt <= existing_dt + timedelta(seconds=5):
+                            skipped += 1
+                            continue
+                    else:
+                        if last_edited <= supabase_updated:
+                            skipped += 1
+                            continue
+                elif supabase_updated and last_edited <= supabase_updated:
+                    skipped += 1
+                    continue
+                
+                # Content equality check - avoid unnecessary updates
+                fields_to_check = ['mood', 'effort', 'wakeup_time', 'nutrition', 'note']
+                needs_update = False
+                for field in fields_to_check:
+                    new_val = journal_data.get(field)
+                    existing_val = existing.get(field)
+                    if (new_val is None and existing_val == "") or (new_val == "" and existing_val is None):
+                        continue
+                    if new_val != existing_val:
+                        needs_update = True
+                        logger.debug(f"Field '{field}' changed")
+                        break
+                
+                # Also check sports (list comparison)
+                if not needs_update:
+                    new_sports = set(journal_data.get('sports', []) or [])
+                    existing_sports = set(existing.get('sports', []) or [])
+                    if new_sports != existing_sports:
+                        needs_update = True
+                
+                if needs_update:
+                    # Update Supabase
                     journal_data['notion_page_id'] = notion_page_id
                     journal_data['notion_updated_at'] = last_edited
-                    # Don't change last_sync_source
-                    del journal_data['source']
+                    journal_data['last_sync_source'] = 'notion'
                     
                     supabase.update_journal(existing['id'], journal_data)
+                    updated += 1
+                    logger.info(f"Updated Supabase journal: {journal_date}")
+                else:
                     skipped += 1
-                    logger.debug(f"Skipped (Supabase is source): {journal_date}")
-                    continue
-                
-                if supabase_updated and last_edited <= supabase_updated:
-                    skipped += 1
-                    continue
-                
-                # Update Supabase
-                journal_data['notion_page_id'] = notion_page_id
-                journal_data['notion_updated_at'] = last_edited
-                journal_data['last_sync_source'] = 'notion'
-                
-                supabase.update_journal(existing['id'], journal_data)
-                updated += 1
-                logger.info(f"Updated Supabase journal: {journal_date}")
+                    logger.debug(f"Skipped (content unchanged): {journal_date}")
             else:
                 # Create in Supabase
                 journal_data['notion_page_id'] = notion_page_id
