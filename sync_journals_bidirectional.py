@@ -209,9 +209,11 @@ class SupabaseClient:
     
     def get_all_journals(self, since: Optional[datetime] = None) -> List[Dict]:
         """Get all journals from Supabase."""
-        url = f"{self.base_url}/journals?select=*&order=date.desc&deleted_at=is.null"
+        url = f"{self.base_url}/journals?select=*&order=date.desc"
         if since:
-            url += f"&updated_at=gte.{since.isoformat()}"
+            # Use date filter instead of updated_at since that column may not exist
+            since_date = since.strftime('%Y-%m-%d')
+            url += f"&date=gte.{since_date}"
         response = self.client.get(url)
         response.raise_for_status()
         return response.json()
