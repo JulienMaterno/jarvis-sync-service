@@ -196,9 +196,9 @@ class GmailSync:
                             if date_str:
                                 try:
                                     from email.utils import parsedate_to_datetime
-                                email_date = parsedate_to_datetime(date_str).isoformat()
-                            except:
-                                internal_date = msg.get('internalDate')
+                                    email_date = parsedate_to_datetime(date_str).isoformat()
+                                except:
+                                    internal_date = msg.get('internalDate')
                                 if internal_date:
                                     email_date = datetime.fromtimestamp(int(internal_date)/1000, timezone.utc).isoformat()
 

@@ -30,6 +30,7 @@ def format_rfc3339(dt: datetime) -> str:
         
         # Format with Z suffix
         formatted_date = dt_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+        # print(f"DEBUG: Formatted date: {formatted_date}") 
         return formatted_date
     except Exception as e:
         # Fallback - ensure we strip microseconds manually if strftime fails
