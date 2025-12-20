@@ -53,7 +53,7 @@ logger = logging.getLogger('MeetingSync')
 
 NOTION_API_TOKEN = os.environ.get('NOTION_API_TOKEN')
 NOTION_MEETING_DB_ID = os.environ.get('NOTION_MEETING_DB_ID', '297cd3f1-eb28-810f-86f0-f142f7e3a5ca')
-NOTION_CRM_DB_ID = os.environ.get('NOTION_CRM_DB_ID', '310acdfc-72d2-42ba-be6b-735ba6057e1c')
+NOTION_CRM_DB_ID = os.environ.get('NOTION_CRM_DATABASE_ID', '2c7cd3f1eb2880269e53ed4d45e99b69')
 
 SUPABASE_URL = os.environ.get('SUPABASE_URL')
 SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
