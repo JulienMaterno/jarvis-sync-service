@@ -115,6 +115,67 @@ class GmailClient:
         response.raise_for_status()
         return response.json()
 
+    @retry_on_error()
+    async def get_profile(self) -> Dict[str, Any]:
+        """
+        Get user profile (useful for historyId).
+        """
+        await self._ensure_token()
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.get(
+                f"{GOOGLE_GMAIL_API_BASE}/profile",
+                headers=headers
+            )
+            
+            if response.status_code == 401:
+                self.access_token = await get_access_token()
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                response = await client.get(
+                    f"{GOOGLE_GMAIL_API_BASE}/profile",
+                    headers=headers
+                )
+            
+            response.raise_for_status()
+            return response.json()
+
+    @retry_on_error()
+    async def list_history(self, start_history_id: str, max_results: int = 100) -> Dict[str, Any]:
+        """
+        List history of changes since start_history_id.
+        """
+        await self._ensure_token()
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        
+        params = {
+            "startHistoryId": start_history_id,
+            "maxResults": max_results
+        }
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.get(
+                f"{GOOGLE_GMAIL_API_BASE}/history",
+                headers=headers,
+                params=params
+            )
+            
+            if response.status_code == 401:
+                self.access_token = await get_access_token()
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                response = await client.get(
+                    f"{GOOGLE_GMAIL_API_BASE}/history",
+                    headers=headers,
+                    params=params
+                )
+            
+            # 404 means historyId is too old, caller should handle this
+            if response.status_code == 404:
+                return {"history": [], "historyId": None, "expired": True}
+                
+            response.raise_for_status()
+            return response.json()
+
     def parse_message_body(self, payload: Dict[str, Any]) -> Dict[str, str]:
         """
         Extracts plain text and HTML body from message payload.
