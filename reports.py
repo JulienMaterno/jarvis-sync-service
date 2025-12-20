@@ -77,7 +77,7 @@ async def generate_evening_journal_prompt():
         
         # 6. Today's reflections
         reflections_resp = supabase.table("reflections") \
-            .select("title, tags") \
+            .select("*") \
             .gte("created_at", today_start.isoformat()) \
             .lte("created_at", today_end.isoformat()) \
             .execute()
@@ -85,7 +85,7 @@ async def generate_evening_journal_prompt():
         
         # 7. Today's journal entries (if any already exist)
         journals_resp = supabase.table("journals") \
-            .select("highlights, mood") \
+            .select("*") \
             .eq("date", today.isoformat()) \
             .execute()
         activity_data["journals"] = journals_resp.data or []
