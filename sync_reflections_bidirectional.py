@@ -215,11 +215,26 @@ class SupabaseClient:
         self.client = httpx.Client(headers=self.headers, timeout=30.0)
     
     def get_all_reflections(self) -> List[Dict]:
-        """Get all reflections from Supabase."""
+        """Get all reflections from Supabase (non-deleted only)."""
         url = f"{self.base_url}/reflections?select=*&order=created_at.desc&deleted_at=is.null"
         response = self.client.get(url)
         response.raise_for_status()
         return response.json()
+    
+    def get_deleted_reflections_with_notion_id(self) -> List[Dict]:
+        """Get reflections that are deleted but still have Notion page IDs (need archiving in Notion)."""
+        url = f"{self.base_url}/reflections?select=id,notion_page_id,title,deleted_at&deleted_at=not.is.null&notion_page_id=not.is.null"
+        response = self.client.get(url)
+        response.raise_for_status()
+        return response.json()
+    
+    def clear_notion_page_id(self, reflection_id: str) -> None:
+        """Clear the notion_page_id after archiving in Notion."""
+        response = self.client.patch(
+            f"{self.base_url}/reflections?id=eq.{reflection_id}",
+            json={'notion_page_id': None, 'notion_updated_at': None}
+        )
+        response.raise_for_status()
     
     def get_reflection_by_notion_id(self, notion_page_id: str) -> Optional[Dict]:
         """Find a reflection by its Notion page ID."""
@@ -495,6 +510,55 @@ def sync_notion_to_supabase(
     return created, updated, skipped
 
 
+def sync_deleted_reflections(
+    notion: NotionClient,
+    supabase: SupabaseClient
+) -> int:
+    """
+    Sync deleted reflections: Archive Notion pages for records deleted in Supabase.
+    This ensures Notion stays in sync when reflections are deleted from the database.
+    
+    Returns: Number of Notion pages archived
+    """
+    archived = 0
+    
+    # Get reflections that are deleted in Supabase but still have Notion page IDs
+    deleted_reflections = supabase.get_deleted_reflections_with_notion_id()
+    
+    if not deleted_reflections:
+        logger.info("No deleted reflections need Notion archiving")
+        return 0
+    
+    logger.info(f"Found {len(deleted_reflections)} deleted reflections to archive in Notion")
+    
+    for reflection in deleted_reflections:
+        reflection_id = reflection.get('id')
+        notion_page_id = reflection.get('notion_page_id')
+        title = reflection.get('title', 'Untitled')
+        
+        try:
+            # Archive the Notion page
+            notion.archive_page(notion_page_id)
+            logger.info(f"Archived Notion page for deleted reflection: {title}")
+            
+            # Clear the notion_page_id so we don't try again
+            supabase.clear_notion_page_id(reflection_id)
+            
+            archived += 1
+            log_sync_event_sync("archive_notion_reflection", "success", f"Archived '{title}' in Notion (deleted in Supabase)")
+            
+        except Exception as e:
+            # Page might already be archived or not exist
+            if "404" in str(e) or "archived" in str(e).lower():
+                logger.info(f"Notion page already archived/deleted: {title}")
+                supabase.clear_notion_page_id(reflection_id)
+            else:
+                logger.error(f"Error archiving Notion page for {title}: {e}")
+    
+    logger.info(f"Archived {archived} Notion pages for deleted reflections")
+    return archived
+
+
 def sync_supabase_to_notion(
     notion: NotionClient, 
     supabase: SupabaseClient,
@@ -665,7 +729,11 @@ def run_sync(full_sync: bool = False, since_hours: int = 24) -> Dict:
     notion = NotionClient(NOTION_API_TOKEN)
     supabase = SupabaseClient(SUPABASE_URL, SUPABASE_KEY)
     
-    # Run syncs
+    # Step 1: Sync deletions first (archive Notion pages for deleted Supabase records)
+    logger.info("--- SYNCING DELETIONS ---")
+    archived = sync_deleted_reflections(notion, supabase)
+    
+    # Step 2: Run bidirectional syncs
     logger.info("--- NOTION → SUPABASE ---")
     n2s_created, n2s_updated, n2s_skipped = sync_notion_to_supabase(
         notion, supabase, full_sync, since_hours
@@ -677,11 +745,12 @@ def run_sync(full_sync: bool = False, since_hours: int = 24) -> Dict:
     )
     
     elapsed = time.time() - start_time
-    total_ops = n2s_created + n2s_updated + s2n_created + s2n_updated
+    total_ops = n2s_created + n2s_updated + s2n_created + s2n_updated + archived
     
     logger.info("=" * 60)
     logger.info("REFLECTION SYNC COMPLETE")
     logger.info("=" * 60)
+    logger.info(f"Deletions synced: {archived} Notion pages archived")
     logger.info(f"Notion → Supabase: {n2s_created} created, {n2s_updated} updated, {n2s_skipped} skipped")
     logger.info(f"Supabase → Notion: {s2n_created} created, {s2n_updated} updated, {s2n_skipped} skipped")
     logger.info(f"Total operations: {total_ops} in {elapsed:.1f}s")
@@ -689,10 +758,11 @@ def run_sync(full_sync: bool = False, since_hours: int = 24) -> Dict:
     
     log_sync_event_sync(
         "reflection_sync_complete", "success",
-        f"Reflection sync complete: {total_ops} operations in {elapsed:.1f}s"
+        f"Reflection sync complete: {total_ops} operations in {elapsed:.1f}s (archived: {archived})"
     )
     
     return {
+        'deletions_synced': archived,
         'notion_to_supabase': {'created': n2s_created, 'updated': n2s_updated, 'skipped': n2s_skipped},
         'supabase_to_notion': {'created': s2n_created, 'updated': s2n_updated, 'skipped': s2n_skipped},
         'total_operations': total_ops,
