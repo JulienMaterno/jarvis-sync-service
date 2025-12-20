@@ -156,6 +156,16 @@ class NotionClient:
         )
         response.raise_for_status()
         return response.json()
+
+    @retry_on_error_sync()
+    def archive_page(self, page_id: str) -> Dict:
+        """Archive (delete) a page."""
+        response = self.client.patch(
+            f'https://api.notion.com/v1/pages/{page_id}',
+            json={"archived": True}
+        )
+        response.raise_for_status()
+        return response.json()
     
     @retry_on_error_sync()
     def delete_all_blocks(self, page_id: str) -> int:
@@ -400,6 +410,13 @@ def sync_notion_to_supabase(
             existing = supabase.get_reflection_by_notion_id(notion_page_id)
             
             if existing:
+                # Check if deleted in Supabase
+                if existing.get('deleted_at'):
+                    logger.info(f"Reflection {notion_page_id} is deleted in Supabase. Deleting from Notion.")
+                    notion.archive_page(notion_page_id)
+                    skipped += 1
+                    continue
+
                 # Check if Notion is newer
                 supabase_updated = existing.get('notion_updated_at', '')
                 last_sync_source = existing.get('last_sync_source', '')
@@ -566,7 +583,7 @@ def sync_supabase_to_notion(
                 # Update Notion (properties AND content blocks)
                 try:
                     props, blocks = supabase_reflection_to_notion(reflection)
-                    notion.update_page(notion_page_id, props)
+                    updated_page = notion.update_page(notion_page_id, props)
                     
                     # Update content: delete old blocks and add new ones
                     if blocks:
@@ -577,15 +594,19 @@ def sync_supabase_to_notion(
                             logger.warning(f"Failed to update content blocks for {reflection['title']}: {e}")
                     
                     supabase.update_reflection(reflection_id, {
-                        'notion_updated_at': datetime.now(timezone.utc).isoformat(),
+                        'notion_updated_at': updated_page.get('last_edited_time'),
                         'last_sync_source': 'supabase'
                     })
                     updated += 1
                     logger.info(f"Updated Notion reflection: {reflection['title']}")
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code == 404:
-                        logger.warning(f"Notion page {notion_page_id} not found - unlinking")
-                        supabase.update_reflection(reflection_id, {'notion_page_id': None, 'notion_updated_at': None})
+                        logger.warning(f"Notion page {notion_page_id} not found - marking as deleted in Supabase")
+                        supabase.update_reflection(reflection_id, {
+                            'deleted_at': datetime.now(timezone.utc).isoformat(),
+                            'notion_page_id': None, 
+                            'notion_updated_at': None
+                        })
                         skipped += 1
                     else:
                         raise

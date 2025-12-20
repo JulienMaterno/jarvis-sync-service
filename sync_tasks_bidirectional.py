@@ -466,11 +466,11 @@ def sync_supabase_to_notion(
                 # Update Notion
                 try:
                     props = supabase_task_to_notion(task)
-                    notion.update_page(notion_page_id, props)
+                    updated_page = notion.update_page(notion_page_id, props)
                     
                     # Update Supabase with sync info
                     supabase.update_task(task_id, {
-                        'notion_updated_at': datetime.now(timezone.utc).isoformat(),
+                        'notion_updated_at': updated_page.get('last_edited_time'),
                         'last_sync_source': 'supabase'
                     })
                     updated += 1

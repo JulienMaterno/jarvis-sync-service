@@ -1052,11 +1052,11 @@ def sync_supabase_to_notion(
                     
                     if needs_update:
                         logger.info(f"Updating Notion: {meeting['title']}")
-                        notion.update_page(notion_page_id, new_props)
+                        updated_page = notion.update_page(notion_page_id, new_props)
                         
                         # Update Supabase with new notion_updated_at and last_sync_source
                         supabase.update_meeting(meeting_id, {
-                            'notion_updated_at': datetime.now(timezone.utc).isoformat(),
+                            'notion_updated_at': updated_page.get('last_edited_time'),
                             'last_sync_source': 'supabase'  # Track sync direction
                         })
                         updated += 1
