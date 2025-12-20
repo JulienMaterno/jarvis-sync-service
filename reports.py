@@ -51,7 +51,7 @@ async def generate_evening_journal_prompt():
         
         # 3. Today's emails
         emails_resp = supabase.table("emails") \
-            .select("subject, sender, contact_name, snippet") \
+            .select("subject, sender, snippet") \
             .gte("date", today_start.isoformat()) \
             .lte("date", today_end.isoformat()) \
             .limit(20) \
