@@ -156,6 +156,35 @@ class NotionClient:
         )
         response.raise_for_status()
         return response.json()
+    
+    @retry_on_error_sync()
+    def delete_all_blocks(self, page_id: str) -> int:
+        """Delete all blocks from a page to prepare for content update."""
+        response = self.client.get(f'https://api.notion.com/v1/blocks/{page_id}/children')
+        response.raise_for_status()
+        blocks = response.json().get('results', [])
+        
+        deleted = 0
+        for block in blocks:
+            try:
+                del_resp = self.client.delete(f'https://api.notion.com/v1/blocks/{block["id"]}')
+                del_resp.raise_for_status()
+                deleted += 1
+            except Exception as e:
+                logger.warning(f"Failed to delete block {block['id']}: {e}")
+        return deleted
+    
+    @retry_on_error_sync()
+    def append_blocks(self, page_id: str, blocks: List[Dict]) -> Dict:
+        """Append blocks to a page."""
+        if not blocks:
+            return {}
+        response = self.client.patch(
+            f'https://api.notion.com/v1/blocks/{page_id}/children',
+            json={"children": blocks}
+        )
+        response.raise_for_status()
+        return response.json()
 
 
 # ============================================================================
@@ -534,10 +563,18 @@ def sync_supabase_to_notion(
                     skipped += 1
                     continue
                 
-                # Update Notion (properties only, not content blocks)
+                # Update Notion (properties AND content blocks)
                 try:
-                    props, _ = supabase_reflection_to_notion(reflection)
+                    props, blocks = supabase_reflection_to_notion(reflection)
                     notion.update_page(notion_page_id, props)
+                    
+                    # Update content: delete old blocks and add new ones
+                    if blocks:
+                        try:
+                            notion.delete_all_blocks(notion_page_id)
+                            notion.append_blocks(notion_page_id, blocks[:100])
+                        except Exception as e:
+                            logger.warning(f"Failed to update content blocks for {reflection['title']}: {e}")
                     
                     supabase.update_reflection(reflection_id, {
                         'notion_updated_at': datetime.now(timezone.utc).isoformat(),
@@ -555,14 +592,22 @@ def sync_supabase_to_notion(
             else:
                 # Not linked - create in Notion
                 props, blocks = supabase_reflection_to_notion(reflection)
-                logger.info(f"Creating Notion reflection: {reflection['title']}")
+                logger.info(f"Creating Notion reflection: {reflection['title']} with {len(blocks)} blocks")
                 
                 try:
                     # Try with blocks first
                     new_page = notion.create_page(NOTION_REFLECTIONS_DB_ID, props, blocks[:100])
                 except Exception as e:
-                    logger.warning(f"Failed with blocks, trying without: {e}")
+                    logger.warning(f"Failed to create with blocks ({e}), creating page first then adding blocks")
+                    # Create page without blocks first
                     new_page = notion.create_page(NOTION_REFLECTIONS_DB_ID, props, [])
+                    # Then append blocks separately
+                    if blocks:
+                        try:
+                            notion.append_blocks(new_page['id'], blocks[:100])
+                            logger.info(f"Appended {len(blocks[:100])} blocks to page")
+                        except Exception as block_err:
+                            logger.error(f"Failed to append blocks: {block_err}")
                 
                 new_page_id = new_page['id']
                 
