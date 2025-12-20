@@ -5,7 +5,7 @@ from lib.sync_service import sync_contacts
 from lib.notion_sync import sync_notion_to_supabase, sync_supabase_to_notion
 from lib.telegram_client import notify_error, reset_failure_count
 from lib.health_monitor import check_sync_health, get_sync_statistics
-from reports import generate_daily_report
+from reports import generate_daily_report, generate_evening_journal_prompt
 from backup import backup_contacts
 import logging
 
@@ -154,6 +154,22 @@ async def daily_report(background_tasks: BackgroundTasks):
         return {"status": "queued", "message": "Daily report generation started"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/report/evening-journal")
+async def evening_journal_prompt(background_tasks: BackgroundTasks):
+    """
+    Generates and sends an evening journal prompt with topics based on
+    today's activities (meetings, emails, calendar events, tasks).
+    
+    Schedule this at 7pm via Cloud Scheduler.
+    """
+    try:
+        background_tasks.add_task(generate_evening_journal_prompt)
+        return {"status": "queued", "message": "Evening journal prompt generation started"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/backup")
 async def trigger_backup():

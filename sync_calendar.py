@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 from lib.google_calendar import GoogleCalendarClient
-from lib.supabase_client import supabase
+from lib.supabase_client import supabase, find_contact_by_email
 from lib.logging_service import log_sync_event
 
 logger = logging.getLogger("CalendarSync")
@@ -101,6 +101,16 @@ class CalendarSync:
                 start_time = start.get('dateTime') or start.get('date')
                 end_time = end.get('dateTime') or end.get('date')
                 
+                # Find contact from organizer or first attendee
+                organizer = event.get('organizer', {})
+                attendees = event.get('attendees', [])
+                contact_id = find_contact_by_email(organizer.get('email'))
+                if not contact_id and attendees:
+                    for att in attendees:
+                        contact_id = find_contact_by_email(att.get('email'))
+                        if contact_id:
+                            break
+                
                 record = {
                     "google_event_id": event['id'],
                     "calendar_id": "primary",
@@ -115,7 +125,8 @@ class CalendarSync:
                     "creator": event.get('creator', {}),
                     "organizer": event.get('organizer', {}),
                     "updated_at": datetime.now(timezone.utc).isoformat(),
-                    "last_sync_at": datetime.now(timezone.utc).isoformat()
+                    "last_sync_at": datetime.now(timezone.utc).isoformat(),
+                    "contact_id": contact_id  # Auto-link to contact
                 }
                 upsert_data.append(record)
 

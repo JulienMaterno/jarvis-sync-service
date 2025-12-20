@@ -5,6 +5,122 @@ from lib.telegram_client import send_telegram_message
 
 logger = logging.getLogger(__name__)
 
+
+async def generate_evening_journal_prompt():
+    """
+    Generates an evening journal prompt with topics based on the day's activities.
+    Combines the daily report with journal suggestions.
+    """
+    try:
+        logger.info("Generating evening journal prompt...")
+        
+        today = datetime.now(timezone.utc).date()
+        today_start = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
+        today_end = datetime.combine(today, datetime.max.time()).replace(tzinfo=timezone.utc)
+        
+        # Gather today's activities
+        topics = []
+        people = set()
+        
+        # 1. Today's meetings
+        meetings_resp = supabase.table("meetings") \
+            .select("title, summary, people_mentioned") \
+            .gte("date", today_start.isoformat()) \
+            .lte("date", today_end.isoformat()) \
+            .execute()
+        
+        for m in meetings_resp.data or []:
+            if m.get("title"):
+                topics.append(f"📅 Meeting: {m['title']}")
+            if m.get("people_mentioned"):
+                for p in m["people_mentioned"]:
+                    people.add(p)
+        
+        # 2. Today's calendar events
+        events_resp = supabase.table("calendar_events") \
+            .select("summary, attendees") \
+            .gte("start_time", today_start.isoformat()) \
+            .lte("start_time", today_end.isoformat()) \
+            .execute()
+        
+        for e in events_resp.data or []:
+            if e.get("summary") and e["summary"] not in [t.split(": ", 1)[-1] for t in topics]:
+                topics.append(f"🗓️ Event: {e['summary']}")
+            if e.get("attendees"):
+                for att in e["attendees"]:
+                    if att.get("displayName"):
+                        people.add(att["displayName"])
+        
+        # 3. Today's emails (important ones)
+        emails_resp = supabase.table("emails") \
+            .select("subject, sender") \
+            .gte("date", today_start.isoformat()) \
+            .lte("date", today_end.isoformat()) \
+            .limit(10) \
+            .execute()
+        
+        email_subjects = []
+        for e in emails_resp.data or []:
+            if e.get("subject"):
+                # Skip newsletters and automated emails
+                subject = e["subject"]
+                skip_keywords = ["unsubscribe", "newsletter", "automated", "noreply", "no-reply"]
+                if not any(kw in subject.lower() for kw in skip_keywords):
+                    email_subjects.append(subject[:50])
+        
+        if email_subjects:
+            topics.append(f"📧 Emails about: {', '.join(email_subjects[:3])}")
+        
+        # 4. Today's completed tasks
+        tasks_resp = supabase.table("tasks") \
+            .select("title") \
+            .eq("completed", True) \
+            .gte("updated_at", today_start.isoformat()) \
+            .lte("updated_at", today_end.isoformat()) \
+            .execute()
+        
+        completed_tasks = [t["title"] for t in (tasks_resp.data or []) if t.get("title")]
+        if completed_tasks:
+            topics.append(f"✅ Completed: {', '.join(completed_tasks[:3])}")
+        
+        # 5. Build the message
+        now = datetime.now(timezone.utc)
+        greeting = "Good evening" if now.hour >= 17 else "Hi"
+        
+        message = f"""📓 **{greeting}! Time for your evening journal**
+
+🕐 _{now.strftime('%A, %B %d')} at {now.strftime('%H:%M')}_
+
+"""
+        
+        if topics:
+            message += "**Today's highlights to reflect on:**\n"
+            for topic in topics[:6]:  # Limit to 6 topics
+                message += f"• {topic}\n"
+            message += "\n"
+        
+        if people:
+            people_list = list(people)[:5]  # Limit to 5 people
+            message += f"**People you connected with:** {', '.join(people_list)}\n\n"
+        
+        message += """**Journal prompts:**
+• What went well today?
+• What could have gone better?
+• What are you grateful for?
+• What's one thing you learned?
+• What's on your mind for tomorrow?
+
+_Reply with a voice note or text to journal!_ 🎙️"""
+
+        await send_telegram_message(message)
+        logger.info("Evening journal prompt sent.")
+        return {"status": "success", "topics": len(topics), "people": len(people)}
+        
+    except Exception as e:
+        logger.error(f"Failed to generate evening prompt: {e}")
+        raise e
+
+
 async def generate_daily_report():
     """
     Generates a daily summary of sync activities and sends it via Telegram.
@@ -87,11 +203,11 @@ _{yesterday.strftime('%Y-%m-%d')} to {datetime.now(timezone.utc).strftime('%Y-%m
 
 **Sync Details**
 📧 Emails: {stats['emails_synced']}
-dV Calendar: {stats['calendar_events_synced']}
+📆 Calendar: {stats['calendar_events_synced']}
 📝 Reflections: {stats['reflections_synced']}
 ✅ Tasks: {stats['tasks_synced']}
 📅 Meetings: {stats['meetings_synced']}
-busts Contacts: {stats['contacts_synced']}
+👥 Contacts: {stats['contacts_synced']}
 """
 
         if stats['errors'] > 0:

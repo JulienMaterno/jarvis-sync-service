@@ -29,6 +29,11 @@ TRANSIENT_ERROR_PATTERNS = [
     "ECONNRESET",
     "ECONNREFUSED",
     "SSL",
+    "Bad Request",  # Often transient (sync token issues)
+    "400",          # HTTP 400 errors
+    "502",          # Bad Gateway
+    "503",          # Service Unavailable  
+    "504",          # Gateway Timeout
 ]
 
 def is_transient_error(error: str) -> bool:

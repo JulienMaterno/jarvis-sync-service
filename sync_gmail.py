@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any
 from lib.google_gmail import GmailClient
-from lib.supabase_client import supabase
+from lib.supabase_client import supabase, find_contact_by_email
 from lib.logging_service import log_sync_event
 
 logger = logging.getLogger("GmailSync")
@@ -111,7 +111,9 @@ class GmailSync:
                             "body_text": body_content['text'],
                             "body_html": body_content['html'],
                             "updated_at": datetime.now(timezone.utc).isoformat(),
-                            "last_sync_at": datetime.now(timezone.utc).isoformat()
+                            "last_sync_at": datetime.now(timezone.utc).isoformat(),
+                            # Auto-link to contact if found
+                            "contact_id": find_contact_by_email(sender) or find_contact_by_email(recipient)
                         }
                         upsert_data.append(record)
                     
