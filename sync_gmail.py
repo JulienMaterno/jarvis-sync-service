@@ -45,12 +45,17 @@ class GmailSync:
             
             # Supabase 'in' query might fail if list is too long, chunk it
             existing_ids = set()
-            chunk_size = 100
+            chunk_size = 50  # Reduced chunk size to avoid timeouts
             for i in range(0, len(all_ids), chunk_size):
                 chunk = all_ids[i:i+chunk_size]
-                response = supabase.table("emails").select("google_message_id").in_("google_message_id", chunk).execute()
-                for row in response.data:
-                    existing_ids.add(row['google_message_id'])
+                try:
+                    response = supabase.table("emails").select("google_message_id").in_("google_message_id", chunk).execute()
+                    for row in response.data:
+                        existing_ids.add(row['google_message_id'])
+                except Exception as e:
+                    logger.error(f"Error checking existing emails chunk {i}: {e}")
+                    # Continue to next chunk instead of failing entire sync
+                    continue
             
             logger.info(f"Found {len(existing_ids)} existing emails in DB")
             

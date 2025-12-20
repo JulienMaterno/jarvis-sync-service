@@ -13,13 +13,26 @@ def format_rfc3339(dt: datetime) -> str:
     Ensures proper UTC format with 'Z' suffix (no +00:00 offset).
     Google Calendar API is strict - no microseconds, no +00:00 offset.
     """
-    # Convert to UTC if timezone-aware
-    if dt.tzinfo is not None:
-        dt = dt.astimezone(timezone.utc)
-    # Strip microseconds and timezone info, then format with Z suffix
-    dt = dt.replace(microsecond=0, tzinfo=None)
-    # Format without microseconds, with Z suffix for UTC
-    return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+    try:
+        # Convert to UTC if timezone-aware
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc)
+        
+        # Create a new naive datetime in UTC
+        dt_utc = datetime(
+            year=dt.year,
+            month=dt.month,
+            day=dt.day,
+            hour=dt.hour,
+            minute=dt.minute,
+            second=dt.second
+        )
+        
+        # Format with Z suffix
+        return dt_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    except Exception as e:
+        # Fallback
+        return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
 
 class GoogleCalendarClient:
     def __init__(self):
