@@ -18,7 +18,7 @@ def format_rfc3339(dt: datetime) -> str:
         if dt.tzinfo is not None:
             dt = dt.astimezone(timezone.utc)
         
-        # Create a new naive datetime in UTC
+        # Create a new naive datetime in UTC, explicitly dropping microseconds
         dt_utc = datetime(
             year=dt.year,
             month=dt.month,
@@ -30,11 +30,13 @@ def format_rfc3339(dt: datetime) -> str:
         
         # Format with Z suffix
         formatted_date = dt_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
-        # logger.debug(f"Formatted date: {formatted_date}")
         return formatted_date
     except Exception as e:
-        # Fallback
-        return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+        # Fallback - ensure we strip microseconds manually if strftime fails
+        try:
+            return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+        except:
+            return dt.isoformat().split('.')[0].split('+')[0] + 'Z'
 
 class GoogleCalendarClient:
     def __init__(self):

@@ -70,6 +70,8 @@ class CalendarSync:
                 time_min = datetime.now(timezone.utc) - timedelta(days=days_past)
                 time_max = datetime.now(timezone.utc) + timedelta(days=days_future)
                 
+                logger.info(f"Syncing calendar from {time_min} to {time_max}")
+                
                 try:
                     result = await self.google_client.list_events(
                         time_min=time_min,
