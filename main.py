@@ -3,7 +3,7 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.concurrency import run_in_threadpool
 from lib.sync_service import sync_contacts
 from lib.notion_sync import sync_notion_to_supabase, sync_supabase_to_notion
-from lib.telegram_client import notify_error
+from lib.telegram_client import notify_error, reset_failure_count
 from lib.health_monitor import check_sync_health, get_sync_statistics
 from reports import generate_daily_report
 from backup import backup_contacts
@@ -113,6 +113,8 @@ async def sync_everything(background_tasks: BackgroundTasks):
             else:
                 res = await run_in_threadpool(func, *args, **kwargs)
             results[name] = {"status": "success", "data": res}
+            # Reset failure counter on success
+            reset_failure_count(name)
         except Exception as e:
             logger.error(f"{name} failed: {e}")
             results[name] = {"status": "error", "error": str(e)}
