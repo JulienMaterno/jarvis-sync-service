@@ -1,120 +1,128 @@
 import logging
+import os
+import httpx
 from datetime import datetime, timedelta, timezone
 from lib.supabase_client import supabase
 from lib.telegram_client import send_telegram_message
 
 logger = logging.getLogger(__name__)
 
+INTELLIGENCE_SERVICE_URL = os.getenv("INTELLIGENCE_SERVICE_URL", "https://jarvis-intelligence-service-776871804948.asia-southeast1.run.app")
+
 
 async def generate_evening_journal_prompt():
     """
-    Generates an evening journal prompt with topics based on the day's activities.
-    Combines the daily report with journal suggestions.
+    Generates an AI-powered evening journal prompt by calling the Intelligence Service.
+    The AI analyzes the day's activities and creates personalized highlights and prompts.
     """
     try:
-        logger.info("Generating evening journal prompt...")
+        logger.info("Generating evening journal prompt via Intelligence Service...")
         
         today = datetime.now(timezone.utc).date()
         today_start = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
         today_end = datetime.combine(today, datetime.max.time()).replace(tzinfo=timezone.utc)
         
-        # Gather today's activities
-        topics = []
-        people = set()
+        # Gather today's raw activity data
+        activity_data = {
+            "meetings": [],
+            "calendar_events": [],
+            "emails": [],
+            "tasks_completed": [],
+            "tasks_created": [],
+            "reflections": [],
+            "journals": []
+        }
         
         # 1. Today's meetings
         meetings_resp = supabase.table("meetings") \
-            .select("title, summary, people_mentioned") \
+            .select("title, summary, people_mentioned, topics_discussed") \
             .gte("date", today_start.isoformat()) \
             .lte("date", today_end.isoformat()) \
             .execute()
-        
-        for m in meetings_resp.data or []:
-            if m.get("title"):
-                topics.append(f"📅 Meeting: {m['title']}")
-            if m.get("people_mentioned"):
-                for p in m["people_mentioned"]:
-                    people.add(p)
+        activity_data["meetings"] = meetings_resp.data or []
         
         # 2. Today's calendar events
         events_resp = supabase.table("calendar_events") \
-            .select("summary, attendees") \
+            .select("summary, description, attendees, location") \
             .gte("start_time", today_start.isoformat()) \
             .lte("start_time", today_end.isoformat()) \
             .execute()
+        activity_data["calendar_events"] = events_resp.data or []
         
-        for e in events_resp.data or []:
-            if e.get("summary") and e["summary"] not in [t.split(": ", 1)[-1] for t in topics]:
-                topics.append(f"🗓️ Event: {e['summary']}")
-            if e.get("attendees"):
-                for att in e["attendees"]:
-                    if att.get("displayName"):
-                        people.add(att["displayName"])
-        
-        # 3. Today's emails (important ones)
+        # 3. Today's emails
         emails_resp = supabase.table("emails") \
-            .select("subject, sender") \
+            .select("subject, sender, contact_name, snippet") \
             .gte("date", today_start.isoformat()) \
             .lte("date", today_end.isoformat()) \
-            .limit(10) \
+            .limit(20) \
             .execute()
-        
-        email_subjects = []
-        for e in emails_resp.data or []:
-            if e.get("subject"):
-                # Skip newsletters and automated emails
-                subject = e["subject"]
-                skip_keywords = ["unsubscribe", "newsletter", "automated", "noreply", "no-reply"]
-                if not any(kw in subject.lower() for kw in skip_keywords):
-                    email_subjects.append(subject[:50])
-        
-        if email_subjects:
-            topics.append(f"📧 Emails about: {', '.join(email_subjects[:3])}")
+        activity_data["emails"] = emails_resp.data or []
         
         # 4. Today's completed tasks
-        tasks_resp = supabase.table("tasks") \
-            .select("title") \
+        tasks_completed_resp = supabase.table("tasks") \
+            .select("title, description") \
             .not_.is_("completed_at", "null") \
             .gte("completed_at", today_start.isoformat()) \
             .lte("completed_at", today_end.isoformat()) \
             .execute()
+        activity_data["tasks_completed"] = tasks_completed_resp.data or []
         
-        completed_tasks = [t["title"] for t in (tasks_resp.data or []) if t.get("title")]
-        if completed_tasks:
-            topics.append(f"✅ Completed: {', '.join(completed_tasks[:3])}")
+        # 5. Today's created tasks
+        tasks_created_resp = supabase.table("tasks") \
+            .select("title, description") \
+            .gte("created_at", today_start.isoformat()) \
+            .lte("created_at", today_end.isoformat()) \
+            .execute()
+        activity_data["tasks_created"] = tasks_created_resp.data or []
         
-        # 5. Build the message
-        now = datetime.now(timezone.utc)
-        greeting = "Good evening" if now.hour >= 17 else "Hi"
+        # 6. Today's reflections
+        reflections_resp = supabase.table("reflections") \
+            .select("title, key_insights, tags") \
+            .gte("created_at", today_start.isoformat()) \
+            .lte("created_at", today_end.isoformat()) \
+            .execute()
+        activity_data["reflections"] = reflections_resp.data or []
         
-        message = f"""📓 **{greeting}! Time for your evening journal**
-
-🕐 _{now.strftime('%A, %B %d')} at {now.strftime('%H:%M')}_
-
-"""
+        # 7. Today's journal entries (if any already exist)
+        journals_resp = supabase.table("journals") \
+            .select("highlights, mood, energy_level") \
+            .eq("date", today.isoformat()) \
+            .execute()
+        activity_data["journals"] = journals_resp.data or []
         
-        if topics:
-            message += "**Today's highlights to reflect on:**\n"
-            for topic in topics[:6]:  # Limit to 6 topics
-                message += f"• {topic}\n"
-            message += "\n"
+        # Call Intelligence Service
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{INTELLIGENCE_SERVICE_URL}/api/v1/journal/evening-prompt",
+                json={
+                    "activity_data": activity_data,
+                    "timezone": "Asia/Singapore"
+                }
+            )
+            response.raise_for_status()
+            result = response.json()
         
-        if people:
-            people_list = list(people)[:5]  # Limit to 5 people
-            message += f"**People you connected with:** {', '.join(people_list)}\n\n"
-        
-        message += """**Journal prompts:**
-• What went well today?
-• What could have gone better?
-• What are you grateful for?
-• What's one thing you learned?
-• What's on your mind for tomorrow?
-
-_Reply with a voice note or text to journal!_ 🎙️"""
-
+        # Send the AI-generated message via Telegram
+        message = result.get("message", "Time to journal! 📓")
         await send_telegram_message(message)
-        logger.info("Evening journal prompt sent.")
-        return {"status": "success", "topics": len(topics), "people": len(people)}
+        
+        logger.info(f"Evening journal prompt sent. Highlights: {len(result.get('highlights', []))}")
+        return {
+            "status": "success", 
+            "highlights": result.get("highlights", []),
+            "prompts": result.get("reflection_prompts", [])
+        }
+        
+    except httpx.HTTPError as e:
+        logger.error(f"Intelligence Service error: {e}")
+        # Fallback to simple message
+        fallback_msg = """📓 **Evening Journal**
+
+Time to reflect on your day! Take a moment to journal about what happened, what you learned, and what's on your mind.
+
+_Reply with a voice note or text_ 🎙️"""
+        await send_telegram_message(fallback_msg)
+        return {"status": "fallback", "error": str(e)}
         
     except Exception as e:
         logger.error(f"Failed to generate evening prompt: {e}")
