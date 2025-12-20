@@ -74,9 +74,9 @@ async def generate_evening_journal_prompt():
         # 4. Today's completed tasks
         tasks_resp = supabase.table("tasks") \
             .select("title") \
-            .eq("completed", True) \
-            .gte("updated_at", today_start.isoformat()) \
-            .lte("updated_at", today_end.isoformat()) \
+            .not_.is_("completed_at", "null") \
+            .gte("completed_at", today_start.isoformat()) \
+            .lte("completed_at", today_end.isoformat()) \
             .execute()
         
         completed_tasks = [t["title"] for t in (tasks_resp.data or []) if t.get("title")]
