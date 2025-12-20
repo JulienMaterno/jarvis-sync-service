@@ -18,7 +18,8 @@ class GmailClient:
     async def list_messages(self, 
                           query: str = None, 
                           max_results: int = 100,
-                          include_spam_trash: bool = False) -> List[Dict[str, Any]]:
+                          include_spam_trash: bool = False,
+                          client: Optional[httpx.AsyncClient] = None) -> List[Dict[str, Any]]:
         """
         List messages matching a query.
         Returns a list of message objects (id, threadId).
@@ -33,28 +34,44 @@ class GmailClient:
         if query:
             params["q"] = query
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        if client:
             response = await client.get(
                 f"{GOOGLE_GMAIL_API_BASE}/messages",
                 headers=headers,
                 params=params
             )
+        else:
+            async with httpx.AsyncClient(timeout=60.0) as new_client:
+                response = await new_client.get(
+                    f"{GOOGLE_GMAIL_API_BASE}/messages",
+                    headers=headers,
+                    params=params
+                )
             
-            if response.status_code == 401:
-                self.access_token = await get_access_token()
-                headers["Authorization"] = f"Bearer {self.access_token}"
+        if response.status_code == 401:
+            self.access_token = await get_access_token()
+            headers["Authorization"] = f"Bearer {self.access_token}"
+            # Retry with fresh token
+            if client:
                 response = await client.get(
                     f"{GOOGLE_GMAIL_API_BASE}/messages",
                     headers=headers,
                     params=params
                 )
-                
-            response.raise_for_status()
-            data = response.json()
-            return data.get("messages", [])
+            else:
+                async with httpx.AsyncClient(timeout=60.0) as new_client:
+                    response = await new_client.get(
+                        f"{GOOGLE_GMAIL_API_BASE}/messages",
+                        headers=headers,
+                        params=params
+                    )
+            
+        response.raise_for_status()
+        data = response.json()
+        return data.get("messages", [])
 
     @retry_on_error()
-    async def get_message(self, message_id: str, format: str = 'full') -> Dict[str, Any]:
+    async def get_message(self, message_id: str, format: str = 'full', client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
         """
         Get full message details.
         format: 'full', 'metadata', 'minimal', 'raw'
@@ -62,14 +79,41 @@ class GmailClient:
         await self._ensure_token()
         headers = {"Authorization": f"Bearer {self.access_token}"}
         
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        params = {"format": format}
+        
+        if client:
             response = await client.get(
                 f"{GOOGLE_GMAIL_API_BASE}/messages/{message_id}",
                 headers=headers,
-                params={"format": format}
+                params=params
             )
-            response.raise_for_status()
-            return response.json()
+        else:
+            async with httpx.AsyncClient(timeout=60.0) as new_client:
+                response = await new_client.get(
+                    f"{GOOGLE_GMAIL_API_BASE}/messages/{message_id}",
+                    headers=headers,
+                    params=params
+                )
+
+        if response.status_code == 401:
+            self.access_token = await get_access_token()
+            headers["Authorization"] = f"Bearer {self.access_token}"
+            if client:
+                response = await client.get(
+                    f"{GOOGLE_GMAIL_API_BASE}/messages/{message_id}",
+                    headers=headers,
+                    params=params
+                )
+            else:
+                async with httpx.AsyncClient(timeout=60.0) as new_client:
+                    response = await new_client.get(
+                        f"{GOOGLE_GMAIL_API_BASE}/messages/{message_id}",
+                        headers=headers,
+                        params=params
+                    )
+
+        response.raise_for_status()
+        return response.json()
 
     def parse_message_body(self, payload: Dict[str, Any]) -> Dict[str, str]:
         """

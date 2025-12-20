@@ -28,76 +28,80 @@ class GmailSync:
             # List messages (IDs only)
             # include_spam_trash=True allows us to track emails moved to Trash/Spam
             # and update their labels accordingly (e.g. adding 'TRASH' label)
-            messages_meta = await self.gmail_client.list_messages(
-                query=query,
-                max_results=max_results,
-                include_spam_trash=True
-            )
             
-            if not messages_meta:
-                logger.info("No messages found")
-                return {"status": "success", "count": 0}
+            # Use a single client for all requests to avoid connection issues
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                messages_meta = await self.gmail_client.list_messages(
+                    query=query,
+                    max_results=max_results,
+                    include_spam_trash=True,
+                    client=client
+                )
+                
+                if not messages_meta:
+                    logger.info("No messages found")
+                    return {"status": "success", "count": 0}
 
-            logger.info(f"Found {len(messages_meta)} messages in Gmail")
-            
-            # Check which ones exist in Supabase
-            all_ids = [m['id'] for m in messages_meta]
-            
-            # Supabase 'in' query might fail if list is too long, chunk it
-            existing_ids = set()
-            chunk_size = 50  # Reduced chunk size to avoid timeouts
-            for i in range(0, len(all_ids), chunk_size):
-                chunk = all_ids[i:i+chunk_size]
-                try:
-                    response = supabase.table("emails").select("google_message_id").in_("google_message_id", chunk).execute()
-                    for row in response.data:
-                        existing_ids.add(row['google_message_id'])
-                except Exception as e:
-                    logger.error(f"Error checking existing emails chunk {i}: {e}")
-                    # Continue to next chunk instead of failing entire sync
-                    continue
-            
-            logger.info(f"Found {len(existing_ids)} existing emails in DB")
-            
-            upsert_data = []
-            for msg_meta in messages_meta:
-                msg_id = msg_meta['id']
-                try:
-                    if msg_id in existing_ids:
-                        # Optimization: If exists, fetch MINIMAL format just to update labels/thread_id
-                        # This saves bandwidth and processing time
-                        msg = await self.gmail_client.get_message(msg_id, format='minimal')
-                        
-                        # We only update labels and thread_id for existing emails
-                        # We assume body/subject/sender don't change
-                        record = {
-                            "google_message_id": msg_id,
-                            "thread_id": msg.get('threadId'),
-                            "label_ids": msg.get('labelIds', []),
-                            "snippet": msg.get('snippet', ''),
-                            "last_sync_at": datetime.now(timezone.utc).isoformat()
-                            # Don't update body/headers
-                        }
-                        upsert_data.append(record)
-                    else:
-                        # New email: Fetch FULL content
-                        msg = await self.gmail_client.get_message(msg_id, format='full')
-                        payload = msg.get('payload', {})
-                        
-                        # Parse body
-                        body_content = self.gmail_client.parse_message_body(payload)
-                        
-                        # Parse headers
-                        subject = self.gmail_client.get_header(payload, 'Subject')
-                        sender = self.gmail_client.get_header(payload, 'From')
-                        recipient = self.gmail_client.get_header(payload, 'To')
-                        date_str = self.gmail_client.get_header(payload, 'Date')
-                        
-                        # Parse date
-                        email_date = None
-                        if date_str:
-                            try:
-                                from email.utils import parsedate_to_datetime
+                logger.info(f"Found {len(messages_meta)} messages in Gmail")
+                
+                # Check which ones exist in Supabase
+                all_ids = [m['id'] for m in messages_meta]
+                
+                # Supabase 'in' query might fail if list is too long, chunk it
+                existing_ids = set()
+                chunk_size = 50  # Reduced chunk size to avoid timeouts
+                for i in range(0, len(all_ids), chunk_size):
+                    chunk = all_ids[i:i+chunk_size]
+                    try:
+                        response = supabase.table("emails").select("google_message_id").in_("google_message_id", chunk).execute()
+                        for row in response.data:
+                            existing_ids.add(row['google_message_id'])
+                    except Exception as e:
+                        logger.error(f"Error checking existing emails chunk {i}: {e}")
+                        # Continue to next chunk instead of failing entire sync
+                        continue
+                
+                logger.info(f"Found {len(existing_ids)} existing emails in DB")
+                
+                upsert_data = []
+                for msg_meta in messages_meta:
+                    msg_id = msg_meta['id']
+                    try:
+                        if msg_id in existing_ids:
+                            # Optimization: If exists, fetch MINIMAL format just to update labels/thread_id
+                            # This saves bandwidth and processing time
+                            msg = await self.gmail_client.get_message(msg_id, format='minimal', client=client)
+                            
+                            # We only update labels and thread_id for existing emails
+                            # We assume body/subject/sender don't change
+                            record = {
+                                "google_message_id": msg_id,
+                                "thread_id": msg.get('threadId'),
+                                "label_ids": msg.get('labelIds', []),
+                                "snippet": msg.get('snippet', ''),
+                                "last_sync_at": datetime.now(timezone.utc).isoformat()
+                                # Don't update body/headers
+                            }
+                            upsert_data.append(record)
+                        else:
+                            # New email: Fetch FULL content
+                            msg = await self.gmail_client.get_message(msg_id, format='full', client=client)
+                            payload = msg.get('payload', {})
+                            
+                            # Parse body
+                            body_content = self.gmail_client.parse_message_body(payload)
+                            
+                            # Parse headers
+                            subject = self.gmail_client.get_header(payload, 'Subject')
+                            sender = self.gmail_client.get_header(payload, 'From')
+                            recipient = self.gmail_client.get_header(payload, 'To')
+                            date_str = self.gmail_client.get_header(payload, 'Date')
+                            
+                            # Parse date
+                            email_date = None
+                            if date_str:
+                                try:
+                                    from email.utils import parsedate_to_datetime
                                 email_date = parsedate_to_datetime(date_str).isoformat()
                             except:
                                 internal_date = msg.get('internalDate')
