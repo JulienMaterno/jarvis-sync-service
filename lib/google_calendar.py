@@ -29,7 +29,9 @@ def format_rfc3339(dt: datetime) -> str:
         )
         
         # Format with Z suffix
-        return dt_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+        formatted_date = dt_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+        # logger.debug(f"Formatted date: {formatted_date}")
+        return formatted_date
     except Exception as e:
         # Fallback
         return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
