@@ -269,17 +269,17 @@ def notion_reflection_to_supabase(notion_reflection: Dict, notion: NotionClient)
     props = notion_reflection.get('properties', {})
     page_id = notion_reflection.get('id')
     
-    # Extract title
+    # Extract title (safely handle empty list)
     title_prop = props.get('Name', {}).get('title', [])
-    title = title_prop[0].get('plain_text', 'Untitled') if title_prop else 'Untitled'
+    title = title_prop[0].get('plain_text', 'Untitled') if title_prop and len(title_prop) > 0 else 'Untitled'
     
     # Extract date
     date_prop = props.get('Date', {}).get('date')
     date = date_prop.get('start') if date_prop else None
     
-    # Extract location/place
+    # Extract location/place (safely handle empty list)
     place_prop = props.get('Place', {}).get('rich_text', [])
-    location = place_prop[0].get('plain_text', '') if place_prop else None
+    location = place_prop[0].get('plain_text', '') if place_prop and len(place_prop) > 0 else None
     
     # Extract tags
     tags_prop = props.get('Tags', {}).get('multi_select', [])

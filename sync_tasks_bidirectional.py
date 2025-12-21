@@ -208,9 +208,9 @@ def notion_task_to_supabase(notion_task: Dict) -> Dict:
     """Convert Notion task properties to Supabase format."""
     props = notion_task.get('properties', {})
     
-    # Extract title
+    # Extract title (safely handle empty list)
     title_prop = props.get('Name', {}).get('title', [])
-    title = title_prop[0].get('plain_text', 'Untitled') if title_prop else 'Untitled'
+    title = title_prop[0].get('plain_text', 'Untitled') if title_prop and len(title_prop) > 0 else 'Untitled'
     
     # Extract due date
     due_prop = props.get('Due', {}).get('date')

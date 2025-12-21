@@ -78,15 +78,40 @@ class NotionClient:
         response.raise_for_status()
         return response.json()
 
-    @retry_on_error_sync()
     def archive_page(self, page_id: str) -> Dict[str, Any]:
+        """
+        Archive a Notion page. Handles cases where the page is already archived
+        or has been deleted.
+        
+        Returns:
+            Dict with 'archived': True on success, or 'already_archived': True if page was already gone
+        """
         url = f"{self.base_url}/pages/{page_id}"
-        body = {
-            "archived": True
-        }
-        response = self.client.patch(url, json=body)
-        response.raise_for_status()
-        return response.json()
+        
+        # First check if page exists and its current state
+        try:
+            page = self.retrieve_page(page_id)
+            if page.get("archived"):
+                logger.info(f"Page {page_id} is already archived")
+                return {"id": page_id, "already_archived": True, "archived": True}
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (400, 404):
+                logger.info(f"Page {page_id} not found (may be deleted)")
+                return {"id": page_id, "not_found": True, "archived": True}
+            raise
+        
+        # Archive the page
+        body = {"archived": True}
+        try:
+            response = self.client.patch(url, json=body)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (400, 404):
+                # Page may have been archived/deleted between check and archive
+                logger.info(f"Page {page_id} archive failed (400/404) - treating as archived")
+                return {"id": page_id, "already_archived": True, "archived": True}
+            raise
 
     @retry_on_error_sync()
     def retrieve_page(self, page_id: str) -> Dict[str, Any]:

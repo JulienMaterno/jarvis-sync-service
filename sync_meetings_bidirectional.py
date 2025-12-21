@@ -303,7 +303,7 @@ class NotionClient:
             props = page.get('properties', {})
             
             name_prop = props.get('Name', {}).get('title', [])
-            name = name_prop[0].get('plain_text', '') if name_prop else ''
+            name = name_prop[0].get('plain_text', '') if name_prop and len(name_prop) > 0 else ''
             email = props.get('Mail', {}).get('email')
             
             contact = {
@@ -366,7 +366,7 @@ class NotionClient:
             # Try exact match
             for page in results:
                 title_prop = page['properties'].get('Name', {}).get('title', [])
-                page_name = title_prop[0].get('plain_text', '') if title_prop else ''
+                page_name = title_prop[0].get('plain_text', '') if title_prop and len(title_prop) > 0 else ''
                 if page_name.lower() == name.lower():
                     return page['id']
             
@@ -388,7 +388,7 @@ class NotionClient:
             props = page.get('properties', {})
             
             name_prop = props.get('Name', {}).get('title', [])
-            name = name_prop[0].get('plain_text', '') if name_prop else ''
+            name = name_prop[0].get('plain_text', '') if name_prop and len(name_prop) > 0 else ''
             email = props.get('Mail', {}).get('email')
             
             self._crm_cache[page_id] = {
@@ -569,17 +569,17 @@ def notion_to_supabase_meeting(page: Dict, notion: NotionClient, supabase: Supab
     props = page.get('properties', {})
     page_id = page.get('id')
     
-    # Title
+    # Title (safely handle empty list)
     title_prop = props.get('Meeting', {}).get('title', [])
-    title = title_prop[0].get('plain_text', 'Untitled') if title_prop else 'Untitled'
+    title = title_prop[0].get('plain_text', 'Untitled') if title_prop and len(title_prop) > 0 else 'Untitled'
     
     # Date
     date_prop = props.get('Date', {}).get('date')
     date = date_prop.get('start') if date_prop else None
     
-    # Location  
+    # Location (safely handle empty list)
     location_prop = props.get('Location', {}).get('rich_text', [])
-    location = location_prop[0].get('plain_text', '') if location_prop else None
+    location = location_prop[0].get('plain_text', '') if location_prop and len(location_prop) > 0 else None
     
     # People relation (links to CRM)
     person_ids = props.get('People', {}).get('relation', [])

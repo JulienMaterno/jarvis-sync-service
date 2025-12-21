@@ -244,28 +244,38 @@ def sync_notion_deletions_to_supabase(last_synced_at: Optional[str]):
             
     logger.info(f"Processed {deleted_count} Notion deletions.")
 
-def sync_notion_to_supabase():
+def sync_notion_to_supabase(full_sync: bool = False):
     """
     Syncs contacts from Notion to Supabase.
-    """
-    logger.info("Starting Notion -> Supabase sync...")
     
-    # Optimization: Get the latest notion_updated_at from Supabase to filter Notion query
-    # This ensures we only fetch changed rows
-    res = supabase.table("contacts").select("notion_updated_at").order("notion_updated_at", desc=True).limit(1).execute()
-    last_synced_at = res.data[0]["notion_updated_at"] if res.data and res.data[0]["notion_updated_at"] else None
+    Args:
+        full_sync: If True, sync all contacts. If False, only sync recently changed.
+    
+    Returns:
+        Dict with synced, created, skipped, errors counts
+    """
+    logger.info(f"Starting Notion -> Supabase sync (mode: {'full' if full_sync else 'incremental'})...")
+    
+    # Get current counts for safety valve
+    existing_supabase = supabase.table("contacts").select("id").is_("deleted_at", "null").execute()
+    existing_count = len(existing_supabase.data) if existing_supabase.data else 0
+    
+    # Get last sync timestamp for incremental mode
+    last_synced_at = None
+    if not full_sync:
+        res = supabase.table("contacts").select("notion_updated_at").order("notion_updated_at", desc=True).limit(1).execute()
+        last_synced_at = res.data[0]["notion_updated_at"] if res.data and res.data[0].get("notion_updated_at") else None
     
     # 1. Handle Deletions (Archived in Notion -> Soft delete in Supabase)
     sync_notion_deletions_to_supabase(last_synced_at)
     
+    # Build filter for Notion query
     filter_params = None
-    if last_synced_at:
+    if last_synced_at and not full_sync:
         logger.info(f"Incremental sync: Fetching Notion pages modified after {last_synced_at}")
         filter_params = {
             "timestamp": "last_edited_time",
-            "last_edited_time": {
-                "after": last_synced_at
-            }
+            "last_edited_time": {"after": last_synced_at}
         }
     else:
         logger.info("Full sync: Fetching all Notion pages")
@@ -273,8 +283,15 @@ def sync_notion_to_supabase():
     notion_contacts = get_all_notion_contacts(filter_params)
     logger.info(f"Fetched {len(notion_contacts)} contacts from Notion.")
     
+    # SAFETY VALVE: Prevent accidental mass deletion
+    if full_sync and existing_count > 10 and len(notion_contacts) < (existing_count * 0.1):
+        msg = f"SAFETY VALVE: Notion returned {len(notion_contacts)} contacts, but Supabase has {existing_count}. Aborting to prevent data loss."
+        logger.error(msg)
+        raise Exception(msg)
+    
     synced = 0
     created = 0
+    skipped = 0
     errors = 0
     
     for page in notion_contacts:
@@ -289,29 +306,49 @@ def sync_notion_to_supabase():
             contact_data = transform_notion_to_supabase(page)
             
             if existing:
-                # Compare timestamps
+                # Compare timestamps with 5-second buffer to prevent ping-pong
                 sb_notion_updated = existing.get("notion_updated_at")
+                last_sync_source = existing.get("last_sync_source", "")
                 
-                # Since we filtered by last_edited_time > last_synced_at, we know it's newer.
-                # But double check just in case of race conditions or manual edits
-                if not sb_notion_updated or last_edited > sb_notion_updated:
+                should_update = False
+                if not sb_notion_updated:
+                    should_update = True
+                elif last_sync_source == 'notion':
+                    # Last update was from Notion - use 5s buffer
+                    from datetime import datetime, timedelta, timezone
+                    try:
+                        notion_dt = datetime.fromisoformat(last_edited.replace('Z', '+00:00'))
+                        sb_dt = datetime.fromisoformat(sb_notion_updated.replace('Z', '+00:00'))
+                        if notion_dt > sb_dt + timedelta(seconds=5):
+                            should_update = True
+                    except:
+                        should_update = last_edited > sb_notion_updated
+                else:
+                    should_update = last_edited > sb_notion_updated
+                
+                if should_update:
+                    contact_data['last_sync_source'] = 'notion'
                     logger.info(f"Updating Supabase contact from Notion: {contact_data.get('email')}")
                     supabase.table("contacts").update(contact_data).eq("id", existing["id"]).execute()
                     synced += 1
+                else:
+                    skipped += 1
             else:
                 # Check if email exists (to link existing contact)
                 email = contact_data.get("email")
                 if email:
-                    res_email = supabase.table("contacts").select("*").eq("email", email).execute()
+                    res_email = supabase.table("contacts").select("*").eq("email", email).is_("deleted_at", "null").execute()
                     existing_by_email = res_email.data[0] if res_email.data else None
                     
                     if existing_by_email:
+                        contact_data['last_sync_source'] = 'notion'
                         logger.info(f"Linking existing Supabase contact {email} to Notion page {page_id}")
                         supabase.table("contacts").update(contact_data).eq("id", existing_by_email["id"]).execute()
                         synced += 1
                         continue
 
                 # Create new
+                contact_data['last_sync_source'] = 'notion'
                 logger.info(f"Creating new contact in Supabase from Notion: {contact_data.get('email')}")
                 supabase.table("contacts").insert(contact_data).execute()
                 created += 1
@@ -320,17 +357,24 @@ def sync_notion_to_supabase():
             logger.error(f"Error syncing Notion page {page.get('id')}: {e}")
             errors += 1
             
-    return {"synced": synced, "created": created, "errors": errors}
+    logger.info(f"Notion → Supabase: {synced} updated, {created} created, {skipped} skipped, {errors} errors")
+    return {"synced": synced, "created": created, "skipped": skipped, "errors": errors}
 
-def sync_supabase_to_notion():
+def sync_supabase_to_notion(full_sync: bool = False):
     """
     Syncs contacts from Supabase to Notion.
+    
+    Args:
+        full_sync: If True, sync all contacts. If False, uses timestamp comparison.
+    
+    Returns:
+        Dict with synced, created, archived, skipped, errors counts
     """
-    logger.info("Starting Supabase -> Notion sync...")
+    logger.info(f"Starting Supabase -> Notion sync (mode: {'full' if full_sync else 'incremental'})...")
     
     # 1. Handle Deletions (Soft deleted in Supabase -> Archive in Notion)
     res = supabase.table("contacts").select("*").not_.is_("deleted_at", "null").not_.is_("notion_page_id", "null").execute()
-    deleted_contacts = res.data
+    deleted_contacts = res.data or []
     
     deleted_count = 0
     for contact in deleted_contacts:
@@ -342,27 +386,50 @@ def sync_supabase_to_notion():
             # Only archive if deletion happened after last sync
             if not notion_updated_at or deleted_at > notion_updated_at:
                 logger.info(f"Archiving Notion page {page_id} (deleted in Supabase)")
-                notion.archive_page(page_id)
+                result = notion.archive_page(page_id)
                 
-                # Update timestamp to prevent re-syncing
-                supabase.table("contacts").update({
-                    "notion_updated_at": datetime.now(timezone.utc).isoformat()
-                }).eq("id", contact["id"]).execute()
+                # Update timestamp to prevent re-syncing (also clear link if already gone)
+                update_data = {"notion_updated_at": datetime.now(timezone.utc).isoformat()}
+                if result.get("not_found") or result.get("already_archived"):
+                    update_data["notion_page_id"] = None  # Clear the link
+                    
+                supabase.table("contacts").update(update_data).eq("id", contact["id"]).execute()
                 deleted_count += 1
                 
         except Exception as e:
-            logger.error(f"Error archiving Notion page {contact.get('notion_page_id')}: {e}")
+            error_msg = str(e).lower()
+            if "400" in error_msg or "404" in error_msg or "archived" in error_msg:
+                # Page already gone - clear the link
+                logger.info(f"Notion page {contact.get('notion_page_id')} already archived/deleted, clearing link")
+                supabase.table("contacts").update({
+                    "notion_page_id": None,
+                    "notion_updated_at": datetime.now(timezone.utc).isoformat()
+                }).eq("id", contact["id"]).execute()
+                deleted_count += 1
+            else:
+                logger.error(f"Error archiving Notion page {contact.get('notion_page_id')}: {e}")
 
     logger.info(f"Archived {deleted_count} pages in Notion.")
 
     # 2. Handle Updates/Creates
     # Fetch active contacts
     res = supabase.table("contacts").select("*").is_("deleted_at", "null").execute()
-    contacts = res.data
+    contacts = res.data or []
     logger.info(f"Fetched {len(contacts)} active contacts from Supabase.")
+    
+    # Get Notion contact count for safety valve
+    notion_contacts = get_all_notion_contacts()
+    notion_count = len(notion_contacts)
+    
+    # SAFETY VALVE: Prevent accidental mass creation
+    if full_sync and notion_count > 10 and len(contacts) < (notion_count * 0.1):
+        msg = f"SAFETY VALVE: Supabase has {len(contacts)} contacts, but Notion has {notion_count}. Aborting to prevent data loss."
+        logger.error(msg)
+        raise Exception(msg)
     
     synced = 0
     created = 0
+    skipped = 0
     errors = 0
     
     for contact in contacts:
@@ -411,13 +478,17 @@ def sync_supabase_to_notion():
                         # Notion API returns 400 or 404 for archived pages sometimes depending on context
                         error_msg = str(e).lower()
                         if "archived" in error_msg or "could not find" in error_msg or "404" in error_msg or "400" in error_msg:
-                            logger.warning(f"Notion page {page_id} appears to be deleted/archived. Soft-deleting in Supabase.")
+                            logger.warning(f"Notion page {page_id} appears to be deleted/archived. Clearing link in Supabase.")
                             supabase.table("contacts").update({
-                                "deleted_at": datetime.now(timezone.utc).isoformat(),
+                                "notion_page_id": None,
+                                "notion_updated_at": datetime.now(timezone.utc).isoformat(),
                                 "last_sync_source": "notion"
                             }).eq("id", contact["id"]).execute()
+                            skipped += 1
                         else:
                             raise e
+                else:
+                    skipped += 1
             else:
                 # Create new page in Notion
                 logger.info(f"Creating new page in Notion for {contact.get('email')}")
@@ -442,5 +513,6 @@ def sync_supabase_to_notion():
         except Exception as e:
             logger.error(f"Error syncing contact {contact.get('id')} to Notion: {e}")
             errors += 1
-            
-    return {"synced": synced, "created": created, "archived": deleted_count, "errors": errors}
+    
+    logger.info(f"Supabase → Notion: {synced} updated, {created} created, {skipped} skipped, {deleted_count} archived, {errors} errors")
+    return {"synced": synced, "created": created, "skipped": skipped, "archived": deleted_count, "errors": errors}

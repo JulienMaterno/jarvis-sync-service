@@ -270,9 +270,9 @@ def notion_journal_to_supabase(notion_journal: Dict, notion: NotionClient) -> Di
     props = notion_journal.get('properties', {})
     page_id = notion_journal.get('id')
     
-    # Extract title
+    # Extract title (safely handle empty list)
     title_prop = props.get('Name', {}).get('title', [])
-    title = title_prop[0].get('plain_text', 'Journal Entry') if title_prop else 'Journal Entry'
+    title = title_prop[0].get('plain_text', 'Journal Entry') if title_prop and len(title_prop) > 0 else 'Journal Entry'
     
     # Extract date (required)
     date_prop = props.get('Date', {}).get('date')
