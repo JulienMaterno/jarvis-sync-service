@@ -2,33 +2,12 @@ from datetime import datetime, timezone, timedelta
 import urllib.parse
 
 def format_rfc3339(dt: datetime) -> str:
-    """
-    Format a datetime object to RFC3339 format for Google Calendar API.
-    Ensures proper UTC format with 'Z' suffix (no +00:00 offset).
-    Google Calendar API is strict - no microseconds, no +00:00 offset.
-    """
-    try:
-        # Convert to UTC if timezone-aware
-        if dt.tzinfo is not None:
-            dt = dt.astimezone(timezone.utc)
-        
-        # Create a new naive datetime in UTC
-        dt_utc = datetime(
-            year=dt.year,
-            month=dt.month,
-            day=dt.day,
-            hour=dt.hour,
-            minute=dt.minute,
-            second=dt.second
-        )
-        
-        # Format with Z suffix
-        formatted_date = dt_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
-        return formatted_date
-    except Exception as e:
-        print(f"Error in format_rfc3339: {e}")
-        # Fallback
-        return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+    if dt.tzinfo is None:
+        dt_utc = dt.replace(microsecond=0)
+    else:
+        dt_utc = dt.astimezone(timezone.utc).replace(tzinfo=None, microsecond=0)
+
+    return dt_utc.isoformat(timespec="seconds") + "Z"
 
 def simulate_request():
     days_past = 90

@@ -11,11 +11,16 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 TELEGRAM_BOT_SERVICE_URL = os.environ.get("TELEGRAM_BOT_SERVICE_URL")
 
+# Notification control - can disable via environment variable
+# Set to "false", "0", "no", or "disabled" to disable
+NOTIFICATIONS_ENABLED = os.environ.get("TELEGRAM_NOTIFICATIONS_ENABLED", "true").lower() not in ("false", "0", "no", "disabled")
+ERROR_NOTIFICATIONS_ENABLED = os.environ.get("TELEGRAM_ERROR_NOTIFICATIONS_ENABLED", "true").lower() not in ("false", "0", "no", "disabled")
+
 # Track consecutive failures per service to avoid spamming on transient errors
 _failure_counts = {}
 _last_notification = {}
-FAILURE_THRESHOLD = 3  # Only notify after 3 consecutive failures
-NOTIFICATION_COOLDOWN = 300  # Don't notify same error more than once per 5 minutes
+FAILURE_THRESHOLD = 5  # Increased from 3 - only notify after 5 consecutive failures
+NOTIFICATION_COOLDOWN = 600  # Increased from 300 - don't notify same error more than once per 10 minutes
 
 # Transient error patterns that should be suppressed unless persistent
 TRANSIENT_ERROR_PATTERNS = [
@@ -34,6 +39,8 @@ TRANSIENT_ERROR_PATTERNS = [
     "502",          # Bad Gateway
     "503",          # Service Unavailable  
     "504",          # Gateway Timeout
+    "list index out of range",  # Common sync comparison error - now fixed
+    "index out of range",
 ]
 
 def is_transient_error(error: str) -> bool:
@@ -41,10 +48,18 @@ def is_transient_error(error: str) -> bool:
     error_lower = error.lower()
     return any(pattern.lower() in error_lower for pattern in TRANSIENT_ERROR_PATTERNS)
 
-async def send_telegram_message(text: str):
+async def send_telegram_message(text: str, force: bool = False):
     """
     Sends a message to the configured Telegram chat.
+    
+    Args:
+        text: Message to send
+        force: If True, bypass notification settings (for critical alerts only)
     """
+    if not NOTIFICATIONS_ENABLED and not force:
+        logger.info("Telegram notifications disabled. Skipping message.")
+        return
+        
     if not TELEGRAM_CHAT_ID:
         logger.warning("TELEGRAM_CHAT_ID not configured. Skipping message.")
         return
@@ -83,6 +98,11 @@ async def notify_error(context: str, error: str):
     Only notifies after multiple consecutive failures for transient errors.
     """
     global _failure_counts, _last_notification
+    
+    # Check if error notifications are disabled
+    if not ERROR_NOTIFICATIONS_ENABLED:
+        logger.warning(f"Error notification suppressed (disabled): {context} - {str(error)[:100]}")
+        return
     
     error_str = str(error)
     is_transient = is_transient_error(error_str)
