@@ -1026,21 +1026,29 @@ def sync_supabase_to_notion(
                     # Content comparison - check if properties actually changed
                     needs_update = False
                     
+                    # Helper to safely get first item from list
+                    def safe_first(lst, default={}):
+                        return lst[0] if lst else default
+                    
                     # Compare title
-                    current_title = current_props.get('Meeting', {}).get('title', [{}])[0].get('plain_text', '')
-                    new_title = new_props.get('Meeting', {}).get('title', [{}])[0].get('text', {}).get('content', '')
+                    current_title_list = current_props.get('Meeting', {}).get('title', [])
+                    current_title = safe_first(current_title_list).get('plain_text', '')
+                    new_title_list = new_props.get('Meeting', {}).get('title', [])
+                    new_title = safe_first(new_title_list).get('text', {}).get('content', '')
                     if current_title != new_title:
                         needs_update = True
                     
                     # Compare date
-                    current_date = current_props.get('Date', {}).get('date', {}).get('start', '')
-                    new_date = new_props.get('Date', {}).get('date', {}).get('start', '') if 'Date' in new_props else ''
+                    current_date = current_props.get('Date', {}).get('date', {}).get('start', '') if current_props.get('Date', {}).get('date') else ''
+                    new_date = new_props.get('Date', {}).get('date', {}).get('start', '') if 'Date' in new_props and new_props.get('Date', {}).get('date') else ''
                     if current_date != new_date:
                         needs_update = True
                     
                     # Compare location
-                    current_location = current_props.get('Location', {}).get('rich_text', [{}])[0].get('plain_text', '')
-                    new_location = new_props.get('Location', {}).get('rich_text', [{}])[0].get('text', {}).get('content', '') if 'Location' in new_props else ''
+                    current_loc_list = current_props.get('Location', {}).get('rich_text', [])
+                    current_location = safe_first(current_loc_list).get('plain_text', '')
+                    new_loc_list = new_props.get('Location', {}).get('rich_text', []) if 'Location' in new_props else []
+                    new_location = safe_first(new_loc_list).get('text', {}).get('content', '')
                     if current_location != new_location:
                         needs_update = True
                     
