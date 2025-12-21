@@ -1,7 +1,11 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any
+from email.utils import parsedate_to_datetime, parseaddr
+from typing import Any, Dict, List, Optional
+
+import httpx
+
 from lib.google_gmail import GmailClient
 from lib.supabase_client import supabase, find_contact_by_email
 from lib.logging_service import log_sync_event
@@ -42,8 +46,24 @@ class GmailSync:
             
             last_history_id = await self.get_history_id()
             full_sync = False
-            messages_to_fetch = [] # List of (id, format)
+            messages_to_fetch = []  # List of (id, format)
             new_history_id = None
+            existing_email_cache: Dict[str, Dict[str, Any]] = {}
+
+            async def get_existing_email_record(message_id: str) -> Optional[Dict[str, Any]]:
+                if message_id in existing_email_cache:
+                    cached = existing_email_cache[message_id]
+                    return cached or None
+
+                def fetch() -> Dict[str, Any]:
+                    result = supabase.table("emails").select(
+                        "google_message_id, thread_id, label_ids, snippet"
+                    ).eq("google_message_id", message_id).limit(1).execute()
+                    return result.data[0] if result.data else None
+
+                record = await asyncio.to_thread(fetch)
+                existing_email_cache[message_id] = record or {}
+                return record
             
             if last_history_id:
                 logger.info(f"Found history ID {last_history_id}, attempting incremental sync")
@@ -136,9 +156,14 @@ class GmailSync:
                     for i in range(0, len(all_ids), chunk_size):
                         chunk = all_ids[i:i+chunk_size]
                         try:
-                            response = supabase.table("emails").select("google_message_id").in_("google_message_id", chunk).execute()
+                            response = supabase.table("emails").select(
+                                "google_message_id, thread_id, label_ids, snippet"
+                            ).in_("google_message_id", chunk).execute()
                             for row in response.data:
-                                existing_ids.add(row['google_message_id'])
+                                message_id = row.get('google_message_id')
+                                if message_id:
+                                    existing_ids.add(message_id)
+                                    existing_email_cache[message_id] = row
                         except Exception as e:
                             logger.error(f"Error checking existing emails chunk {i}: {e}")
                             continue
@@ -160,122 +185,123 @@ class GmailSync:
                 return {"status": "success", "count": 0}
                 
             logger.info(f"Processing {len(messages_to_fetch)} messages")
-            upsert_data = []
-            
+
+            new_email_records: List[Dict[str, Any]] = []
+            update_records: List[Dict[str, Any]] = []
+
             async with httpx.AsyncClient(timeout=60.0) as client:
                 for msg_id, fetch_format in messages_to_fetch:
                     try:
-                        if fetch_format == 'minimal':
-                            # Optimization: If exists, fetch MINIMAL format just to update labels/thread_id
-                            msg = await self.gmail_client.get_message(msg_id, format='minimal', client=client)
-                            
-                            record = {
+                        if fetch_format == "minimal":
+                            msg = await self.gmail_client.get_message(msg_id, format="minimal", client=client)
+                            update_candidate = {
                                 "google_message_id": msg_id,
-                                "thread_id": msg.get('threadId'),
-                                "label_ids": msg.get('labelIds', []),
-                                "snippet": msg.get('snippet', ''),
-                                "last_sync_at": datetime.now(timezone.utc).isoformat()
+                                "thread_id": msg.get("threadId"),
+                                "label_ids": msg.get("labelIds", []),
+                                "snippet": msg.get("snippet", ""),
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
+                                "last_sync_at": datetime.now(timezone.utc).isoformat(),
                             }
-                            upsert_data.append(record)
-                        else:
-                            # New email: Fetch FULL content
-                            msg = await self.gmail_client.get_message(msg_id, format='full', client=client)
-                            payload = msg.get('payload', {})
-                            
-                            # Parse body
-                            body_content = self.gmail_client.parse_message_body(payload)
-                            
-                            # Parse headers
-                            subject = self.gmail_client.get_header(payload, 'Subject')
-                            sender = self.gmail_client.get_header(payload, 'From')
-                            recipient = self.gmail_client.get_header(payload, 'To')
-                            date_str = self.gmail_client.get_header(payload, 'Date')
-                            
-                            # Parse date
-                            email_date = None
-                            if date_str:
-                                try:
-                                    from email.utils import parsedate_to_datetime
-                                    email_date = parsedate_to_datetime(date_str).isoformat()
-                                except:
-                                    internal_date = msg.get('internalDate')
-                                if internal_date:
-                                    email_date = datetime.fromtimestamp(int(internal_date)/1000, timezone.utc).isoformat()
 
-                        record = {
-                            "google_message_id": msg_id,
-                            "thread_id": msg.get('threadId'),
-                            "label_ids": msg.get('labelIds', []),
-                            "snippet": msg.get('snippet', ''),
-                            "sender": sender,
-                            "recipient": recipient,
-                            "subject": subject,
-                            "date": email_date,
-                            "body_text": body_content['text'],
-                            "body_html": body_content['html'],
-                            "updated_at": datetime.now(timezone.utc).isoformat(),
-                            "last_sync_at": datetime.now(timezone.utc).isoformat(),
-                            # Auto-link to contact if found
-                            "contact_id": find_contact_by_email(sender) or find_contact_by_email(recipient)
-                        }
-                        upsert_data.append(record)
-                    
-                except Exception as e:
-                    logger.error(f"Failed to process message {msg_id}: {e}")
-                    continue
+                            existing_record = await get_existing_email_record(msg_id)
+                            if existing_record:
+                                existing_labels = existing_record.get("label_ids") or []
+                                candidate_labels = update_candidate["label_ids"] or []
+                                if (
+                                    (existing_record.get("thread_id") or "") == (update_candidate["thread_id"] or "")
+                                    and sorted(existing_labels) == sorted(candidate_labels)
+                                    and (existing_record.get("snippet") or "") == (update_candidate["snippet"] or "")
+                                ):
+                                    logger.debug(f"Skipping update for {msg_id}; no changes detected")
+                                    continue
 
-            if upsert_data:
-                # Upsert in batches
-                batch_size = 50 
-                for i in range(0, len(upsert_data), batch_size):
-                    batch = upsert_data[i:i+batch_size]
-                    # For existing emails, we might be missing required fields if we did a pure insert
-                    # But upsert updates existing rows. 
-                    # Wait, if we only provide partial data for existing rows, will it nullify others?
-                    # Supabase/Postgres UPSERT (INSERT ... ON CONFLICT DO UPDATE) usually updates only provided columns 
-                    # IF we construct the query right. The supabase-py client's `upsert` replaces the row by default?
-                    # Actually, supabase-py `upsert` usually does a full replace if not specified otherwise.
-                    # We need to be careful.
-                    # If we want partial update, we should use `update` for existing and `insert` for new.
-                    # Or ensure we don't overwrite with nulls.
-                    # The `upsert` method in supabase-js has `ignoreDuplicates` option, but not "merge".
-                    # Standard Postgres `ON CONFLICT DO UPDATE SET ...` merges.
-                    # The Supabase client maps to `INSERT ... ON CONFLICT ...`.
-                    # If we send a dict with missing keys, and the row exists, those keys might be set to NULL or default?
-                    # No, usually it only updates the columns present in the payload.
-                    # Let's verify this assumption or split into insert/update to be safe.
-                    
-                    # Safer approach: Split into `to_insert` and `to_update`.
-                    pass
+                            update_records.append(update_candidate)
+                            existing_email_cache[msg_id] = {
+                                "google_message_id": msg_id,
+                                "thread_id": update_candidate["thread_id"],
+                                "label_ids": update_candidate["label_ids"],
+                                "snippet": update_candidate["snippet"],
+                            }
+                            continue
 
-                # Let's split them
-                to_insert = [d for d in upsert_data if "body_text" in d] # New emails have body
-                to_update = [d for d in upsert_data if "body_text" not in d] # Existing emails don't
-                
-                if to_insert:
-                    for i in range(0, len(to_insert), batch_size):
-                        batch = to_insert[i:i+batch_size]
-                        supabase.table("emails").upsert(batch, on_conflict="google_message_id").execute()
-                        logger.info(f"Inserted {len(batch)} new emails")
-                        
-                if to_update:
-                    # Parallelize updates to speed up processing
-                    # We use a semaphore to limit concurrency to avoid overwhelming Supabase/Network
-                    sem = asyncio.Semaphore(10)
-                    
-                    async def update_item(item):
-                        async with sem:
-                            # We wrap the blocking Supabase call in a thread
-                            await asyncio.to_thread(
-                                lambda: supabase.table("emails").update(item).eq("google_message_id", item["google_message_id"]).execute()
-                            )
+                        # New email path - fetch full payload
+                        msg = await self.gmail_client.get_message(msg_id, format="full", client=client)
+                        payload = msg.get("payload", {})
 
-                    tasks = [update_item(item) for item in to_update]
-                    await asyncio.gather(*tasks)
-                    logger.info(f"Updated {len(to_update)} existing emails")
+                        body_content = self.gmail_client.parse_message_body(payload) or {}
+                        subject = self.gmail_client.get_header(payload, "Subject")
+                        sender_raw = self.gmail_client.get_header(payload, "From")
+                        recipient_raw = self.gmail_client.get_header(payload, "To")
+                        date_str = self.gmail_client.get_header(payload, "Date")
 
-            await log_sync_event("gmail_sync", "success", f"Synced {len(upsert_data)} emails")
-            return {"status": "success", "count": len(upsert_data)}
+                        sender_email = parseaddr(sender_raw)[1] if sender_raw else None
+                        recipient_email = parseaddr(recipient_raw)[1] if recipient_raw else None
+
+                        contact_id = None
+                        if sender_email:
+                            contact_id = find_contact_by_email(sender_email)
+                        if not contact_id and recipient_email:
+                            contact_id = find_contact_by_email(recipient_email)
+
+                        email_date: Optional[str] = None
+                        internal_date = msg.get("internalDate")
+                        if date_str:
+                            try:
+                                parsed_dt = parsedate_to_datetime(date_str)
+                                if parsed_dt.tzinfo is None:
+                                    parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+                                email_date = parsed_dt.astimezone(timezone.utc).isoformat()
+                            except Exception:
+                                email_date = None
+                        if not email_date and internal_date:
+                            email_date = datetime.fromtimestamp(int(internal_date) / 1000, timezone.utc).isoformat()
+
+                        new_email_records.append(
+                            {
+                                "google_message_id": msg_id,
+                                "thread_id": msg.get("threadId"),
+                                "label_ids": msg.get("labelIds", []),
+                                "snippet": msg.get("snippet", ""),
+                                "sender": sender_raw,
+                                "recipient": recipient_raw,
+                                "subject": subject,
+                                "date": email_date,
+                                "body_text": body_content.get("text"),
+                                "body_html": body_content.get("html"),
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
+                                "last_sync_at": datetime.now(timezone.utc).isoformat(),
+                                "contact_id": contact_id,
+                            }
+                        )
+
+                    except Exception as exc:
+                        logger.error(f"Failed to process message {msg_id}: {exc}")
+
+            batch_size = 50
+
+            if new_email_records:
+                for i in range(0, len(new_email_records), batch_size):
+                    batch = new_email_records[i : i + batch_size]
+                    supabase.table("emails").upsert(batch, on_conflict="google_message_id").execute()
+                    logger.info(f"Inserted {len(batch)} new emails")
+
+            if update_records:
+                sem = asyncio.Semaphore(10)
+
+                async def update_item(item: Dict[str, Any]) -> None:
+                    async with sem:
+                        await asyncio.to_thread(
+                            lambda: supabase.table("emails").update(item).eq("google_message_id", item["google_message_id"]).execute()
+                        )
+
+                await asyncio.gather(*(update_item(record) for record in update_records))
+                logger.info(f"Updated {len(update_records)} existing emails")
+
+            total_processed = len(new_email_records) + len(update_records)
+            if new_history_id:
+                await self.save_history_id(new_history_id)
+            await log_sync_event("gmail_sync", "success", f"Synced {total_processed} emails")
+            return {"status": "success", "count": total_processed}
 
         except Exception as e:
             logger.error(f"Gmail sync failed: {str(e)}")
