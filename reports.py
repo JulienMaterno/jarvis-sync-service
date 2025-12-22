@@ -10,6 +10,22 @@ logger = logging.getLogger(__name__)
 INTELLIGENCE_SERVICE_URL = os.getenv("INTELLIGENCE_SERVICE_URL", "https://jarvis-intelligence-service-776871804948.asia-southeast1.run.app")
 
 
+def get_activity_summary_for_journal() -> dict:
+    """Get ActivityWatch summary for today to include in journal prompt."""
+    try:
+        today = datetime.now(timezone.utc).date()
+        result = supabase.table("activity_summaries").select("*").eq(
+            "date", str(today)
+        ).execute()
+        
+        if result.data:
+            return result.data[0]
+    except Exception as e:
+        logger.warning(f"Failed to get activity summary: {e}")
+    
+    return {}
+
+
 async def generate_evening_journal_prompt():
     """
     Generates an AI-powered evening journal prompt by calling the Intelligence Service.
@@ -89,6 +105,18 @@ async def generate_evening_journal_prompt():
             .eq("date", today.isoformat()) \
             .execute()
         activity_data["journals"] = journals_resp.data or []
+        
+        # 8. ActivityWatch screen time data
+        activity_summary = get_activity_summary_for_journal()
+        if activity_summary:
+            activity_data["screen_time"] = {
+                "total_active_hours": round(activity_summary.get("total_active_time", 0) / 3600, 1),
+                "total_afk_hours": round(activity_summary.get("total_afk_time", 0) / 3600, 1),
+                "productive_hours": round(activity_summary.get("productive_time", 0) / 3600, 1),
+                "distracting_hours": round(activity_summary.get("distracting_time", 0) / 3600, 1),
+                "top_apps": activity_summary.get("top_apps", [])[:5],
+                "top_sites": activity_summary.get("top_sites", [])[:5],
+            }
         
         # Call Intelligence Service
         async with httpx.AsyncClient(timeout=60.0) as client:

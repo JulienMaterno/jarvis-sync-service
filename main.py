@@ -22,6 +22,9 @@ from sync_reflections_bidirectional import run_sync as run_reflection_sync
 from sync_calendar import run_calendar_sync
 from sync_gmail import run_gmail_sync
 
+# Import ActivityWatch sync
+from sync_activitywatch import run_activitywatch_sync, ActivityWatchSync, format_activity_summary_for_journal
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -290,4 +293,53 @@ async def sync_gmail():
     except Exception as e:
         logger.error(f"Gmail sync failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- ActivityWatch Sync ---
+
+@app.post("/sync/activitywatch")
+async def sync_activitywatch(hours: int = 24, full: bool = False):
+    """
+    Sync ActivityWatch data from local instance to Supabase.
+    
+    NOTE: This endpoint must be called from a machine where ActivityWatch is running
+    (localhost:5600). It cannot be called from Cloud Run.
+    
+    For cloud integration, run the sync locally or use a tunnel.
+    
+    Args:
+        hours: Number of hours of history to sync (default 24)
+        full: If True, ignore last sync time and do full sync
+    """
+    try:
+        logger.info(f"Starting ActivityWatch sync (hours={hours}, full={full})")
+        result = await run_activitywatch_sync(hours=hours, full=full)
+        return result
+    except Exception as e:
+        logger.error(f"ActivityWatch sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/activitywatch/summary/today")
+async def get_today_activity_summary():
+    """
+    Get today's ActivityWatch summary.
+    Returns screen time breakdown, top apps, top websites, and productivity metrics.
+    """
+    try:
+        sync = ActivityWatchSync()
+        summary = await sync.get_today_summary()
+        
+        if not summary:
+            return {"status": "no_data", "message": "No activity data for today"}
+        
+        return {
+            "status": "success",
+            "summary": summary,
+            "formatted": format_activity_summary_for_journal(summary)
+        }
+    except Exception as e:
+        logger.error(f"Failed to get activity summary: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
