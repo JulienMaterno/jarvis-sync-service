@@ -40,8 +40,8 @@ logger = logging.getLogger('BookSync')
 # ============================================================================
 
 NOTION_API_TOKEN = os.environ.get('NOTION_API_TOKEN')
-# TODO: User needs to share this database and provide the ID
-NOTION_BOOKS_DB_ID = os.environ.get('NOTION_BOOKS_DB_ID', '')
+# Content (Books) database ID - discovered from Notion
+NOTION_BOOKS_DB_ID = os.environ.get('NOTION_BOOKS_DB_ID', '16a068b5-e624-8158-b858-dd72af14183f')
 
 SUPABASE_URL = os.environ.get('SUPABASE_URL')
 SUPABASE_KEY = os.environ.get('SUPABASE_KEY')

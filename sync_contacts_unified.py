@@ -56,7 +56,7 @@ import httpx
 # CONFIGURATION
 # ============================================================================
 
-NOTION_CONTACTS_DATABASE_ID = os.environ.get('NOTION_CONTACTS_DATABASE_ID', '142eb9e6-06cd-805d-81e1-cf3f99eb4629')
+NOTION_CONTACTS_DATABASE_ID = os.environ.get('NOTION_CRM_DATABASE_ID', '2d1068b5-e624-81e8-9c1c-f1d45c33e420')
 SUPABASE_TABLE = 'contacts'
 
 # Google API config

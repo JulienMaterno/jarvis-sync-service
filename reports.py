@@ -26,6 +26,66 @@ def get_activity_summary_for_journal() -> dict:
     return {}
 
 
+def get_reading_data_for_journal() -> dict:
+    """Get reading progress and highlights for today's journal prompt."""
+    today = datetime.now(timezone.utc).date()
+    today_start = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
+    
+    reading_data = {
+        "currently_reading": [],
+        "todays_highlights": [],
+        "recent_finishes": []
+    }
+    
+    try:
+        # 1. Currently reading books with progress
+        reading_resp = supabase.table("books") \
+            .select("title, author, current_page, total_pages, started_at") \
+            .eq("status", "Reading") \
+            .is_("deleted_at", "null") \
+            .execute()
+        
+        for book in reading_resp.data or []:
+            total = book.get('total_pages') or 0
+            current = book.get('current_page') or 0
+            progress = round((current / total * 100), 1) if total > 0 else 0
+            
+            reading_data["currently_reading"].append({
+                "title": book.get("title"),
+                "author": book.get("author"),
+                "progress_percent": progress,
+                "current_page": current,
+                "total_pages": total
+            })
+        
+        # 2. Today's highlights
+        highlights_resp = supabase.table("highlights") \
+            .select("content, note, book_title, page_number, is_favorite") \
+            .gte("highlighted_at", today_start.isoformat()) \
+            .is_("deleted_at", "null") \
+            .order("highlighted_at", desc=True) \
+            .limit(10) \
+            .execute()
+        
+        reading_data["todays_highlights"] = highlights_resp.data or []
+        
+        # 3. Recently finished books (last 7 days)
+        week_ago = (today - timedelta(days=7)).isoformat()
+        finished_resp = supabase.table("books") \
+            .select("title, author, rating, finished_at") \
+            .eq("status", "Finished") \
+            .gte("finished_at", week_ago) \
+            .is_("deleted_at", "null") \
+            .execute()
+        
+        reading_data["recent_finishes"] = finished_resp.data or []
+        
+    except Exception as e:
+        logger.warning(f"Failed to get reading data: {e}")
+    
+    return reading_data
+
+
 async def generate_evening_journal_prompt():
     """
     Generates an AI-powered evening journal prompt by calling the Intelligence Service.
@@ -116,6 +176,15 @@ async def generate_evening_journal_prompt():
                 "distracting_hours": round(activity_summary.get("distracting_time", 0) / 3600, 1),
                 "top_apps": activity_summary.get("top_apps", [])[:5],
                 "top_sites": activity_summary.get("top_sites", [])[:5],
+            }
+        
+        # 9. Reading data - books and highlights
+        reading_data = get_reading_data_for_journal()
+        if reading_data.get("currently_reading") or reading_data.get("todays_highlights"):
+            activity_data["reading"] = {
+                "currently_reading": reading_data.get("currently_reading", []),
+                "todays_highlights": reading_data.get("todays_highlights", []),
+                "recently_finished": reading_data.get("recent_finishes", [])
             }
         
         # Call Intelligence Service
