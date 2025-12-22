@@ -211,9 +211,11 @@ class SupabaseClient:
         """Get all journals from Supabase."""
         url = f"{self.base_url}/journals?select=*&order=date.desc"
         if since:
-            # Use date filter instead of updated_at since that column may not exist
+            # Filter by date OR updated_at using proper PostgREST OR syntax
             since_date = since.strftime('%Y-%m-%d')
-            url += f"&date=gte.{since_date}"
+            since_iso = since.strftime('%Y-%m-%dT%H:%M:%S')
+            # PostgREST OR syntax: or=(condition1,condition2)
+            url += f"&or=(date.gte.{since_date},updated_at.gte.{since_iso})"
         response = self.client.get(url)
         response.raise_for_status()
         return response.json()
@@ -667,16 +669,26 @@ def sync_supabase_to_notion(
     
     since = datetime.now(timezone.utc) - timedelta(hours=since_hours) if not full_sync else None
     
-    # Get journals from Supabase that were processed by AI
+    # Get journals from Supabase
     journals = supabase.get_all_journals(since)
     
-    # Filter to only those with AI content to push
+    # Sync journals that:
+    # 1. Have no notion_page_id yet (NEW entries that need to be created in Notion)
+    # 2. OR have AI content (sections, summary, key_events) to push back
+    # 3. AND were NOT created by Notion (avoid ping-pong)
     journals_to_sync = [
         j for j in journals 
-        if j.get('sections') or j.get('summary') or j.get('key_events')
+        if (
+            # New entries without Notion link - ALWAYS sync to create the page
+            not j.get('notion_page_id')
+            # OR entries with AI-processed content to push
+            or j.get('sections') or j.get('summary') or j.get('key_events')
+        )
+        # Don't sync if Notion was the source (handled later but pre-filter helps)
+        and j.get('last_sync_source') != 'notion'
     ]
     
-    logger.info(f"Found {len(journals_to_sync)} journals with AI content to sync to Notion")
+    logger.info(f"Found {len(journals_to_sync)} journals to sync to Notion ({len([j for j in journals_to_sync if not j.get('notion_page_id')])} new, {len([j for j in journals_to_sync if j.get('notion_page_id')])} updates)")
     
     for journal in journals_to_sync:
         journal_id = journal['id']

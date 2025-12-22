@@ -22,6 +22,9 @@ from sync_reflections_bidirectional import run_sync as run_reflection_sync
 from sync_calendar import run_calendar_sync
 from sync_gmail import run_gmail_sync
 
+# Import journal sync
+from sync_journals_bidirectional import run_bidirectional_sync as run_journal_sync
+
 # Import ActivityWatch sync
 from sync_activitywatch import run_activitywatch_sync, ActivityWatchSync, format_activity_summary_for_journal
 
@@ -162,6 +165,9 @@ async def sync_everything(background_tasks: BackgroundTasks):
     
     # === REFLECTIONS SYNC ===
     await run_step("reflections_sync", run_reflection_sync, full_sync=False, since_hours=24)
+    
+    # === JOURNALS SYNC ===
+    await run_step("journals_sync", run_journal_sync, full_sync=False, since_hours=24)
     
     # === CALENDAR SYNC ===
     await run_step("calendar_sync", run_calendar_sync)
