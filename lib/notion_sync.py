@@ -307,24 +307,26 @@ def sync_notion_to_supabase(full_sync: bool = False):
             
             if existing:
                 # Compare timestamps with 5-second buffer to prevent ping-pong
+                # notion_updated_at in Supabase stores when Notion was last edited
                 sb_notion_updated = existing.get("notion_updated_at")
-                last_sync_source = existing.get("last_sync_source", "")
                 
                 should_update = False
                 if not sb_notion_updated:
+                    # No previous sync - always update
                     should_update = True
-                elif last_sync_source == 'notion':
-                    # Last update was from Notion - use 5s buffer
+                else:
+                    # Use 5-second buffer to prevent ping-pong loops
+                    # This applies regardless of last_sync_source to handle race conditions
                     from datetime import datetime, timedelta, timezone
                     try:
                         notion_dt = datetime.fromisoformat(last_edited.replace('Z', '+00:00'))
                         sb_dt = datetime.fromisoformat(sb_notion_updated.replace('Z', '+00:00'))
+                        # Update if Notion is newer by more than 5 seconds
                         if notion_dt > sb_dt + timedelta(seconds=5):
                             should_update = True
-                    except:
+                    except Exception:
+                        # Fallback to string comparison
                         should_update = last_edited > sb_notion_updated
-                else:
-                    should_update = last_edited > sb_notion_updated
                 
                 if should_update:
                     contact_data['last_sync_source'] = 'notion'

@@ -4,7 +4,7 @@ from fastapi.concurrency import run_in_threadpool
 from lib.sync_service import sync_contacts
 from lib.notion_sync import sync_notion_to_supabase, sync_supabase_to_notion
 from lib.telegram_client import notify_error, reset_failure_count
-from lib.health_monitor import check_sync_health, get_sync_statistics
+from lib.health_monitor import check_sync_health, get_sync_statistics, run_health_check, SystemHealthMonitor
 from reports import generate_daily_report, generate_evening_journal_prompt
 from backup import backup_contacts
 import logging
@@ -61,6 +61,31 @@ async def sync_health_check():
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}
+
+
+@app.get("/health/full")
+async def full_health_check():
+    """
+    Comprehensive health check for the entire Jarvis ecosystem.
+    Returns detailed status of all components, recent errors, and recommendations.
+    """
+    try:
+        report = await run_health_check(send_telegram=False)
+        return report.to_dict()
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/health/report")
+async def send_health_report(background_tasks: BackgroundTasks):
+    """
+    Generate and send a health report to Telegram.
+    """
+    async def run_report():
+        await run_health_check(send_telegram=True)
+    
+    background_tasks.add_task(run_report)
+    return {"status": "queued", "message": "Health report generation started"}
 
 @app.post("/sync/contacts")
 async def sync_all_contacts():

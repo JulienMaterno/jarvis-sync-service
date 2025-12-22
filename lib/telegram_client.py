@@ -14,7 +14,10 @@ TELEGRAM_BOT_SERVICE_URL = os.environ.get("TELEGRAM_BOT_SERVICE_URL")
 # Notification control - can disable via environment variable
 # Set to "false", "0", "no", or "disabled" to disable
 NOTIFICATIONS_ENABLED = os.environ.get("TELEGRAM_NOTIFICATIONS_ENABLED", "true").lower() not in ("false", "0", "no", "disabled")
-ERROR_NOTIFICATIONS_ENABLED = os.environ.get("TELEGRAM_ERROR_NOTIFICATIONS_ENABLED", "true").lower() not in ("false", "0", "no", "disabled")
+
+# Error notifications are DISABLED by default - errors go to sync_logs database instead
+# Only enable for debugging or critical situations
+ERROR_NOTIFICATIONS_ENABLED = os.environ.get("TELEGRAM_ERROR_NOTIFICATIONS_ENABLED", "false").lower() not in ("false", "0", "no", "disabled")
 
 # Track consecutive failures per service to avoid spamming on transient errors
 _failure_counts = {}
