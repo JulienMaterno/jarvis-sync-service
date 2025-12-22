@@ -42,7 +42,6 @@ CREATE INDEX IF NOT EXISTS idx_activity_events_timestamp ON activity_events(time
 CREATE INDEX IF NOT EXISTS idx_activity_events_bucket ON activity_events(bucket_id);
 CREATE INDEX IF NOT EXISTS idx_activity_events_app ON activity_events(app_name);
 CREATE INDEX IF NOT EXISTS idx_activity_events_domain ON activity_events(site_domain);
-CREATE INDEX IF NOT EXISTS idx_activity_events_date ON activity_events((timestamp::date));
 
 -- Activity summaries table - pre-aggregated daily summaries for fast querying
 CREATE TABLE IF NOT EXISTS activity_summaries (
@@ -84,19 +83,20 @@ INSERT INTO sync_state (key, value)
 VALUES ('activitywatch_last_sync', '{}')
 ON CONFLICT (key) DO NOTHING;
 
--- View for easy querying of today's activity
-CREATE OR REPLACE VIEW today_activity AS
+-- View for easy querying of activity by app
+-- Note: Filter by date in your query: WHERE date = CURRENT_DATE
+CREATE OR REPLACE VIEW activity_by_app AS
 SELECT 
+    timestamp::date as date,
     app_name,
     SUM(duration) as total_seconds,
     COUNT(*) as event_count,
-    ROUND(SUM(duration) / 3600.0, 2) as hours
+    ROUND((SUM(duration) / 3600.0)::numeric, 2) as hours
 FROM activity_events
-WHERE timestamp::date = CURRENT_DATE
-    AND bucket_type = 'currentwindow'
+WHERE bucket_type = 'currentwindow'
     AND afk_status IS NULL
-GROUP BY app_name
-ORDER BY total_seconds DESC;
+GROUP BY timestamp::date, app_name
+ORDER BY date DESC, total_seconds DESC;
 
 -- Comment on tables
 COMMENT ON TABLE activity_events IS 'Raw activity events from ActivityWatch - window, AFK, and browser tracking';
