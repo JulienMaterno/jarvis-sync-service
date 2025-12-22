@@ -96,59 +96,17 @@ async def send_telegram_message(text: str, force: bool = False):
 
 async def notify_error(context: str, error: str):
     """
-    Sends an error alert with traceback if available.
-    Uses smart filtering to avoid spamming on transient/network errors.
-    Only notifies after multiple consecutive failures for transient errors.
+    ERROR NOTIFICATIONS ARE PERMANENTLY DISABLED.
+    
+    All errors are logged to sync_logs table in Supabase instead.
+    This function is kept for backward compatibility but does nothing.
+    
+    To check errors, query: SELECT * FROM sync_logs WHERE status = 'error' ORDER BY created_at DESC;
     """
-    global _failure_counts, _last_notification
-    
-    # Check if error notifications are disabled
-    if not ERROR_NOTIFICATIONS_ENABLED:
-        logger.warning(f"Error notification suppressed (disabled): {context} - {str(error)[:100]}")
-        return
-    
-    error_str = str(error)
-    is_transient = is_transient_error(error_str)
-    
-    # Track consecutive failures
-    if context not in _failure_counts:
-        _failure_counts[context] = 0
-    _failure_counts[context] += 1
-    
-    # For transient errors, only notify after threshold is reached
-    if is_transient and _failure_counts[context] < FAILURE_THRESHOLD:
-        logger.warning(f"Transient error in {context} ({_failure_counts[context]}/{FAILURE_THRESHOLD}): {error_str[:100]}")
-        return
-    
-    # Check cooldown - don't spam the same error repeatedly
-    now = datetime.now(timezone.utc)
-    error_key = f"{context}:{error_str[:50]}"
-    if error_key in _last_notification:
-        elapsed = (now - _last_notification[error_key]).total_seconds()
-        if elapsed < NOTIFICATION_COOLDOWN:
-            logger.info(f"Skipping notification for {context} (cooldown: {int(NOTIFICATION_COOLDOWN - elapsed)}s remaining)")
-            return
-    
-    _last_notification[error_key] = now
-    
-    # Get full traceback
-    tb = traceback.format_exc()
-    
-    # If the error string is just the message, the traceback gives more context.
-    # If traceback is "NoneType: None", it means no active exception, so just use the error msg.
-    if "NoneType: None" in tb:
-        details = error_str
-    else:
-        # Truncate traceback to avoid Telegram message limit (4096 chars)
-        details = f"{error_str}\n\nTraceback:\n{tb}"[:3000]
-
-    # Add failure count info for transient errors
-    prefix = ""
-    if is_transient:
-        prefix = f"(after {_failure_counts[context]} consecutive failures)\n"
-    
-    message = f"🚨 **Error in {context}**\n{prefix}\n```\n{details}\n```"
-    await send_telegram_message(message)
+    # PERMANENTLY DISABLED - No more Telegram error spam!
+    # Errors are logged to database via log_sync_event() calls throughout the codebase
+    logger.info(f"Error logged (notification disabled): {context} - {str(error)[:100]}")
+    return
 
 
 def reset_failure_count(context: str):
