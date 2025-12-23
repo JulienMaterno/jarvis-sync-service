@@ -174,7 +174,7 @@ async def generate_evening_journal_prompt():
         
         # Reflections (last 24h)
         reflections_resp = supabase.table("reflections") \
-            .select("id, title, content, tags, mood, energy_level, created_at") \
+            .select("id, title, content, tags, created_at") \
             .gte("created_at", cutoff.isoformat()) \
             .order("created_at", desc=True) \
             .execute()
