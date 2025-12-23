@@ -88,17 +88,25 @@ def get_reading_data_for_journal() -> dict:
 
 async def generate_evening_journal_prompt():
     """
-    Generates an AI-powered evening journal prompt by calling the Intelligence Service.
-    The AI analyzes the day's activities and creates personalized highlights and prompts.
+    Enhanced evening journal generation that:
+    1. Collects ALL activities from last 24 hours
+    2. Calls Intelligence Service for AI analysis
+    3. Creates/updates journal entry in Supabase
+    4. Sends interactive prompt to Telegram
+    5. User can reply to append personal notes
     """
     try:
-        logger.info("Generating evening journal prompt via Intelligence Service...")
+        logger.info("Generating enhanced evening journal prompt...")
         
-        today = datetime.now(timezone.utc).date()
-        today_start = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
-        today_end = datetime.combine(today, datetime.max.time()).replace(tzinfo=timezone.utc)
+        # Use 24-hour window
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=24)
+        today = now.date()
         
-        # Gather today's raw activity data
+        # =================================================================
+        # 1. COLLECT ALL ACTIVITY DATA
+        # =================================================================
+        
         activity_data = {
             "meetings": [],
             "calendar_events": [],
@@ -106,67 +114,91 @@ async def generate_evening_journal_prompt():
             "tasks_completed": [],
             "tasks_created": [],
             "reflections": [],
-            "journals": []
+            "highlights": [],  # Book highlights
+            "reading": None,
+            "screen_time": None,
+            "contacts_added": [],
+            "summary": {}
         }
         
-        # 1. Today's meetings
+        # Meetings (last 24h)
         meetings_resp = supabase.table("meetings") \
-            .select("title, summary, people_mentioned, topics_discussed") \
-            .gte("date", today_start.isoformat()) \
-            .lte("date", today_end.isoformat()) \
+            .select("id, title, summary, contact_name, people_mentioned, topics_discussed, date, created_at") \
+            .gte("created_at", cutoff.isoformat()) \
+            .order("date", desc=True) \
             .execute()
         activity_data["meetings"] = meetings_resp.data or []
         
-        # 2. Today's calendar events
+        # Calendar events (last 24h)
         events_resp = supabase.table("calendar_events") \
-            .select("summary, description, attendees, location") \
-            .gte("start_time", today_start.isoformat()) \
-            .lte("start_time", today_end.isoformat()) \
+            .select("summary, description, attendees, location, start_time, end_time") \
+            .gte("start_time", cutoff.isoformat()) \
+            .lte("start_time", now.isoformat()) \
+            .order("start_time") \
             .execute()
         activity_data["calendar_events"] = events_resp.data or []
         
-        # 3. Today's emails
+        # Emails (last 24h, filtered)
         emails_resp = supabase.table("emails") \
-            .select("subject, sender, snippet") \
-            .gte("date", today_start.isoformat()) \
-            .lte("date", today_end.isoformat()) \
-            .limit(20) \
+            .select("subject, sender, snippet, date, contact_id") \
+            .gte("date", cutoff.isoformat()) \
+            .order("date", desc=True) \
+            .limit(30) \
             .execute()
-        activity_data["emails"] = emails_resp.data or []
         
-        # 4. Today's completed tasks
+        # Filter out automated emails
+        skip_keywords = {"unsubscribe", "newsletter", "noreply", "no-reply", 
+                        "github", "notification", "automated", "donotreply"}
+        filtered_emails = []
+        for email in (emails_resp.data or []):
+            subject = (email.get("subject") or "").lower()
+            sender = (email.get("sender") or "").lower()
+            if not any(kw in subject or kw in sender for kw in skip_keywords):
+                filtered_emails.append(email)
+        activity_data["emails"] = filtered_emails[:20]
+        
+        # Completed tasks (last 24h)
         tasks_completed_resp = supabase.table("tasks") \
-            .select("title") \
+            .select("id, title, description, priority, project, completed_at") \
             .not_.is_("completed_at", "null") \
-            .gte("completed_at", today_start.isoformat()) \
-            .lte("completed_at", today_end.isoformat()) \
+            .gte("completed_at", cutoff.isoformat()) \
             .execute()
         activity_data["tasks_completed"] = tasks_completed_resp.data or []
         
-        # 5. Today's created tasks
+        # Created tasks (last 24h)
         tasks_created_resp = supabase.table("tasks") \
-            .select("title") \
-            .gte("created_at", today_start.isoformat()) \
-            .lte("created_at", today_end.isoformat()) \
+            .select("id, title, description, priority, due_date, project, created_at") \
+            .gte("created_at", cutoff.isoformat()) \
             .execute()
         activity_data["tasks_created"] = tasks_created_resp.data or []
         
-        # 6. Today's reflections
+        # Reflections (last 24h)
         reflections_resp = supabase.table("reflections") \
-            .select("*") \
-            .gte("created_at", today_start.isoformat()) \
-            .lte("created_at", today_end.isoformat()) \
+            .select("id, title, content, tags, mood, energy_level, created_at") \
+            .gte("created_at", cutoff.isoformat()) \
+            .order("created_at", desc=True) \
             .execute()
         activity_data["reflections"] = reflections_resp.data or []
         
-        # 7. Today's journal entries (if any already exist)
-        journals_resp = supabase.table("journals") \
-            .select("*") \
-            .eq("date", today.isoformat()) \
+        # Book highlights (last 24h) - NEW!
+        highlights_resp = supabase.table("highlights") \
+            .select("id, content, note, book_title, chapter, highlighted_at, is_favorite") \
+            .gte("highlighted_at", cutoff.isoformat()) \
+            .order("highlighted_at", desc=True) \
+            .limit(20) \
             .execute()
-        activity_data["journals"] = journals_resp.data or []
+        activity_data["highlights"] = highlights_resp.data or []
         
-        # 8. ActivityWatch screen time data
+        # Reading progress - NEW!
+        reading_data = get_reading_data_for_journal()
+        if reading_data.get("currently_reading") or reading_data.get("todays_highlights"):
+            activity_data["reading"] = {
+                "currently_reading": reading_data.get("currently_reading", []),
+                "todays_highlights": reading_data.get("todays_highlights", []),
+                "recently_finished": reading_data.get("recent_finishes", [])
+            }
+        
+        # Screen time (ActivityWatch)
         activity_summary = get_activity_summary_for_journal()
         if activity_summary:
             activity_data["screen_time"] = {
@@ -178,36 +210,127 @@ async def generate_evening_journal_prompt():
                 "top_sites": activity_summary.get("top_sites", [])[:5],
             }
         
-        # 9. Reading data - books and highlights
-        reading_data = get_reading_data_for_journal()
-        if reading_data.get("currently_reading") or reading_data.get("todays_highlights"):
-            activity_data["reading"] = {
-                "currently_reading": reading_data.get("currently_reading", []),
-                "todays_highlights": reading_data.get("todays_highlights", []),
-                "recently_finished": reading_data.get("recent_finishes", [])
-            }
+        # New contacts (last 24h)
+        contacts_resp = supabase.table("contacts") \
+            .select("id, first_name, last_name, company, job_title, created_at") \
+            .gte("created_at", cutoff.isoformat()) \
+            .execute()
+        activity_data["contacts_added"] = contacts_resp.data or []
         
-        # Call Intelligence Service
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                f"{INTELLIGENCE_SERVICE_URL}/api/v1/journal/evening-prompt",
-                json={
-                    "activity_data": activity_data,
-                    "timezone": "Asia/Singapore"
+        # Compute summary stats
+        activity_data["summary"] = {
+            "meetings_count": len(activity_data["meetings"]),
+            "tasks_completed_count": len(activity_data["tasks_completed"]),
+            "tasks_created_count": len(activity_data["tasks_created"]),
+            "reflections_count": len(activity_data["reflections"]),
+            "calendar_events_count": len(activity_data["calendar_events"]),
+            "emails_count": len(activity_data["emails"]),
+            "highlights_count": len(activity_data["highlights"]),
+            "contacts_added_count": len(activity_data["contacts_added"]),
+        }
+        
+        logger.info(f"Collected activity: {activity_data['summary']}")
+        
+        # =================================================================
+        # 2. CALL INTELLIGENCE SERVICE FOR AI ANALYSIS
+        # =================================================================
+        
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            # Try new endpoint first, fallback to legacy
+            try:
+                response = await client.post(
+                    f"{INTELLIGENCE_SERVICE_URL}/api/v1/journal/evening-analysis",
+                    json={
+                        "activity_data": activity_data,
+                        "timezone": "Asia/Singapore",
+                        "user_name": "Bertan"
+                    }
+                )
+                response.raise_for_status()
+                result = response.json()
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    # Fallback to legacy endpoint
+                    logger.info("Falling back to legacy journal endpoint")
+                    response = await client.post(
+                        f"{INTELLIGENCE_SERVICE_URL}/api/v1/journal/evening-prompt",
+                        json={
+                            "activity_data": activity_data,
+                            "timezone": "Asia/Singapore"
+                        }
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+                else:
+                    raise
+        
+        # =================================================================
+        # 3. CREATE/UPDATE JOURNAL ENTRY IN SUPABASE
+        # =================================================================
+        
+        journal_content = result.get("journal_content", "")
+        if journal_content:
+            # Check if journal exists for today
+            existing_journal = supabase.table("journals") \
+                .select("id, content") \
+                .eq("date", today.isoformat()) \
+                .execute()
+            
+            if existing_journal.data:
+                # Update existing journal with AI content
+                journal_id = existing_journal.data[0]["id"]
+                current_content = existing_journal.data[0].get("content", "")
+                
+                # Prepend AI summary if not already there
+                if "## AI Summary" not in current_content:
+                    new_content = f"## AI Summary\n\n{journal_content}\n\n---\n\n{current_content}"
+                    supabase.table("journals") \
+                        .update({
+                            "content": new_content,
+                            "updated_at": now.isoformat(),
+                            "last_sync_source": "supabase"
+                        }) \
+                        .eq("id", journal_id) \
+                        .execute()
+                    logger.info(f"Updated journal {journal_id} with AI summary")
+            else:
+                # Create new journal entry
+                new_journal = {
+                    "date": today.isoformat(),
+                    "title": f"Journal - {today.strftime('%B %d, %Y')}",
+                    "content": f"## AI Summary\n\n{journal_content}",
+                    "last_sync_source": "supabase"
                 }
-            )
-            response.raise_for_status()
-            result = response.json()
+                create_resp = supabase.table("journals").insert(new_journal).execute()
+                if create_resp.data:
+                    logger.info(f"Created new journal: {create_resp.data[0].get('id')}")
         
-        # Send the AI-generated message via Telegram
-        message = result.get("message", "Time to journal! 📓")
+        # =================================================================
+        # 4. SEND TO TELEGRAM
+        # =================================================================
+        
+        message = result.get("message", "")
+        if not message:
+            # Fallback message construction
+            message = f"""📓 **Evening Journal**
+_{today.strftime('%A, %B %d, %Y')}_
+
+Time to reflect on your day! Here's what I observed:
+
+**Activities:** {activity_data['summary'].get('meetings_count', 0)} meetings, {activity_data['summary'].get('tasks_completed_count', 0)} tasks done
+
+_Reply with a voice note or text to add your thoughts._"""
+        
         await send_telegram_message(message)
         
-        logger.info(f"Evening journal prompt sent. Highlights: {len(result.get('highlights', []))}")
+        logger.info(f"Evening journal sent. Highlights: {len(result.get('highlights', []))}, Questions: {len(result.get('reflection_questions', result.get('reflection_prompts', [])))}")
+        
         return {
-            "status": "success", 
+            "status": "success",
             "highlights": result.get("highlights", []),
-            "prompts": result.get("reflection_prompts", [])
+            "questions": result.get("reflection_questions", result.get("reflection_prompts", [])),
+            "observations": result.get("observations", []),
+            "activity_summary": activity_data["summary"]
         }
         
     except httpx.HTTPError as e:
