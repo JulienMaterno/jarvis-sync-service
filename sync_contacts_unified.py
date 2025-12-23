@@ -28,6 +28,7 @@ Direction: MULTI-SOURCE (three-way)
 import os
 import sys
 import json
+import time
 from datetime import datetime, timezone
 
 # Add lib to path
@@ -268,16 +269,21 @@ class ContactsSyncService(TwoWaySyncService):
     """
     Multi-source sync for Contacts: Google + Notion ↔ Supabase
     
+    IMPORTANT: This class overrides the default TwoWaySyncService behavior to add
+    DEDUPLICATION by name/email. Without this, the sync creates duplicates when:
+    1. A contact exists in Supabase (from Google) without notion_page_id
+    2. The same contact exists in Notion
+    3. Default sync would create a new Supabase record instead of linking them
+    
     Notion Property Mapping:
     - Name (title) → first_name + last_name
     - Company (rich_text) → company
-    - Email (email) → email
-    - Phone (phone) → phone
-    - Job Title (rich_text) → job_title
+    - Mail (email) → email  
+    - Position (rich_text) → job_title
     - Birthday (date) → birthday
-    - LinkedIn (url) → linkedin_url
-    - Location (rich_text) → location
-    - Tags (multi_select) → stored in dynamic_properties
+    - LinkedIn URL (url) → linkedin_url
+    - Location (select) → location
+    - Subscribed? (checkbox) → subscribed
     """
     
     def __init__(self):
@@ -287,6 +293,35 @@ class ContactsSyncService(TwoWaySyncService):
             supabase_table=SUPABASE_TABLE
         )
         self.google = GoogleContactsClient(GOOGLE_TOKEN_JSON)
+    
+    def _normalize_name(self, first: str, last: str) -> str:
+        """Normalize name for comparison (lowercase, trimmed)."""
+        return f"{(first or '').strip()} {(last or '').strip()}".strip().lower()
+    
+    def _find_existing_contact(self, contact_data: Dict, all_contacts: List[Dict]) -> Optional[Dict]:
+        """
+        Find an existing contact by email or name to prevent duplicates.
+        This is the KEY deduplication logic that was missing!
+        """
+        email = contact_data.get('email')
+        first_name = contact_data.get('first_name', '')
+        last_name = contact_data.get('last_name', '')
+        name_normalized = self._normalize_name(first_name, last_name)
+        
+        for existing in all_contacts:
+            # Match by email (most reliable)
+            if email and existing.get('email') and email.lower() == existing.get('email', '').lower():
+                return existing
+            
+            # Match by name (fallback)
+            existing_name = self._normalize_name(
+                existing.get('first_name', ''), 
+                existing.get('last_name', '')
+            )
+            if name_normalized and existing_name and name_normalized == existing_name:
+                return existing
+        
+        return None
     
     def convert_from_source(self, notion_record: Dict) -> Dict:
         """Convert Notion contact page to Supabase format."""
@@ -298,20 +333,21 @@ class ContactsSyncService(TwoWaySyncService):
         first_name = parts[0] if parts else ''
         last_name = parts[1] if len(parts) > 1 else ''
         
+        # Location is a select in Notion
+        location_prop = props.get('Location', {}).get('select')
+        location = location_prop.get('name') if location_prop else None
+        
         return {
             'first_name': first_name,
             'last_name': last_name,
-            'email': Extract.email(props, 'Email'),
-            'phone': Extract.phone(props, 'Phone'),
+            'email': Extract.email(props, 'Mail'),  # Notion uses "Mail" not "Email"
+            # Phone doesn't exist in Notion schema
             'company': Extract.rich_text(props, 'Company'),
-            'job_title': Extract.rich_text(props, 'Job Title'),
+            'job_title': Extract.rich_text(props, 'Position'),  # Notion uses "Position"
             'birthday': Extract.date(props, 'Birthday'),
-            'linkedin_url': Extract.url(props, 'LinkedIn'),
-            'location': Extract.rich_text(props, 'Location'),
-            'notes': Extract.rich_text(props, 'Notes'),
-            'dynamic_properties': {
-                'tags': Extract.multi_select(props, 'Tags')
-            }
+            'linkedin_url': Extract.url(props, 'LinkedIn URL'),  # Notion uses "LinkedIn URL"
+            'location': location,
+            'subscribed': props.get('Subscribed?', {}).get('checkbox', False),  # Notion uses "Subscribed?"
         }
     
     def convert_to_source(self, supabase_record: Dict) -> Dict:
@@ -320,24 +356,237 @@ class ContactsSyncService(TwoWaySyncService):
         
         props = {
             'Name': Build.title(full_name),
-            'Email': Build.email(supabase_record.get('email')),
-            'Phone': Build.phone(supabase_record.get('phone')),
-            'Company': Build.rich_text(supabase_record.get('company')),
-            'Job Title': Build.rich_text(supabase_record.get('job_title')),
-            'LinkedIn': Build.url(supabase_record.get('linkedin_url')),
-            'Location': Build.rich_text(supabase_record.get('location')),
-            'Notes': Build.rich_text(supabase_record.get('notes')),
         }
+        
+        # Only add non-empty fields (using correct Notion property names)
+        if supabase_record.get('email'):
+            props['Mail'] = Build.email(supabase_record['email'])
+        
+        if supabase_record.get('company'):
+            props['Company'] = Build.rich_text(supabase_record['company'])
+        
+        if supabase_record.get('job_title'):
+            props['Position'] = Build.rich_text(supabase_record['job_title'])
+        
+        if supabase_record.get('linkedin_url'):
+            props['LinkedIn URL'] = Build.url(supabase_record['linkedin_url'])
         
         if supabase_record.get('birthday'):
             props['Birthday'] = Build.date(supabase_record['birthday'])
         
-        # Handle tags from dynamic_properties
-        dyn = supabase_record.get('dynamic_properties') or {}
-        if dyn.get('tags'):
-            props['Tags'] = Build.multi_select(dyn['tags'])
+        # Location is a SELECT in Notion, not rich_text
+        if supabase_record.get('location'):
+            props['Location'] = {'select': {'name': supabase_record['location']}}
+        
+        # Subscribed checkbox
+        if supabase_record.get('subscribed') is not None:
+            props['Subscribed?'] = {'checkbox': bool(supabase_record['subscribed'])}
         
         return props
+    
+    def _sync_notion_to_supabase(self, full_sync: bool, since_hours: int) -> SyncResult:
+        """
+        OVERRIDE: Sync from Notion to Supabase WITH DEDUPLICATION.
+        
+        This fixes the duplicate creation bug by checking for existing contacts
+        by email/name before creating new records.
+        """
+        from datetime import timedelta
+        stats = SyncStats()
+        start_time = time.time()
+        
+        try:
+            # Build filter for incremental sync
+            filter_query = None
+            if not full_sync:
+                cutoff = (datetime.now(timezone.utc) - timedelta(hours=since_hours)).isoformat()
+                filter_query = {
+                    "timestamp": "last_edited_time",
+                    "last_edited_time": {"after": cutoff}
+                }
+            
+            # Fetch from Notion
+            notion_records = self.notion.query_database(self.notion_database_id, filter=filter_query)
+            self.logger.info(f"Found {len(notion_records)} records in Notion")
+            
+            # Get ALL existing Supabase contacts for deduplication
+            all_supabase = self.supabase.select_all()
+            existing_by_notion_id = {r['notion_page_id']: r for r in all_supabase if r.get('notion_page_id')}
+            
+            self.logger.info(f"Supabase has {len(all_supabase)} contacts, {len(existing_by_notion_id)} with notion_page_id")
+            
+            # Safety valve
+            is_safe, msg = self.check_safety_valve(len(notion_records), len(existing_by_notion_id), "Notion → Supabase")
+            if not is_safe and full_sync:
+                self.logger.error(msg)
+                return SyncResult(success=False, direction="notion_to_supabase", error_message=msg)
+            
+            # Process each Notion record
+            for notion_record in notion_records:
+                try:
+                    notion_id = self.get_source_id(notion_record)
+                    
+                    # Convert Notion data
+                    data = self.convert_from_source(notion_record)
+                    data['notion_page_id'] = notion_id
+                    data['notion_updated_at'] = notion_record.get('last_edited_time')
+                    data['last_sync_source'] = 'notion'
+                    data['updated_at'] = datetime.now(timezone.utc).isoformat()
+                    
+                    # Check if already linked by notion_page_id
+                    existing_record = existing_by_notion_id.get(notion_id)
+                    
+                    if existing_record:
+                        # Already linked - check if update needed
+                        comparison = self.compare_timestamps(
+                            notion_record.get('last_edited_time'),
+                            existing_record.get('notion_updated_at')
+                        )
+                        if comparison <= 0:
+                            stats.skipped += 1
+                            continue
+                        
+                        # Update existing record
+                        self.supabase.update(existing_record['id'], data)
+                        stats.updated += 1
+                        self.logger.info(f"Updated contact: {data.get('first_name')} {data.get('last_name')}")
+                    else:
+                        # Not linked yet - check for duplicate by email/name
+                        duplicate = self._find_existing_contact(data, all_supabase)
+                        
+                        if duplicate:
+                            # Found duplicate! Link it instead of creating new
+                            self.logger.info(
+                                f"LINKING existing contact '{duplicate.get('first_name')} {duplicate.get('last_name')}' "
+                                f"to Notion page {notion_id[:8]}..."
+                            )
+                            self.supabase.update(duplicate['id'], data)
+                            stats.updated += 1
+                            
+                            # Update our tracking dict
+                            existing_by_notion_id[notion_id] = duplicate
+                        else:
+                            # Truly new contact - create
+                            data['created_at'] = datetime.now(timezone.utc).isoformat()
+                            self.supabase.insert(data)
+                            stats.created += 1
+                            self.logger.info(f"Created new contact: {data.get('first_name')} {data.get('last_name')}")
+                    
+                except Exception as e:
+                    self.logger.error(f"Error syncing from Notion: {e}")
+                    stats.errors += 1
+            
+            return SyncResult(
+                success=True,
+                direction="notion_to_supabase",
+                stats=stats,
+                elapsed_seconds=time.time() - start_time
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Notion to Supabase sync failed: {e}")
+            return SyncResult(success=False, direction="notion_to_supabase", error_message=str(e))
+    
+    def _sync_supabase_to_notion(self, full_sync: bool, since_hours: int) -> SyncResult:
+        """
+        OVERRIDE: Sync from Supabase to Notion WITH DEDUPLICATION.
+        
+        Before creating a new Notion page, check if one already exists with the same name.
+        """
+        from datetime import timedelta
+        stats = SyncStats()
+        start_time = time.time()
+        
+        try:
+            # Get Supabase records that need syncing
+            if full_sync:
+                supabase_records = self.supabase.select_all()
+            else:
+                cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+                supabase_records = self.supabase.select_updated_since(cutoff)
+            
+            # Filter to records without notion_page_id (need to create) or updated locally
+            records_to_sync = [
+                r for r in supabase_records 
+                if not r.get('notion_page_id') or r.get('last_sync_source') == 'supabase'
+            ]
+            
+            self.logger.info(f"Found {len(records_to_sync)} Supabase records to sync to Notion")
+            
+            # Get all Notion contacts for deduplication
+            notion_records = self.notion.query_database(self.notion_database_id)
+            notion_by_name = {}
+            for nr in notion_records:
+                name = Extract.title(nr.get('properties', {}), 'Name').strip().lower()
+                if name:
+                    notion_by_name[name] = nr
+            
+            self.logger.info(f"Found {len(notion_records)} Notion contacts for dedup check")
+            
+            for record in records_to_sync:
+                try:
+                    notion_page_id = record.get('notion_page_id')
+                    notion_props = self.convert_to_source(record)
+                    full_name = f"{record.get('first_name', '')} {record.get('last_name', '')}".strip()
+                    
+                    if notion_page_id:
+                        # Update existing Notion page
+                        try:
+                            self.notion.update_page(notion_page_id, notion_props)
+                            stats.updated += 1
+                        except Exception as e:
+                            if "404" in str(e) or "archived" in str(e).lower():
+                                self.logger.warning(f"Notion page {notion_page_id} not found, clearing link")
+                                self.supabase.update(record['id'], {'notion_page_id': None})
+                            else:
+                                raise
+                    else:
+                        # Check if Notion page already exists with same name
+                        name_key = full_name.lower()
+                        existing_notion = notion_by_name.get(name_key)
+                        
+                        if existing_notion:
+                            # Link to existing Notion page instead of creating duplicate
+                            existing_notion_id = existing_notion['id']
+                            self.logger.info(
+                                f"LINKING Supabase contact '{full_name}' to existing Notion page {existing_notion_id[:8]}..."
+                            )
+                            self.supabase.update(record['id'], {
+                                'notion_page_id': existing_notion_id,
+                                'notion_updated_at': existing_notion.get('last_edited_time'),
+                                'last_sync_source': 'notion'
+                            })
+                            stats.updated += 1
+                        else:
+                            # Create new Notion page
+                            self.logger.info(f"Creating new Notion page for '{full_name}'")
+                            new_page = self.notion.create_page(self.notion_database_id, notion_props)
+                            
+                            # Update Supabase with new Notion ID
+                            self.supabase.update(record['id'], {
+                                'notion_page_id': new_page['id'],
+                                'notion_updated_at': new_page.get('last_edited_time'),
+                                'last_sync_source': 'notion'
+                            })
+                            stats.created += 1
+                            
+                            # Add to our tracking dict
+                            notion_by_name[name_key] = new_page
+                    
+                except Exception as e:
+                    self.logger.error(f"Error syncing '{full_name}' to Notion: {e}")
+                    stats.errors += 1
+            
+            return SyncResult(
+                success=True,
+                direction="supabase_to_notion",
+                stats=stats,
+                elapsed_seconds=time.time() - start_time
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Supabase to Notion sync failed: {e}")
+            return SyncResult(success=False, direction="supabase_to_notion", error_message=str(e))
     
     def sync_google(self) -> SyncResult:
         """Sync Google Contacts to/from Supabase."""
