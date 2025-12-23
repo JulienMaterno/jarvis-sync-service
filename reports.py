@@ -159,7 +159,7 @@ async def generate_evening_journal_prompt():
         
         # Completed tasks (last 24h)
         tasks_completed_resp = supabase.table("tasks") \
-            .select("id, title, description, priority, project, completed_at") \
+            .select("id, title, description, priority, completed_at") \
             .not_.is_("completed_at", "null") \
             .gte("completed_at", cutoff.isoformat()) \
             .execute()
@@ -167,7 +167,7 @@ async def generate_evening_journal_prompt():
         
         # Created tasks (last 24h)
         tasks_created_resp = supabase.table("tasks") \
-            .select("id, title, description, priority, due_date, project, created_at") \
+            .select("id, title, description, priority, due_date, created_at") \
             .gte("created_at", cutoff.isoformat()) \
             .execute()
         activity_data["tasks_created"] = tasks_created_resp.data or []
