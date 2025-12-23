@@ -232,22 +232,63 @@ async def generate_evening_journal_prompt():
         logger.info(f"Collected activity: {activity_data['summary']}")
         
         # =================================================================
-        # 2. CALL INTELLIGENCE SERVICE FOR AI ANALYSIS
+        # 2. FETCH PREVIOUS JOURNALS FOR CONTEXT
         # =================================================================
         
-        async with httpx.AsyncClient(timeout=90.0) as client:
+        previous_journals = []
+        try:
+            # Get last 5 days of journals for context
+            from datetime import date
+            five_days_ago = (today - timedelta(days=5)).isoformat()
+            prev_journals_resp = supabase.table("journals") \
+                .select("date, title, content") \
+                .gte("date", five_days_ago) \
+                .lt("date", today.isoformat()) \
+                .order("date", desc=True) \
+                .limit(5) \
+                .execute()
+            previous_journals = prev_journals_resp.data or []
+            if previous_journals:
+                logger.info(f"Loaded {len(previous_journals)} previous journals for context")
+        except Exception as e:
+            logger.warning(f"Could not fetch previous journals: {e}")
+        
+        # =================================================================
+        # 3. CALL INTELLIGENCE SERVICE FOR AI ANALYSIS
+        # =================================================================
+        
+        async with httpx.AsyncClient(timeout=120.0) as client:
             # Try new endpoint first, fallback to legacy
             try:
+                logger.info("Calling Intelligence Service for evening analysis...")
                 response = await client.post(
                     f"{INTELLIGENCE_SERVICE_URL}/api/v1/journal/evening-analysis",
                     json={
                         "activity_data": activity_data,
                         "timezone": "Asia/Singapore",
-                        "user_name": "Bertan"
+                        "user_name": "Bertan",
+                        "previous_journals": previous_journals
                     }
                 )
                 response.raise_for_status()
                 result = response.json()
+                logger.info(f"Intelligence Service returned: status={result.get('status')}, highlights={len(result.get('highlights', []))}")
+            except httpx.HTTPStatusError as e:
+                logger.error(f"Intelligence Service HTTP error: {e.response.status_code} - {e.response.text[:500]}")
+                if e.response.status_code == 404:
+                    # Fallback to legacy endpoint
+                    logger.info("Falling back to legacy journal endpoint")
+                    response = await client.post(
+                        f"{INTELLIGENCE_SERVICE_URL}/api/v1/journal/evening-prompt",
+                        json={
+                            "activity_data": activity_data,
+                            "timezone": "Asia/Singapore"
+                        }
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+                else:
+                    raise
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 404:
                     # Fallback to legacy endpoint
@@ -306,7 +347,7 @@ async def generate_evening_journal_prompt():
                     logger.info(f"Created new journal: {create_resp.data[0].get('id')}")
         
         # =================================================================
-        # 4. SEND TO TELEGRAM
+        # 5. SEND TO TELEGRAM
         # =================================================================
         
         message = result.get("message", "")
@@ -321,9 +362,15 @@ Time to reflect on your day! Here's what I observed:
 
 _Reply with a voice note or text to add your thoughts._"""
         
-        await send_telegram_message(message)
+        try:
+            logger.info(f"Sending Telegram message ({len(message)} chars)...")
+            await send_telegram_message(message)
+            logger.info("Telegram message sent successfully")
+        except Exception as telegram_error:
+            logger.error(f"Failed to send Telegram message: {telegram_error}")
+            # Don't fail the whole operation if Telegram fails
         
-        logger.info(f"Evening journal sent. Highlights: {len(result.get('highlights', []))}, Questions: {len(result.get('reflection_questions', result.get('reflection_prompts', [])))}")
+        logger.info(f"Evening journal complete. Highlights: {len(result.get('highlights', []))}, Questions: {len(result.get('reflection_questions', result.get('reflection_prompts', [])))}")
         
         return {
             "status": "success",
@@ -334,7 +381,7 @@ _Reply with a voice note or text to add your thoughts._"""
         }
         
     except httpx.HTTPError as e:
-        logger.error(f"Intelligence Service error: {e}")
+        logger.error(f"Intelligence Service HTTP error: {e}", exc_info=True)
         # Fallback to simple message
         fallback_msg = """📓 **Evening Journal**
 

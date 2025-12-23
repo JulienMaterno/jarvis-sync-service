@@ -160,14 +160,8 @@ class SystemHealthMonitor:
             if orphan_contacts.count and orphan_contacts.count > 0:
                 issues.append(f"{orphan_contacts.count} contacts without Notion link")
             
-            # 2. Meetings without contact_id that have contact_name
-            unlinked_meetings = supabase.table("meetings") \
-                .select("id", count="exact") \
-                .is_("contact_id", "null") \
-                .not_.is_("contact_name", "null") \
-                .execute()
-            if unlinked_meetings.count and unlinked_meetings.count > 5:
-                issues.append(f"{unlinked_meetings.count} meetings with unlinked contacts")
+            # Note: Meetings with unlinked contacts are normal - not all meetings have linked contacts
+            # Removed unlinked meetings warning per user preference
             
             if not issues:
                 return ComponentHealth(

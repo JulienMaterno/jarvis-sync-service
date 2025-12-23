@@ -122,12 +122,38 @@ class SupabaseClient:
     
     def upsert_book(self, book_data: Dict) -> Dict:
         """Upsert a book (insert or update based on notion_page_id)."""
-        response = self.client.post(
-            f"{self.base_url}/books?on_conflict=notion_page_id",
-            json=book_data
+        notion_page_id = book_data.get('notion_page_id')
+        
+        # Check if book exists
+        existing = self.get_book_by_notion_id(notion_page_id)
+        
+        if existing:
+            # Update existing record
+            response = self.client.patch(
+                f"{self.base_url}/books?notion_page_id=eq.{notion_page_id}",
+                json=book_data
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result[0] if result else {}
+        else:
+            # Insert new record
+            response = self.client.post(
+                f"{self.base_url}/books",
+                json=book_data
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result[0] if result else {}
+    
+    def get_book_by_notion_id(self, notion_page_id: str) -> Optional[Dict]:
+        """Get a book by its Notion page ID."""
+        response = self.client.get(
+            f"{self.base_url}/books?notion_page_id=eq.{notion_page_id}&limit=1"
         )
         response.raise_for_status()
-        return response.json()[0] if response.json() else {}
+        result = response.json()
+        return result[0] if result else None
     
     def get_all_books(self) -> List[Dict]:
         """Get all books from Supabase."""
@@ -190,8 +216,11 @@ def notion_book_to_supabase(notion_page: Dict) -> Dict:
     """
     props = notion_page.get('properties', {})
     
-    # TODO: Update these property names to match your Notion database
-    # Run sync_books.py --schema to see actual property names
+    # Supabase books table columns:
+    # id, title, author, author_id, status, rating, current_page, total_pages, 
+    # progress_percent, started_at, finished_at, summary, notes, tags, cover_url, 
+    # goodreads_url, amazon_url, notion_page_id, notion_updated_at, last_sync_source, 
+    # created_at, updated_at, deleted_at
     
     return {
         'notion_page_id': notion_page['id'],
@@ -200,11 +229,15 @@ def notion_book_to_supabase(notion_page: Dict) -> Dict:
         'cover_url': extract_url(props, 'Cover') or extract_text(props, 'Cover URL'),
         'status': extract_select(props, 'Status'),
         'rating': extract_number(props, 'Rating'),
-        'genres': extract_multi_select(props, 'Genres') or extract_multi_select(props, 'Tags'),
-        'date_started': extract_date(props, 'Date Started'),
-        'date_finished': extract_date(props, 'Date Finished'),
+        'tags': extract_multi_select(props, 'Genres') or extract_multi_select(props, 'Tags'),
+        'started_at': extract_date(props, 'Date Started'),
+        'finished_at': extract_date(props, 'Date Finished'),
         'notes': extract_text(props, 'Notes'),
-        'bookfusion_id': extract_text(props, 'BookFusion ID'),
+        'summary': extract_text(props, 'Summary'),
+        'total_pages': extract_number(props, 'Pages') or extract_number(props, 'Total Pages'),
+        'current_page': extract_number(props, 'Current Page'),
+        'goodreads_url': extract_url(props, 'Goodreads URL') or extract_url(props, 'Goodreads'),
+        'amazon_url': extract_url(props, 'Amazon URL') or extract_url(props, 'Amazon'),
         
         # Metadata
         'notion_updated_at': notion_page.get('last_edited_time'),

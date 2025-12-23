@@ -136,12 +136,38 @@ class SupabaseClient:
     
     def upsert_highlight(self, data: Dict) -> Dict:
         """Upsert a highlight (insert or update based on notion_page_id)."""
-        response = self.client.post(
-            f"{self.base_url}/highlights?on_conflict=notion_page_id",
-            json=data
+        notion_page_id = data.get('notion_page_id')
+        
+        # Check if highlight exists
+        existing = self.get_highlight_by_notion_id(notion_page_id)
+        
+        if existing:
+            # Update existing record
+            response = self.client.patch(
+                f"{self.base_url}/highlights?notion_page_id=eq.{notion_page_id}",
+                json=data
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result[0] if result else {}
+        else:
+            # Insert new record
+            response = self.client.post(
+                f"{self.base_url}/highlights",
+                json=data
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result[0] if result else {}
+    
+    def get_highlight_by_notion_id(self, notion_page_id: str) -> Optional[Dict]:
+        """Get a highlight by its Notion page ID."""
+        response = self.client.get(
+            f"{self.base_url}/highlights?notion_page_id=eq.{notion_page_id}&limit=1"
         )
         response.raise_for_status()
-        return response.json()[0] if response.json() else {}
+        result = response.json()
+        return result[0] if result else None
     
     def get_all_highlights(self, limit: int = 1000) -> List[Dict]:
         """Get all highlights from Supabase."""
@@ -226,42 +252,48 @@ def convert_notion_to_supabase(page: Dict, supabase: SupabaseClient) -> Dict:
     """Convert Notion highlight page to Supabase format."""
     props = page.get('properties', {})
     
-    # Try different possible property names for the highlight content
-    content = (
-        extract_text(props, 'Highlight') or
-        extract_text(props, 'Content') or
-        extract_text(props, 'Quote') or
-        extract_text(props, 'Text') or
-        extract_title(props, 'Name') or
-        ''
-    )
+    # Based on actual Notion schema:
+    # - Title: title (the actual highlight text)
+    # - Content: relation (to books - NOT the highlight text!)
+    # - Chapter Title: rich_text
+    # - Chapter Index: number
+    # - Location: number
+    # - Added At: date
+    # - Tags: multi_select
+    # - Color: rich_text
+    # - Authors: relation
+    # - Location URL: url
     
-    # Get book title from relation or text
-    book_title = extract_text(props, 'Book') or extract_text(props, 'Book Title')
+    # The highlight text is in the "Title" property (title type)
+    content = extract_title(props, 'Title')
     
-    # Try to look up book_id
+    # Get book info - "Content" is a relation to books
+    # We can't easily get the book title from a relation without additional API calls
+    # For now, we'll leave book_title empty and book_id null
+    book_title = None  # Would need to fetch from relation
     book_id = None
-    if book_title:
-        book_id = supabase.get_book_id_by_title(book_title)
     
-    # Get highlight type
-    highlight_type = extract_select(props, 'Type') or 'highlight'
+    # Location is a number in this schema
+    location_num = extract_number(props, 'Location')
+    
+    # Highlight type from Color
+    color = extract_text(props, 'Color')
     
     return {
         'notion_page_id': page.get('id'),
         'notion_updated_at': page.get('last_edited_time'),
         'last_sync_source': 'notion',
         'content': content,
-        'note': extract_text(props, 'Note') or extract_text(props, 'Notes') or extract_text(props, 'My Thoughts'),
+        'note': extract_text(props, 'Note') or extract_text(props, 'Notes'),
         'book_id': book_id,
         'book_title': book_title,
-        'page_number': extract_number(props, 'Page') or extract_number(props, 'Page Number'),
-        'chapter': extract_text(props, 'Chapter'),
-        'location': extract_text(props, 'Location'),
-        'highlight_type': highlight_type.lower() if highlight_type else 'highlight',
+        'page_number': None,  # Not in schema
+        'chapter': extract_text(props, 'Chapter Title'),
+        'location': str(location_num) if location_num else None,
+        'highlight_type': color.lower() if color else 'highlight',
         'tags': extract_multi_select(props, 'Tags'),
-        'is_favorite': extract_checkbox(props, 'Favorite') or extract_checkbox(props, 'Star'),
-        'highlighted_at': extract_date(props, 'Date') or extract_date(props, 'Highlighted At') or page.get('created_time'),
+        'is_favorite': False,  # Not in schema
+        'highlighted_at': extract_date(props, 'Added At') or page.get('created_time'),
         'updated_at': datetime.now(timezone.utc).isoformat()
     }
 
