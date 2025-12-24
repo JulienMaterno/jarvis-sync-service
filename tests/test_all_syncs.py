@@ -64,13 +64,10 @@ async def test_gmail_sync():
 
 async def test_contacts_sync():
     """Test contacts (Notion only, skip Google if failing)"""
-    from sync_contacts_bidirectional import sync_notion_to_supabase, sync_supabase_to_notion
-    result1 = await sync_notion_to_supabase()
-    result2 = await sync_supabase_to_notion()
-    return {
-        'notion_to_supabase': result1,
-        'supabase_to_notion': result2
-    }
+    from sync_contacts_unified import ContactsSyncService
+    service = ContactsSyncService()
+    result = await service.run()
+    return result
 
 async def run_all_tests(skip_google: bool = True):
     """Run all sync tests"""
