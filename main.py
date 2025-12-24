@@ -55,7 +55,12 @@ async def root():
 async def health_check():
     """
     Comprehensive health check endpoint.
-    Returns sync lock status, last sync info, and component health.
+    Returns sync lock status, last sync info, and accurate statistics.
+    
+    Success rate calculation:
+    - Only counts actionable operations (success vs error)
+    - Excludes informational logs (sync_start, sync_complete, etc.)
+    - 100% means zero errors in the time window
     """
     global _last_sync_start, _last_sync_end, _last_sync_results
     
@@ -70,7 +75,7 @@ async def health_check():
         )
     }
     
-    # Get basic stats
+    # Get accurate stats
     try:
         stats = await get_sync_statistics(hours=24)
     except Exception:
@@ -80,7 +85,8 @@ async def health_check():
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "sync": sync_status,
-        "statistics_24h": stats
+        "statistics_24h": stats,
+        "note": "Success rate = success/(success+error), excluding info logs"
     }
 
 @app.get("/health/sync")

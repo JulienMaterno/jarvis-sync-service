@@ -458,7 +458,7 @@ async def check_sync_health(service_name: str, failure_threshold: int = 5):
 
 
 async def get_sync_statistics(hours: int = 24):
-    """Legacy: Get sync statistics for the last N hours."""
+    """Get sync statistics for the last N hours with accurate success rate."""
     try:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
         response = supabase.table("sync_logs") \
@@ -468,17 +468,34 @@ async def get_sync_statistics(hours: int = 24):
         
         logs = response.data
         if not logs:
-            return {"total": 0, "success": 0, "error": 0, "rate": 0}
+            return {
+                "total_logs": 0,
+                "success": 0,
+                "error": 0,
+                "info": 0,
+                "other": 0,
+                "success_rate": 100.0,
+                "actionable_ops": 0
+            }
         
-        total = len(logs)
+        # Count by status type
         success = len([l for l in logs if l.get("status") == "success"])
         error = len([l for l in logs if l.get("status") == "error"])
+        info = len([l for l in logs if l.get("status") == "info"])
+        other = len(logs) - success - error - info
+        
+        # Calculate real success rate (success vs error only, excluding info logs)
+        actionable_ops = success + error
+        success_rate = round((success / actionable_ops) * 100, 1) if actionable_ops > 0 else 100.0
         
         return {
-            "total": total,
+            "total_logs": len(logs),
             "success": success,
             "error": error,
-            "success_rate": round((success / total) * 100, 1) if total > 0 else 0
+            "info": info,
+            "other": other,
+            "success_rate": success_rate,
+            "actionable_ops": actionable_ops
         }
         
     except Exception as e:
