@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.concurrency import run_in_threadpool
 from lib.sync_service import sync_contacts
@@ -9,21 +10,25 @@ from reports import generate_daily_report, generate_evening_journal_prompt
 from backup import backup_contacts
 import logging
 
-# Import meeting sync
-from sync_meetings_bidirectional import run_sync as run_meeting_sync
+# Import meeting sync (using new unified service)
+from syncs.meetings_sync import run_sync as run_meeting_sync
 
-# Import task sync
-from sync_tasks_bidirectional import run_sync as run_task_sync
+# Import task sync (using new unified service)
+from syncs.tasks_sync import run_sync as run_task_sync
 
-# Import reflection sync
-from sync_reflections_bidirectional import run_sync as run_reflection_sync
+# Import reflection sync (using new unified service)
+from syncs.reflections_sync import run_sync as run_reflection_sync
 
 # Import calendar and gmail sync
 from sync_calendar import run_calendar_sync
 from sync_gmail import run_gmail_sync
 
-# Import journal sync
-from sync_journals_bidirectional import run_bidirectional_sync as run_journal_sync
+# Import journal sync (using new unified service)
+from syncs.journals_sync import run_sync as run_journal_sync
+
+# Import books and highlights sync (Notion → Supabase)
+from sync_books import run_sync as run_books_sync
+from sync_highlights import run_sync as run_highlights_sync
 
 # Import ActivityWatch sync
 from sync_activitywatch import run_activitywatch_sync, ActivityWatchSync, format_activity_summary_for_journal
@@ -34,14 +39,49 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Jarvis Backend")
 
+# ============================================================================
+# SYNC LOCKING - Prevent overlapping syncs
+# ============================================================================
+_sync_lock = asyncio.Lock()
+_last_sync_start: datetime | None = None
+_last_sync_end: datetime | None = None
+_last_sync_results: dict | None = None
+
 @app.get("/")
 async def root():
     return {"status": "Jarvis Backend is running"}
 
 @app.get("/health")
 async def health_check():
-    """Basic health check endpoint."""
-    return {"status": "healthy"}
+    """
+    Comprehensive health check endpoint.
+    Returns sync lock status, last sync info, and component health.
+    """
+    global _last_sync_start, _last_sync_end, _last_sync_results
+    
+    # Check sync lock status
+    sync_status = {
+        "sync_in_progress": _sync_lock.locked(),
+        "last_sync_start": _last_sync_start.isoformat() if _last_sync_start else None,
+        "last_sync_end": _last_sync_end.isoformat() if _last_sync_end else None,
+        "last_sync_duration_seconds": (
+            (_last_sync_end - _last_sync_start).total_seconds() 
+            if _last_sync_start and _last_sync_end else None
+        )
+    }
+    
+    # Get basic stats
+    try:
+        stats = await get_sync_statistics(hours=24)
+    except Exception:
+        stats = {"error": "could not fetch stats"}
+    
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "sync": sync_status,
+        "statistics_24h": stats
+    }
 
 @app.get("/health/sync")
 async def sync_health_check():
@@ -74,10 +114,19 @@ async def full_health_check():
     """
     Comprehensive health check for the entire Jarvis ecosystem.
     Returns detailed status of all components, recent errors, and recommendations.
+    This is what gets sent in the 8am Telegram report.
     """
+    global _last_sync_results
+    
     try:
         report = await run_health_check(send_telegram=False)
-        return report.to_dict()
+        result = report.to_dict()
+        
+        # Add last sync results if available
+        if _last_sync_results:
+            result["last_sync_results"] = _last_sync_results
+        
+        return result
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
@@ -132,50 +181,89 @@ async def sync_everything(background_tasks: BackgroundTasks):
     """
     Runs all syncs in the correct order.
     Failures in one module do not stop others.
+    
+    Uses sync locking to prevent overlapping sync cycles.
     """
-    results = {}
-    logger.info("Starting full sync cycle via API")
+    global _last_sync_start, _last_sync_end, _last_sync_results
+    
+    # Check if a sync is already in progress
+    if _sync_lock.locked():
+        logger.warning("Sync already in progress, skipping this request")
+        return {
+            "status": "skipped",
+            "reason": "sync_already_in_progress",
+            "last_sync_start": _last_sync_start.isoformat() if _last_sync_start else None,
+            "message": "A sync cycle is already running. Try again later."
+        }
+    
+    async with _sync_lock:
+        _last_sync_start = datetime.now(timezone.utc)
+        results = {}
+        logger.info("Starting full sync cycle via API (lock acquired)")
 
-    async def run_step(name, func, *args, **kwargs):
-        try:
-            logger.info(f"Starting {name}...")
-            if asyncio.iscoroutinefunction(func):
-                res = await func(*args, **kwargs)
-            else:
-                res = await run_in_threadpool(func, *args, **kwargs)
-            results[name] = {"status": "success", "data": res}
-            # Reset failure counter on success
-            reset_failure_count(name)
-        except Exception as e:
-            logger.error(f"{name} failed: {e}")
-            results[name] = {"status": "error", "error": str(e)}
-            # Notify on error
-            background_tasks.add_task(notify_error, name, str(e))
+        async def run_step(name, func, *args, **kwargs):
+            try:
+                logger.info(f"Starting {name}...")
+                if asyncio.iscoroutinefunction(func):
+                    res = await func(*args, **kwargs)
+                else:
+                    res = await run_in_threadpool(func, *args, **kwargs)
+                results[name] = {"status": "success", "data": res}
+                # Reset failure counter on success
+                reset_failure_count(name)
+            except Exception as e:
+                logger.error(f"{name} failed: {e}")
+                results[name] = {"status": "error", "error": str(e)}
+                # Error notifications are disabled - errors go to sync_logs table
 
-    # === CONTACTS SYNC ===
-    await run_step("notion_to_supabase", sync_notion_to_supabase)
-    await run_step("google_sync", sync_contacts)
-    await run_step("supabase_to_notion", sync_supabase_to_notion)
-    
-    # === MEETINGS SYNC ===
-    await run_step("meetings_sync", run_meeting_sync, full_sync=False, since_hours=24)
-    
-    # === TASKS SYNC ===
-    await run_step("tasks_sync", run_task_sync, full_sync=False, since_hours=24)
-    
-    # === REFLECTIONS SYNC ===
-    await run_step("reflections_sync", run_reflection_sync, full_sync=False, since_hours=24)
-    
-    # === JOURNALS SYNC ===
-    await run_step("journals_sync", run_journal_sync, full_sync=False, since_hours=24)
-    
-    # === CALENDAR SYNC ===
-    await run_step("calendar_sync", run_calendar_sync)
+        # === CONTACTS SYNC ===
+        await run_step("notion_to_supabase", sync_notion_to_supabase)
+        await run_step("google_sync", sync_contacts)
+        await run_step("supabase_to_notion", sync_supabase_to_notion)
+        
+        # === MEETINGS SYNC ===
+        await run_step("meetings_sync", run_meeting_sync, full_sync=False, since_hours=24)
+        
+        # === TASKS SYNC ===
+        await run_step("tasks_sync", run_task_sync, full_sync=False, since_hours=24)
+        
+        # === REFLECTIONS SYNC ===
+        await run_step("reflections_sync", run_reflection_sync, full_sync=False, since_hours=24)
+        
+        # === JOURNALS SYNC ===
+        await run_step("journals_sync", run_journal_sync, full_sync=False, since_hours=24)
+        
+        # === CALENDAR SYNC ===
+        await run_step("calendar_sync", run_calendar_sync)
 
-    # === GMAIL SYNC ===
-    await run_step("gmail_sync", run_gmail_sync)
-    
-    return results
+        # === GMAIL SYNC ===
+        await run_step("gmail_sync", run_gmail_sync)
+        
+        # === BOOKS SYNC (Notion → Supabase) ===
+        await run_step("books_sync", run_books_sync, full_sync=False, since_hours=24)
+        
+        # === HIGHLIGHTS SYNC (Notion → Supabase) ===
+        await run_step("highlights_sync", run_highlights_sync, full_sync=False, since_hours=24)
+        
+        # Track sync completion
+        _last_sync_end = datetime.now(timezone.utc)
+        _last_sync_results = results
+        
+        # Count successes and errors for summary
+        success_count = sum(1 for r in results.values() if r.get("status") == "success")
+        error_count = sum(1 for r in results.values() if r.get("status") == "error")
+        
+        logger.info(f"Full sync cycle complete: {success_count} success, {error_count} errors")
+        
+        return {
+            "status": "completed",
+            "summary": {
+                "success_count": success_count,
+                "error_count": error_count,
+                "duration_seconds": (_last_sync_end - _last_sync_start).total_seconds()
+            },
+            "results": results
+        }
 
 @app.post("/report/daily")
 async def daily_report(background_tasks: BackgroundTasks):
@@ -298,6 +386,48 @@ async def sync_gmail():
         return await run_gmail_sync()
     except Exception as e:
         logger.error(f"Gmail sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Books Sync ---
+
+@app.post("/sync/books")
+async def sync_books(full: bool = False, hours: int = 24):
+    """
+    Sync books from Notion to Supabase (one-way).
+    Source: Notion Content database (fed by BookFusion)
+    
+    Args:
+        full: If True, sync all books. If False, only recently updated.
+        hours: For incremental sync, how many hours to look back.
+    """
+    try:
+        logger.info(f"Starting books sync via API (full={full}, hours={hours})")
+        result = await run_in_threadpool(run_books_sync, full_sync=full, since_hours=hours)
+        return result
+    except Exception as e:
+        logger.error(f"Books sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Highlights Sync ---
+
+@app.post("/sync/highlights")
+async def sync_highlights(full: bool = False, hours: int = 24):
+    """
+    Sync book highlights from Notion to Supabase (one-way).
+    Source: Notion Highlights database (fed by BookFusion)
+    
+    Args:
+        full: If True, sync all highlights. If False, only recently updated.
+        hours: For incremental sync, how many hours to look back.
+    """
+    try:
+        logger.info(f"Starting highlights sync via API (full={full}, hours={hours})")
+        result = await run_in_threadpool(run_highlights_sync, full_sync=full, since_hours=hours)
+        return result
+    except Exception as e:
+        logger.error(f"Highlights sync failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

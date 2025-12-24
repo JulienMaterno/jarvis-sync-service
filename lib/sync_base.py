@@ -1,6 +1,6 @@
 """
 ===================================================================================
-UNIFIED SYNC ARCHITECTURE - Base Classes and Templates
+UNIFIED SYNC ARCHITECTURE - Base Classes and Templates (v2)
 ===================================================================================
 
 This module provides a standardized, reusable architecture for all sync services.
@@ -16,7 +16,16 @@ Key Features:
 - Automatic retry with exponential backoff  
 - Safety valves to prevent data loss
 - Unified Notion and Supabase clients
+- Page content extraction and creation
+- Bidirectional deletion sync
 - Standardized entry points and CLI interface
+
+v2 Changes:
+- Added content block extraction (extract_page_content)
+- Added content block creation (build_content_blocks, chunked_paragraphs)
+- Added bidirectional deletion sync (S→N archives Notion pages)
+- Added CRM contact linking support
+- Enhanced NotionClient with block management
 """
 
 import os
@@ -264,7 +273,17 @@ class NotionClient:
     
     @retry_on_error(max_retries=3, base_delay=1.0)
     def archive_page(self, page_id: str) -> Dict:
-        """Archive (soft-delete) a Notion page."""
+        """Archive (soft-delete) a Notion page. Safe to call if already archived."""
+        # First check if already archived
+        try:
+            get_resp = self.client.get(f'https://api.notion.com/v1/pages/{page_id}')
+            if get_resp.status_code == 200:
+                page_data = get_resp.json()
+                if page_data.get('archived') or page_data.get('in_trash'):
+                    return page_data  # Already archived, no action needed
+        except:
+            pass  # Continue to try archiving
+        
         response = self.client.patch(
             f'https://api.notion.com/v1/pages/{page_id}',
             json={"archived": True}
@@ -281,6 +300,148 @@ class NotionClient:
         )
         response.raise_for_status()
         return response.json().get('results', [])
+    
+    @retry_on_error(max_retries=3, base_delay=1.0)
+    def get_all_blocks(self, page_id: str) -> List[Dict]:
+        """Get ALL blocks from a page with pagination."""
+        blocks = []
+        start_cursor = None
+        
+        while True:
+            url = f'https://api.notion.com/v1/blocks/{page_id}/children'
+            params = {'page_size': 100}
+            if start_cursor:
+                params['start_cursor'] = start_cursor
+            
+            response = self.client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            blocks.extend(data.get('results', []))
+            
+            if not data.get('has_more'):
+                break
+            start_cursor = data.get('next_cursor')
+        
+        return blocks
+    
+    def get_block_children(self, block_id: str) -> List[Dict]:
+        """Get children of a specific block (for nested content)."""
+        try:
+            response = self.client.get(
+                f'https://api.notion.com/v1/blocks/{block_id}/children',
+                params={'page_size': 100}
+            )
+            # Handle blocks that don't support children
+            if response.status_code in [400, 404]:
+                return []
+            response.raise_for_status()
+            return response.json().get('results', [])
+        except Exception:
+            return []
+    
+    @retry_on_error(max_retries=3, base_delay=1.0)
+    def append_blocks(self, page_id: str, blocks: List[Dict]) -> List[Dict]:
+        """Append content blocks to a page."""
+        if not blocks:
+            return []
+        response = self.client.patch(
+            f'https://api.notion.com/v1/blocks/{page_id}/children',
+            json={"children": blocks}
+        )
+        response.raise_for_status()
+        return response.json().get('results', [])
+    
+    @retry_on_error(max_retries=3, base_delay=1.0)
+    def delete_block(self, block_id: str) -> bool:
+        """Delete a specific block."""
+        response = self.client.delete(f'https://api.notion.com/v1/blocks/{block_id}')
+        response.raise_for_status()
+        return True
+    
+    def extract_page_content(self, page_id: str, max_depth: int = 3) -> Tuple[str, bool]:
+        """
+        Extract readable text content from a page.
+        
+        Args:
+            page_id: The Notion page ID
+            max_depth: Maximum nesting depth to traverse
+            
+        Returns:
+            Tuple of (content_text, has_unsupported_blocks)
+        """
+        blocks = self.get_all_blocks(page_id)
+        return self._extract_blocks_text(blocks, max_depth=max_depth)
+    
+    def _extract_blocks_text(self, blocks: List[Dict], depth: int = 0, max_depth: int = 3) -> Tuple[str, bool]:
+        """Recursively extract text from blocks."""
+        text_parts = []
+        has_unsupported = False
+        indent = "  " * depth
+        
+        for block in blocks:
+            block_type = block.get('type')
+            block_id = block.get('id')
+            has_children = block.get('has_children', False)
+            
+            # Handle unsupported blocks (AI meeting notes, etc.)
+            if block_type == 'unsupported':
+                has_unsupported = True
+                # Try to get children anyway
+                if has_children and depth < max_depth:
+                    children = self.get_block_children(block_id)
+                    child_text, _ = self._extract_blocks_text(children, depth + 1, max_depth)
+                    if child_text:
+                        text_parts.append(child_text)
+                continue
+            
+            # Extract text based on block type
+            text = self._get_block_text(block)
+            if text:
+                prefix = self._get_block_prefix(block_type)
+                text_parts.append(f"{indent}{prefix}{text}")
+            
+            # Recursively get children (for toggles, etc.)
+            if has_children and depth < max_depth:
+                children = self.get_block_children(block_id)
+                child_text, child_unsupported = self._extract_blocks_text(children, depth + 1, max_depth)
+                if child_text:
+                    text_parts.append(child_text)
+                if child_unsupported:
+                    has_unsupported = True
+        
+        return '\n'.join(filter(None, text_parts)), has_unsupported
+    
+    def _get_block_text(self, block: Dict) -> Optional[str]:
+        """Extract plain text from a single block."""
+        block_type = block.get('type')
+        
+        text_block_types = [
+            'paragraph', 'heading_1', 'heading_2', 'heading_3',
+            'bulleted_list_item', 'numbered_list_item', 'to_do',
+            'toggle', 'quote', 'callout'
+        ]
+        
+        if block_type in text_block_types:
+            rich_text = block.get(block_type, {}).get('rich_text', [])
+            return ''.join([t.get('plain_text', '') for t in rich_text])
+        
+        return None
+    
+    def _get_block_prefix(self, block_type: str) -> str:
+        """Get display prefix for block type."""
+        prefixes = {
+            'heading_1': '# ',
+            'heading_2': '## ',
+            'heading_3': '### ',
+            'bulleted_list_item': '• ',
+            'numbered_list_item': '- ',
+            'to_do': '☐ ',
+            'quote': '> ',
+            'callout': '💡 ',
+            'toggle': '▶ ',
+        }
+        return prefixes.get(block_type, '')
     
     def get_database_schema(self, database_id: str) -> Dict:
         """Get database schema to understand available properties."""
@@ -423,6 +584,248 @@ class SupabaseClient:
     def soft_delete(self, record_id: str) -> Dict:
         """Soft-delete a record by setting deleted_at."""
         return self.update(record_id, {"deleted_at": datetime.now(timezone.utc).isoformat()})
+    
+    @retry_on_error(max_retries=3, base_delay=1.0)
+    def get_deleted_with_notion_id(self) -> List[Dict]:
+        """Get soft-deleted records that still have a notion_page_id (need archiving in Notion)."""
+        response = self.client.get(
+            f"{self.base_url}/{self.table_name}",
+            params={
+                "select": "*",
+                "deleted_at": "not.is.null",
+                "notion_page_id": "not.is.null"
+            }
+        )
+        response.raise_for_status()
+        return response.json()
+    
+    @retry_on_error(max_retries=3, base_delay=1.0)
+    def clear_notion_page_id(self, record_id: str) -> Dict:
+        """Clear notion_page_id after archiving (prevents re-archiving)."""
+        return self.update(record_id, {
+            "notion_page_id": None,
+            "notion_updated_at": None
+        })
+    
+    @retry_on_error(max_retries=3, base_delay=1.0)
+    def get_all_active(self) -> List[Dict]:
+        """Get all non-deleted records."""
+        response = self.client.get(
+            f"{self.base_url}/{self.table_name}",
+            params={
+                "select": "*",
+                "deleted_at": "is.null",
+                "order": "created_at.desc"
+            }
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+# ============================================================================
+# CONTENT BLOCK BUILDERS
+# ============================================================================
+
+class ContentBlockBuilder:
+    """Helper class to build Notion content blocks from text."""
+    
+    NOTION_BLOCK_LIMIT = 2000  # Notion's character limit per block
+    
+    @staticmethod
+    def paragraph(text: str) -> Dict:
+        """Create a paragraph block."""
+        return {
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
+            }
+        }
+    
+    @staticmethod
+    def heading_1(text: str) -> Dict:
+        """Create a heading 1 block."""
+        return {
+            "object": "block",
+            "type": "heading_1",
+            "heading_1": {
+                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
+            }
+        }
+    
+    @staticmethod
+    def heading_2(text: str) -> Dict:
+        """Create a heading 2 block."""
+        return {
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {
+                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
+            }
+        }
+    
+    @staticmethod
+    def heading_3(text: str) -> Dict:
+        """Create a heading 3 block."""
+        return {
+            "object": "block",
+            "type": "heading_3",
+            "heading_3": {
+                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
+            }
+        }
+    
+    @staticmethod
+    def bulleted_list_item(text: str) -> Dict:
+        """Create a bulleted list item block."""
+        return {
+            "object": "block",
+            "type": "bulleted_list_item",
+            "bulleted_list_item": {
+                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
+            }
+        }
+    
+    @staticmethod
+    def numbered_list_item(text: str) -> Dict:
+        """Create a numbered list item block."""
+        return {
+            "object": "block",
+            "type": "numbered_list_item",
+            "numbered_list_item": {
+                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
+            }
+        }
+    
+    @staticmethod
+    def to_do(text: str, checked: bool = False) -> Dict:
+        """Create a to-do block."""
+        return {
+            "object": "block",
+            "type": "to_do",
+            "to_do": {
+                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}],
+                "checked": checked
+            }
+        }
+    
+    @staticmethod
+    def toggle(text: str, children: List[Dict] = None) -> Dict:
+        """Create a toggle block."""
+        block = {
+            "object": "block",
+            "type": "toggle",
+            "toggle": {
+                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
+            }
+        }
+        if children:
+            block["toggle"]["children"] = children
+        return block
+    
+    @staticmethod
+    def quote(text: str) -> Dict:
+        """Create a quote block."""
+        return {
+            "object": "block",
+            "type": "quote",
+            "quote": {
+                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
+            }
+        }
+    
+    @staticmethod
+    def callout(text: str, icon: str = "💡") -> Dict:
+        """Create a callout block."""
+        return {
+            "object": "block",
+            "type": "callout",
+            "callout": {
+                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}],
+                "icon": {"type": "emoji", "emoji": icon}
+            }
+        }
+    
+    @staticmethod
+    def divider() -> Dict:
+        """Create a divider block."""
+        return {"object": "block", "type": "divider", "divider": {}}
+    
+    @classmethod
+    def chunked_paragraphs(cls, text: str, chunk_size: int = None) -> List[Dict]:
+        """
+        Split long text into multiple paragraph blocks.
+        
+        Args:
+            text: The text to split
+            chunk_size: Max characters per block (default: NOTION_BLOCK_LIMIT)
+        """
+        if not text:
+            return []
+        
+        chunk_size = chunk_size or cls.NOTION_BLOCK_LIMIT
+        blocks = []
+        
+        # Try to split on paragraph boundaries first
+        paragraphs = text.split('\n\n')
+        current_chunk = ""
+        
+        for para in paragraphs:
+            if len(current_chunk) + len(para) + 2 <= chunk_size:
+                if current_chunk:
+                    current_chunk += "\n\n"
+                current_chunk += para
+            else:
+                if current_chunk:
+                    blocks.append(cls.paragraph(current_chunk))
+                # Handle very long paragraphs
+                while len(para) > chunk_size:
+                    blocks.append(cls.paragraph(para[:chunk_size]))
+                    para = para[chunk_size:]
+                current_chunk = para
+        
+        if current_chunk:
+            blocks.append(cls.paragraph(current_chunk))
+        
+        return blocks
+    
+    @classmethod
+    def from_structured_content(cls, content: Dict) -> List[Dict]:
+        """
+        Build blocks from a structured content dictionary.
+        
+        Expected format:
+        {
+            "summary": "Summary text",
+            "sections": [
+                {"heading": "Section Title", "content": "Section content", "items": ["item1", "item2"]}
+            ],
+            "action_items": ["task1", "task2"]
+        }
+        """
+        blocks = []
+        
+        # Summary
+        if content.get("summary"):
+            blocks.append(cls.heading_2("Summary"))
+            blocks.extend(cls.chunked_paragraphs(content["summary"]))
+        
+        # Sections
+        for section in content.get("sections", []):
+            if section.get("heading"):
+                blocks.append(cls.heading_3(section["heading"]))
+            if section.get("content"):
+                blocks.extend(cls.chunked_paragraphs(section["content"]))
+            for item in section.get("items", []):
+                blocks.append(cls.bulleted_list_item(item))
+        
+        # Action items
+        if content.get("action_items"):
+            blocks.append(cls.heading_2("Action Items"))
+            for item in content["action_items"]:
+                blocks.append(cls.to_do(item))
+        
+        return blocks
 
 
 # ============================================================================
@@ -438,15 +841,21 @@ class SyncLogger:
         self.logger = setup_logger(f'SyncLogger.{service_name}')
     
     def log(self, event_type: str, status: str, message: str, details: Optional[Dict] = None):
-        """Log a sync event to the database."""
+        """Log a sync event to the database.
+        
+        Note: The 'details' column may not exist in all environments.
+        We try with details first, then fall back to without.
+        """
+        log_data = {
+            'event_type': f"{self.service_name}_{event_type}",
+            'status': status,
+            'message': message[:500] if message else '',
+            'created_at': datetime.now(timezone.utc).isoformat()
+        }
+        
         try:
-            self.supabase.insert({
-                'event_type': f"{self.service_name}_{event_type}",
-                'status': status,
-                'message': message[:500] if message else '',
-                'details': details or {},
-                'created_at': datetime.now(timezone.utc).isoformat()
-            })
+            # Try without details first (safer)
+            self.supabase.insert(log_data)
         except Exception as e:
             self.logger.warning(f"Failed to log sync event: {e}")
     
@@ -829,11 +1238,121 @@ class TwoWaySyncService(BaseSyncService):
     def get_source_id(self, source_record: Dict) -> str:
         return source_record.get('id', '')
     
+    def _sync_notion_deletions(self) -> int:
+        """
+        Detect and sync deletions: Soft-delete Supabase records whose Notion pages were deleted.
+        
+        Returns: Number of records soft-deleted in Supabase
+        """
+        deleted_count = 0
+        
+        # Get all Supabase records that have a notion_page_id and are not already deleted
+        all_records = self.supabase.select_all()
+        linked_records = [r for r in all_records if r.get('notion_page_id') and not r.get('deleted_at')]
+        
+        if not linked_records:
+            self.logger.info("No linked records to check for Notion deletions")
+            return 0
+        
+        self.logger.info(f"Checking {len(linked_records)} linked records for Notion deletions...")
+        
+        # Get all current Notion page IDs
+        try:
+            all_notion_pages = self.notion.query_database(self.notion_database_id)
+            notion_page_ids = {p['id'] for p in all_notion_pages}
+            self.logger.info(f"Found {len(notion_page_ids)} pages in Notion database")
+        except Exception as e:
+            self.logger.error(f"Failed to query Notion database: {e}")
+            return 0
+        
+        # Find orphaned records (Supabase has notion_page_id but page no longer exists in Notion)
+        for record in linked_records:
+            notion_page_id = record.get('notion_page_id')
+            
+            if notion_page_id not in notion_page_ids:
+                # Page was deleted in Notion - soft-delete in Supabase
+                record_id = record.get('id')
+                record_name = record.get('title') or record.get('name') or record.get('first_name', '') + ' ' + record.get('last_name', '')
+                
+                try:
+                    self.supabase.soft_delete(record_id)
+                    self.supabase.update(record_id, {
+                        'notion_page_id': None,
+                        'notion_updated_at': None
+                    })
+                    deleted_count += 1
+                    self.logger.info(f"Soft-deleted '{record_name}' (Notion page was deleted)")
+                except Exception as e:
+                    self.logger.error(f"Failed to soft-delete record {record_id}: {e}")
+        
+        if deleted_count > 0:
+            self.logger.info(f"Soft-deleted {deleted_count} records (Notion pages were deleted)")
+        else:
+            self.logger.info("No Notion deletions detected")
+        
+        return deleted_count
+    
+    def _sync_supabase_deletions(self) -> int:
+        """
+        Sync deletions from Supabase to Notion: Archive Notion pages for soft-deleted Supabase records.
+        
+        Returns: Number of Notion pages archived
+        """
+        archived = 0
+        
+        # Get deleted records that still have notion_page_id
+        deleted_records = self.supabase.get_deleted_with_notion_id()
+        
+        if not deleted_records:
+            self.logger.info("No Supabase deletions need Notion archiving")
+            return 0
+        
+        self.logger.info(f"Found {len(deleted_records)} deleted records to archive in Notion")
+        
+        for record in deleted_records:
+            record_id = record.get('id')
+            notion_page_id = record.get('notion_page_id')
+            record_name = record.get('title') or record.get('name') or record.get('first_name', '') + ' ' + record.get('last_name', '')
+            
+            try:
+                # Archive the Notion page
+                self.notion.archive_page(notion_page_id)
+                self.logger.info(f"Archived Notion page for deleted record: {record_name}")
+                
+                # Clear the notion_page_id so we don't try again
+                self.supabase.clear_notion_page_id(record_id)
+                
+                archived += 1
+                
+            except Exception as e:
+                # Page might already be archived, in trash, or not exist
+                # 400 = already archived, 404 = not found
+                error_str = str(e).lower()
+                if "404" in error_str or "400" in error_str or "archived" in error_str or "trash" in error_str:
+                    self.logger.info(f"Notion page already archived/deleted: {record_name}")
+                    self.supabase.clear_notion_page_id(record_id)
+                    archived += 1  # Count as archived since end state is same
+                else:
+                    self.logger.error(f"Error archiving Notion page for {record_name}: {e}")
+        
+        if archived > 0:
+            self.logger.info(f"Archived {archived} Notion pages for deleted records")
+        
+        return archived
+
     def sync(self, full_sync: bool = False, since_hours: int = 24) -> SyncResult:
         """
         Bidirectional sync between Notion and Supabase.
         """
         start_time = time.time()
+        
+        # Step 0a: Sync Notion deletions → Supabase (soft-delete)
+        self.logger.info("Phase 0a: Sync Notion Deletions → Supabase")
+        notion_deletions = self._sync_notion_deletions()
+        
+        # Step 0b: Sync Supabase deletions → Notion (archive)
+        self.logger.info("Phase 0b: Sync Supabase Deletions → Notion")
+        supabase_deletions = self._sync_supabase_deletions()
         
         # Step 1: Notion → Supabase
         self.logger.info("Phase 1: Notion → Supabase")
@@ -847,19 +1366,21 @@ class TwoWaySyncService(BaseSyncService):
         combined_stats = SyncStats(
             created=result1.stats.created + result2.stats.created,
             updated=result1.stats.updated + result2.stats.updated,
-            deleted=result1.stats.deleted + result2.stats.deleted,
+            deleted=result1.stats.deleted + result2.stats.deleted + notion_deletions + supabase_deletions,
             skipped=result1.stats.skipped + result2.stats.skipped,
             errors=result1.stats.errors + result2.stats.errors
         )
         
         elapsed = time.time() - start_time
-        return SyncResult(
+        result = SyncResult(
             success=result1.success and result2.success,
             direction="bidirectional",
             stats=combined_stats,
             elapsed_seconds=elapsed
         )
-    
+        
+        self.sync_logger.log_complete(result)
+        return result
     def _sync_notion_to_supabase(self, full_sync: bool, since_hours: int) -> SyncResult:
         """Sync from Notion to Supabase."""
         stats = SyncStats()
@@ -1036,6 +1557,7 @@ __all__ = [
     # Property helpers
     'NotionPropertyExtractor',
     'NotionPropertyBuilder',
+    'ContentBlockBuilder',
     
     # Sync services
     'BaseSyncService',

@@ -28,26 +28,26 @@ def print_result(name: str, success: bool, details: str = ""):
 
 async def test_meetings_sync():
     """Test meetings sync"""
-    from sync_meetings_bidirectional import run_sync
+    from syncs.meetings_sync import run_sync
     result = run_sync(full_sync=False, since_hours=24)
     return result
 
 async def test_tasks_sync():
     """Test tasks sync"""
-    from sync_tasks_bidirectional import run_sync
+    from syncs.tasks_sync import run_sync
     result = run_sync(full_sync=False, since_hours=24)
     return result
 
 async def test_reflections_sync():
     """Test reflections sync"""
-    from sync_reflections_bidirectional import run_sync
+    from syncs.reflections_sync import run_sync
     result = run_sync(full_sync=False, since_hours=24)
     return result
 
 async def test_journals_sync():
     """Test journals sync"""
-    from sync_journals_bidirectional import run_bidirectional_sync
-    result = await run_bidirectional_sync(full_sync=False, since_hours=24)
+    from syncs.journals_sync import run_sync
+    result = run_sync(full_sync=False, since_hours=24)
     return result
 
 async def test_calendar_sync():

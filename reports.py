@@ -266,7 +266,7 @@ async def generate_evening_journal_prompt():
                     json={
                         "activity_data": activity_data,
                         "timezone": "Asia/Singapore",
-                        "user_name": "Bertan",
+                        "user_name": "Aaron",
                         "previous_journals": previous_journals
                     }
                 )

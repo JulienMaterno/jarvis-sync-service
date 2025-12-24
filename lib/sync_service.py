@@ -76,11 +76,27 @@ async def sync_contacts():
             
         logger.info(f"Fetched {len(supabase_contacts)} contacts from Supabase.")
         
-        # SAFETY VALVE: If Google returns empty or very few contacts but Supabase has many, 
-        # abort to prevent mass deletion.
-        if len(supabase_contacts) > 10 and len(google_contacts_list) < (len(supabase_contacts) * 0.1):
-            msg = f"Safety Valve Triggered: Google returned {len(google_contacts_list)} contacts, but Supabase has {len(supabase_contacts)}. Aborting."
+        # SAFETY VALVE: Enhanced protection against mass deletions
+        # Check multiple conditions that indicate something is wrong with Google data
+        google_count = len(google_contacts_list)
+        supabase_count = len(supabase_contacts)
+        active_supabase = len([c for c in supabase_contacts if not c.get('deleted_at')])
+        
+        # Condition 1: Google has < 10% of Supabase contacts
+        ratio_check = supabase_count > 10 and google_count < (supabase_count * 0.1)
+        
+        # Condition 2: Google has very few contacts but Supabase has many active
+        minimum_check = google_count < 5 and active_supabase > 20
+        
+        # Condition 3: Google is completely empty but we have data
+        empty_check = google_count == 0 and supabase_count > 0
+        
+        if ratio_check or minimum_check or empty_check:
+            msg = f"Safety Valve Triggered: Google returned {google_count} contacts, but Supabase has {supabase_count} ({active_supabase} active). Aborting."
             await log_sync_event("sync_abort", "error", msg)
+            logger.error(msg)
+            logger.error("This usually means Google Contacts was wiped or there's an API issue.")
+            logger.error("To restore: python restore_google_contacts.py")
             raise Exception(msg)
 
         synced_count = 0
@@ -229,15 +245,24 @@ async def sync_contacts():
                     
                 else:
                     # Case: In Supabase (with Google ID) but NOT in Google
-                    # This means it was DELETED in Google.
-                    # Action: Propagate deletion to Supabase (Soft Delete)
-                    logger.warning(f"Contact {resource_name} missing in Google. Soft-deleting in Supabase.")
-                    supabase.table("contacts").update({
-                        "deleted_at": datetime.now(timezone.utc).isoformat(),
-                        "last_sync_source": "google"
-                    }).eq("id", sb_contact["id"]).execute()
-                    await log_sync_event("delete_supabase", "success", f"Soft-deleted {sb_contact.get('email')} (Missing in Google)")
-                    synced_count += 1
+                    # This could mean:
+                    # 1. Contact was deleted in Google (normal case)
+                    # 2. Google API issue (returned partial data)
+                    # 3. Google account was wiped/reset
+                    # 
+                    # SAFETY: Only soft-delete if Google has a reasonable number of contacts
+                    # If Google returned very few contacts, something is wrong - don't delete!
+                    if len(google_contacts_list) >= 10 or len(supabase_contacts) < 20:
+                        logger.warning(f"Contact {resource_name} missing in Google. Soft-deleting in Supabase.")
+                        supabase.table("contacts").update({
+                            "deleted_at": datetime.now(timezone.utc).isoformat(),
+                            "last_sync_source": "google"
+                        }).eq("id", sb_contact["id"]).execute()
+                        await log_sync_event("delete_supabase", "success", f"Soft-deleted {sb_contact.get('email')} (Missing in Google)")
+                        synced_count += 1
+                    else:
+                        logger.warning(f"SKIPPING deletion of {sb_contact.get('email')} - Google returned too few contacts ({len(google_contacts_list)}), possible API issue")
+                        await log_sync_event("delete_skipped", "warning", f"Skipped deletion of {sb_contact.get('email')} - Google returned only {len(google_contacts_list)} contacts")
                     
             except Exception as e:
                 logger.error(f"Error processing Supabase contact {sb_contact.get('id')}: {e}")

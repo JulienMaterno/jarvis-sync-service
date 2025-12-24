@@ -306,6 +306,12 @@ def sync_notion_to_supabase(full_sync: bool = False):
             contact_data = transform_notion_to_supabase(page)
             
             if existing:
+                # Skip if already soft-deleted in Supabase - don't update deleted contacts
+                if existing.get("deleted_at"):
+                    logger.debug(f"Skipping soft-deleted contact {existing.get('id')}")
+                    skipped += 1
+                    continue
+                    
                 # Compare timestamps with 5-second buffer to prevent ping-pong
                 # notion_updated_at in Supabase stores when Notion was last edited
                 sb_notion_updated = existing.get("notion_updated_at")
@@ -375,6 +381,7 @@ def sync_supabase_to_notion(full_sync: bool = False):
     logger.info(f"Starting Supabase -> Notion sync (mode: {'full' if full_sync else 'incremental'})...")
     
     # 1. Handle Deletions (Soft deleted in Supabase -> Archive in Notion)
+    # If a contact has deleted_at set AND still has a notion_page_id, we need to archive it
     res = supabase.table("contacts").select("*").not_.is_("deleted_at", "null").not_.is_("notion_page_id", "null").execute()
     deleted_contacts = res.data or []
     
@@ -382,21 +389,19 @@ def sync_supabase_to_notion(full_sync: bool = False):
     for contact in deleted_contacts:
         try:
             page_id = contact.get("notion_page_id")
-            deleted_at = contact.get("deleted_at")
-            notion_updated_at = contact.get("notion_updated_at")
             
-            # Only archive if deletion happened after last sync
-            if not notion_updated_at or deleted_at > notion_updated_at:
-                logger.info(f"Archiving Notion page {page_id} (deleted in Supabase)")
-                result = notion.archive_page(page_id)
-                
-                # Update timestamp to prevent re-syncing (also clear link if already gone)
-                update_data = {"notion_updated_at": datetime.now(timezone.utc).isoformat()}
-                if result.get("not_found") or result.get("already_archived"):
-                    update_data["notion_page_id"] = None  # Clear the link
-                    
-                supabase.table("contacts").update(update_data).eq("id", contact["id"]).execute()
-                deleted_count += 1
+            # If contact is soft-deleted and still has notion_page_id, always try to archive
+            logger.info(f"Archiving Notion page {page_id} (soft-deleted in Supabase)")
+            result = notion.archive_page(page_id)
+            
+            # Clear the notion_page_id to indicate archival is complete
+            update_data = {
+                "notion_page_id": None,  # Clear link - archival is done
+                "notion_updated_at": datetime.now(timezone.utc).isoformat()
+            }
+            supabase.table("contacts").update(update_data).eq("id", contact["id"]).execute()
+            deleted_count += 1
+            logger.info(f"Successfully archived and cleared link for contact {contact.get('id')}")
                 
         except Exception as e:
             error_msg = str(e).lower()
@@ -412,6 +417,7 @@ def sync_supabase_to_notion(full_sync: bool = False):
                 logger.error(f"Error archiving Notion page {contact.get('notion_page_id')}: {e}")
 
     logger.info(f"Archived {deleted_count} pages in Notion.")
+
 
     # 2. Handle Updates/Creates
     # Fetch active contacts
