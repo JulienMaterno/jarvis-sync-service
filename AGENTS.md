@@ -1,17 +1,38 @@
 # 🤖 AGENTS.md - LLM Integration Guide
 
-> **⚠️ CRITICAL: This service is LOCKED**
+> **⚠️ CAUTION: Production-Critical Service**
 > 
-> Do NOT modify any code in this repository without explicit user confirmation.
-> This service is production-hardened and handles critical data synchronization.
-> Modifications could cause data loss or sync corruption.
+> This service handles critical data synchronization between Notion, Supabase, Google (Calendar/Gmail), and ActivityWatch.
+> Runs every 15 minutes via Cloud Scheduler. Be careful with modifications.
 
-## 🔒 Why This Service is Locked
+## 🏗️ Architecture (Unified Sync Services)
 
-1. **Data Integrity**: Handles bidirectional sync between Notion, Supabase, and Google
-2. **Production Traffic**: Runs every 15 minutes via Cloud Scheduler
-3. **Safety Valves**: Carefully tuned to prevent accidental mass deletions
-4. **Battle-Tested**: All edge cases have been handled and tested
+```
+jarvis-sync-service/
+├── main.py                      # FastAPI app with all endpoints
+├── reports.py                   # Daily reports & evening journal
+├── syncs/                       # 🆕 Unified sync services (use lib/sync_base.py)
+│   ├── meetings_sync.py         # Bidirectional: Notion ↔ Supabase
+│   ├── tasks_sync.py            # Bidirectional: Notion ↔ Supabase  
+│   ├── reflections_sync.py      # Bidirectional: Notion ↔ Supabase
+│   └── journals_sync.py         # Bidirectional: Notion ↔ Supabase
+├── sync_contacts_unified.py     # Multi-source: Notion ↔ Supabase ↔ Google
+├── sync_calendar.py             # One-way: Google → Supabase
+├── sync_gmail.py                # One-way: Google → Supabase
+├── sync_books.py                # One-way: Notion → Supabase
+├── sync_highlights.py           # One-way: Notion → Supabase
+├── sync_activitywatch.py        # Local: ActivityWatch → Supabase
+└── lib/                         # Core libraries
+    ├── sync_base.py             # 🎯 Base classes for all syncs
+    └── ...
+```
+
+## 🔒 Safety Mechanisms
+
+1. **Data Integrity**: All syncs have safety valves (10% threshold)
+2. **Production Traffic**: Cloud Scheduler runs `/sync/all` every 15 minutes
+3. **Soft Deletes**: Records are soft-deleted, never hard-deleted
+4. **Bidirectional Deletion**: Deletes sync both ways (Notion ↔ Supabase)
 
 ## ✅ What You CAN Do
 
