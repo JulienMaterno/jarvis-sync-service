@@ -541,11 +541,12 @@ class MeetingsSyncService(TwoWaySyncService):
         
         return deleted_count
     
-    def _sync_notion_to_supabase(self, full_sync: bool, since_hours: int) -> SyncResult:
+    def _sync_notion_to_supabase(self, full_sync: bool, since_hours: int, metrics=None) -> SyncResult:
         """
         Override to include content extraction and CRM contact linking.
         Notion → Supabase with content and contacts
         """
+        from lib.sync_base import SyncMetrics
         stats = SyncStats()
         start_time = __import__('time').time()
         
@@ -567,11 +568,20 @@ class MeetingsSyncService(TwoWaySyncService):
             notion_records = self.notion.query_database(self.notion_database_id, filter=filter_query)
             self.logger.info(f"Found {len(notion_records)} meetings in Notion")
             
+            if metrics:
+                metrics.notion_api_calls += 1
+                metrics.source_total = len(notion_records)
+                metrics.records_read += len(notion_records)
+            
             # Get existing for comparison
             existing_map = {}
             for r in self.supabase.select_all():
                 if r.get('notion_page_id'):
                     existing_map[r['notion_page_id']] = r
+            
+            if metrics:
+                metrics.supabase_api_calls += 1
+                metrics.destination_total = len(existing_map)
             
             # Safety valve
             is_safe, msg = self.check_safety_valve(len(notion_records), len(existing_map), "Notion → Supabase")
@@ -643,7 +653,7 @@ class MeetingsSyncService(TwoWaySyncService):
         except Exception as e:
             return SyncResult(success=False, direction="notion_to_supabase", error_message=str(e))
     
-    def _sync_supabase_to_notion(self, full_sync: bool, since_hours: int) -> SyncResult:
+    def _sync_supabase_to_notion(self, full_sync: bool, since_hours: int, metrics=None) -> SyncResult:
         """
         Override to include content block creation and CRM linking.
         Supabase → Notion with content blocks and People relation
@@ -664,6 +674,9 @@ class MeetingsSyncService(TwoWaySyncService):
                 # Filter out soft-deleted records
                 supabase_records = [r for r in all_records if not r.get('deleted_at')]
             
+            if metrics:
+                metrics.supabase_api_calls += 1
+            
             # Filter to records without notion_page_id (new) or updated locally
             records_to_sync = [
                 r for r in supabase_records 
@@ -674,6 +687,9 @@ class MeetingsSyncService(TwoWaySyncService):
             
             # Safety valve
             notion_records = self.notion.query_database(self.notion_database_id)
+            if metrics:
+                metrics.notion_api_calls += 1
+            
             is_safe, msg = self.check_safety_valve(len(records_to_sync), len(notion_records), "Supabase → Notion")
             if not is_safe:
                 self.logger.warning(msg)
@@ -692,6 +708,8 @@ class MeetingsSyncService(TwoWaySyncService):
                     if notion_page_id:
                         # Update existing page
                         self.notion.update_page(notion_page_id, notion_props)
+                        if metrics:
+                            metrics.notion_api_calls += 1
                         
                         # Note: We don't update content blocks for existing pages to avoid
                         # overwriting AI meeting notes or other manual edits
@@ -705,6 +723,8 @@ class MeetingsSyncService(TwoWaySyncService):
                             notion_props, 
                             children=blocks
                         )
+                        if metrics:
+                            metrics.notion_api_calls += 1
                         
                         # Update Supabase with new Notion ID
                         self.supabase.update(record['id'], {
@@ -729,25 +749,36 @@ class MeetingsSyncService(TwoWaySyncService):
             return SyncResult(success=False, direction="supabase_to_notion", error_message=str(e))
     
     def sync(self, full_sync: bool = False, since_hours: int = 24) -> SyncResult:
-        """Override to use meetings-specific sync logic."""
+        """Override to use meetings-specific sync logic with metrics."""
         import time as time_module
+        from lib.sync_base import SyncMetrics
+        
+        metrics = SyncMetrics()
         start_time = time_module.time()
         
         # Step 0a: Sync Notion deletions → Supabase (soft-delete)
         self.logger.info("Phase 0a: Sync Notion Deletions → Supabase")
+        phase_start = time_module.time()
         notion_deletions = self._sync_notion_deletions()
+        metrics.notion_deletions_duration = time_module.time() - phase_start
         
         # Step 0b: Sync Supabase deletions → Notion (archive)
         self.logger.info("Phase 0b: Sync Supabase Deletions → Notion")
+        phase_start = time_module.time()
         supabase_deletions = self._sync_supabase_deletions()
+        metrics.supabase_deletions_duration = time_module.time() - phase_start
         
         # Step 1: Notion → Supabase
         self.logger.info("Phase 1: Notion → Supabase")
-        result1 = self._sync_notion_to_supabase(full_sync, since_hours)
+        phase_start = time_module.time()
+        result1 = self._sync_notion_to_supabase(full_sync, since_hours, metrics)
+        metrics.notion_to_supabase_duration = time_module.time() - phase_start
         
         # Step 2: Supabase → Notion  
         self.logger.info("Phase 2: Supabase → Notion")
-        result2 = self._sync_supabase_to_notion(full_sync, since_hours)
+        phase_start = time_module.time()
+        result2 = self._sync_supabase_to_notion(full_sync, since_hours, metrics)
+        metrics.supabase_to_notion_duration = time_module.time() - phase_start
         
         # Combine results
         combined_stats = SyncStats(
@@ -758,11 +789,16 @@ class MeetingsSyncService(TwoWaySyncService):
             errors=result1.stats.errors + result2.stats.errors
         )
         
+        # Finalize metrics
+        metrics.finish()
+        metrics.records_written = combined_stats.created + combined_stats.updated + combined_stats.deleted
+        
         elapsed = time_module.time() - start_time
         result = SyncResult(
             success=result1.success and result2.success,
             direction="bidirectional",
             stats=combined_stats,
+            metrics=metrics,
             elapsed_seconds=elapsed
         )
         

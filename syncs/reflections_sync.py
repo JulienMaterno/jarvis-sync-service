@@ -165,7 +165,7 @@ class ReflectionsSyncService(TwoWaySyncService):
                 lookup[r['notion_page_id']] = r
         return lookup
     
-    def _sync_notion_to_supabase(self, full_sync: bool, since_hours: int) -> SyncResult:
+    def _sync_notion_to_supabase(self, full_sync: bool, since_hours: int, metrics=None) -> SyncResult:
         """
         Override to include content extraction.
         Notion → Supabase with content
@@ -189,8 +189,17 @@ class ReflectionsSyncService(TwoWaySyncService):
             
             self.logger.info(f"Found {len(notion_records)} reflections in Notion")
             
+            if metrics:
+                metrics.notion_api_calls += 1
+                metrics.source_total = len(notion_records)
+                metrics.records_read += len(notion_records)
+            
             # Build lookup for existing Supabase records
             supabase_lookup = self._build_supabase_lookup()
+            
+            if metrics:
+                metrics.supabase_api_calls += 1
+                metrics.destination_total = len(supabase_lookup)
             
             for notion_record in notion_records:
                 try:
@@ -251,7 +260,7 @@ class ReflectionsSyncService(TwoWaySyncService):
         except Exception as e:
             return SyncResult(success=False, direction="notion_to_supabase", error_message=str(e))
     
-    def _sync_supabase_to_notion(self, full_sync: bool, since_hours: int) -> SyncResult:
+    def _sync_supabase_to_notion(self, full_sync: bool, since_hours: int, metrics=None) -> SyncResult:
         """
         Override to include content block creation.
         Supabase → Notion with content blocks
@@ -269,6 +278,9 @@ class ReflectionsSyncService(TwoWaySyncService):
                 # Filter out soft-deleted records
                 supabase_records = [r for r in all_records if not r.get('deleted_at')]
             
+            if metrics:
+                metrics.supabase_api_calls += 1
+            
             # Filter to records without notion_page_id (new) or updated locally
             records_to_sync = [
                 r for r in supabase_records 
@@ -279,6 +291,9 @@ class ReflectionsSyncService(TwoWaySyncService):
             
             # Safety valve
             notion_records = self.notion.query_database(self.notion_database_id)
+            if metrics:
+                metrics.notion_api_calls += 1
+            
             is_safe, msg = self.check_safety_valve(len(records_to_sync), len(notion_records), "Supabase → Notion")
             if not is_safe:
                 self.logger.warning(msg)

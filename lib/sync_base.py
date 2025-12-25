@@ -150,11 +150,104 @@ class SyncStats:
 
 
 @dataclass
+class SyncMetrics:
+    """
+    Enhanced observability metrics for sync operations.
+    Tracks performance, rate limits, staleness, and data flow.
+    """
+    # Timing metrics
+    start_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    end_time: Optional[datetime] = None
+    
+    # Phase durations (seconds)
+    notion_deletions_duration: float = 0.0
+    supabase_deletions_duration: float = 0.0
+    notion_to_supabase_duration: float = 0.0
+    supabase_to_notion_duration: float = 0.0
+    
+    # Record counts
+    source_total: int = 0
+    destination_total: int = 0
+    records_read: int = 0
+    records_written: int = 0
+    
+    # API call tracking
+    notion_api_calls: int = 0
+    supabase_api_calls: int = 0
+    rate_limit_events: int = 0
+    retries: int = 0
+    
+    # Staleness tracking
+    newest_source_change: Optional[datetime] = None
+    newest_dest_change: Optional[datetime] = None
+    staleness_seconds: float = 0.0  # How old is newest remote change not in dest
+    
+    # Data integrity
+    orphaned_records: int = 0
+    duplicate_records: int = 0
+    conflict_resolutions: int = 0
+    
+    @property
+    def total_duration_seconds(self) -> float:
+        if self.end_time:
+            return (self.end_time - self.start_time).total_seconds()
+        return (datetime.now(timezone.utc) - self.start_time).total_seconds()
+    
+    @property
+    def records_per_second(self) -> float:
+        duration = self.total_duration_seconds
+        if duration > 0:
+            return self.records_read / duration
+        return 0.0
+    
+    def finish(self):
+        """Mark the sync as complete."""
+        self.end_time = datetime.now(timezone.utc)
+    
+    def to_dict(self) -> Dict:
+        return {
+            'timing': {
+                'total_seconds': round(self.total_duration_seconds, 2),
+                'notion_deletions_seconds': round(self.notion_deletions_duration, 2),
+                'supabase_deletions_seconds': round(self.supabase_deletions_duration, 2),
+                'notion_to_supabase_seconds': round(self.notion_to_supabase_duration, 2),
+                'supabase_to_notion_seconds': round(self.supabase_to_notion_duration, 2),
+            },
+            'counts': {
+                'source_total': self.source_total,
+                'destination_total': self.destination_total,
+                'records_read': self.records_read,
+                'records_written': self.records_written,
+            },
+            'api': {
+                'notion_calls': self.notion_api_calls,
+                'supabase_calls': self.supabase_api_calls,
+                'rate_limit_events': self.rate_limit_events,
+                'retries': self.retries,
+            },
+            'staleness': {
+                'staleness_seconds': round(self.staleness_seconds, 2),
+                'newest_source_change': self.newest_source_change.isoformat() if self.newest_source_change else None,
+                'newest_dest_change': self.newest_dest_change.isoformat() if self.newest_dest_change else None,
+            },
+            'data_quality': {
+                'orphaned_records': self.orphaned_records,
+                'duplicate_records': self.duplicate_records,
+                'conflict_resolutions': self.conflict_resolutions,
+            },
+            'throughput': {
+                'records_per_second': round(self.records_per_second, 2),
+            }
+        }
+
+
+@dataclass
 class SyncResult:
     """Result of a complete sync operation."""
     success: bool
     direction: str
     stats: SyncStats = field(default_factory=SyncStats)
+    metrics: SyncMetrics = field(default_factory=SyncMetrics)
     source_count: int = 0
     destination_count: int = 0
     elapsed_seconds: float = 0.0
@@ -165,6 +258,7 @@ class SyncResult:
             'success': self.success,
             'direction': self.direction,
             'stats': self.stats.to_dict(),
+            'metrics': self.metrics.to_dict(),
             'source_count': self.source_count,
             'destination_count': self.destination_count,
             'elapsed_seconds': round(self.elapsed_seconds, 2),
@@ -829,11 +923,11 @@ class ContentBlockBuilder:
 
 
 # ============================================================================
-# SYNC LOGGING SERVICE
+# SYNC LOGGING SERVICE WITH METRICS
 # ============================================================================
 
 class SyncLogger:
-    """Unified logging to sync_logs table."""
+    """Unified logging to sync_logs table with metrics support."""
     
     def __init__(self, service_name: str):
         self.service_name = service_name
@@ -870,9 +964,31 @@ class SyncLogger:
     
     def log_complete(self, result: SyncResult):
         status = 'success' if result.success else 'error'
-        self.log('complete', status, 
-                 f"Completed: {result.stats.created} created, {result.stats.updated} updated, {result.stats.errors} errors",
-                 result.to_dict())
+        
+        # Build comprehensive metrics summary
+        m = result.metrics
+        metrics_summary = (
+            f"Completed: {result.stats.created}c/{result.stats.updated}u/{result.stats.deleted}d/{result.stats.errors}err "
+            f"| {m.total_duration_seconds:.1f}s | "
+            f"API: {m.notion_api_calls}N/{m.supabase_api_calls}S | "
+            f"Rate limits: {m.rate_limit_events} | Retries: {m.retries}"
+        )
+        
+        if m.staleness_seconds > 0:
+            metrics_summary += f" | Staleness: {m.staleness_seconds:.0f}s"
+        
+        self.log('complete', status, metrics_summary, result.to_dict())
+        
+        # Also log to console for Cloud Run visibility
+        self.logger.info(f"📊 SYNC METRICS: {metrics_summary}")
+    
+    def log_metrics(self, metrics: 'SyncMetrics', phase: str = "sync"):
+        """Log intermediate metrics during sync phases."""
+        msg = (
+            f"{phase}: read={metrics.records_read} written={metrics.records_written} "
+            f"api_calls={metrics.notion_api_calls + metrics.supabase_api_calls}"
+        )
+        self.logger.info(msg)
 
 
 # ============================================================================
@@ -1342,25 +1458,34 @@ class TwoWaySyncService(BaseSyncService):
 
     def sync(self, full_sync: bool = False, since_hours: int = 24) -> SyncResult:
         """
-        Bidirectional sync between Notion and Supabase.
+        Bidirectional sync between Notion and Supabase with comprehensive metrics.
         """
+        metrics = SyncMetrics()
         start_time = time.time()
         
         # Step 0a: Sync Notion deletions → Supabase (soft-delete)
         self.logger.info("Phase 0a: Sync Notion Deletions → Supabase")
+        phase_start = time.time()
         notion_deletions = self._sync_notion_deletions()
+        metrics.notion_deletions_duration = time.time() - phase_start
         
         # Step 0b: Sync Supabase deletions → Notion (archive)
         self.logger.info("Phase 0b: Sync Supabase Deletions → Notion")
+        phase_start = time.time()
         supabase_deletions = self._sync_supabase_deletions()
+        metrics.supabase_deletions_duration = time.time() - phase_start
         
         # Step 1: Notion → Supabase
         self.logger.info("Phase 1: Notion → Supabase")
-        result1 = self._sync_notion_to_supabase(full_sync, since_hours)
+        phase_start = time.time()
+        result1 = self._sync_notion_to_supabase(full_sync, since_hours, metrics)
+        metrics.notion_to_supabase_duration = time.time() - phase_start
         
         # Step 2: Supabase → Notion  
         self.logger.info("Phase 2: Supabase → Notion")
-        result2 = self._sync_supabase_to_notion(full_sync, since_hours)
+        phase_start = time.time()
+        result2 = self._sync_supabase_to_notion(full_sync, since_hours, metrics)
+        metrics.supabase_to_notion_duration = time.time() - phase_start
         
         # Combine results
         combined_stats = SyncStats(
@@ -1371,18 +1496,24 @@ class TwoWaySyncService(BaseSyncService):
             errors=result1.stats.errors + result2.stats.errors
         )
         
+        # Finalize metrics
+        metrics.finish()
+        metrics.records_written = combined_stats.created + combined_stats.updated + combined_stats.deleted
+        
         elapsed = time.time() - start_time
         result = SyncResult(
             success=result1.success and result2.success,
             direction="bidirectional",
             stats=combined_stats,
+            metrics=metrics,
             elapsed_seconds=elapsed
         )
         
         self.sync_logger.log_complete(result)
         return result
-    def _sync_notion_to_supabase(self, full_sync: bool, since_hours: int) -> SyncResult:
-        """Sync from Notion to Supabase."""
+
+    def _sync_notion_to_supabase(self, full_sync: bool, since_hours: int, metrics: Optional[SyncMetrics] = None) -> SyncResult:
+        """Sync from Notion to Supabase with metrics tracking."""
         stats = SyncStats()
         start_time = time.time()
         
@@ -1400,8 +1531,23 @@ class TwoWaySyncService(BaseSyncService):
             notion_records = self.notion.query_database(self.notion_database_id, filter=filter_query)
             self.logger.info(f"Found {len(notion_records)} records in Notion")
             
+            if metrics:
+                metrics.notion_api_calls += 1
+                metrics.source_total = len(notion_records)
+                metrics.records_read += len(notion_records)
+                # Track staleness - find newest change in Notion
+                if notion_records:
+                    newest = max(r.get('last_edited_time', '') for r in notion_records)
+                    try:
+                        metrics.newest_source_change = datetime.fromisoformat(newest.replace('Z', '+00:00'))
+                    except:
+                        pass
+            
             # Get existing for comparison
             existing = {r['notion_page_id']: r for r in self.supabase.select_all() if r.get('notion_page_id')}
+            if metrics:
+                metrics.supabase_api_calls += 1
+                metrics.destination_total = len(existing)
             
             # Safety valve
             is_safe, msg = self.check_safety_valve(len(notion_records), len(existing), "Notion → Supabase")
@@ -1425,6 +1571,8 @@ class TwoWaySyncService(BaseSyncService):
                             stats.skipped += 1
                             continue
                         stats.updated += 1
+                        if metrics:
+                            metrics.conflict_resolutions += 1
                     else:
                         stats.created += 1
                     
@@ -1436,6 +1584,8 @@ class TwoWaySyncService(BaseSyncService):
                     data['updated_at'] = datetime.now(timezone.utc).isoformat()
                     
                     self.supabase.upsert(data, conflict_column='notion_page_id')
+                    if metrics:
+                        metrics.supabase_api_calls += 1
                     
                 except Exception as e:
                     self.logger.error(f"Error syncing from Notion: {e}")
@@ -1451,8 +1601,8 @@ class TwoWaySyncService(BaseSyncService):
         except Exception as e:
             return SyncResult(success=False, direction="notion_to_supabase", error_message=str(e))
     
-    def _sync_supabase_to_notion(self, full_sync: bool, since_hours: int) -> SyncResult:
-        """Sync from Supabase to Notion."""
+    def _sync_supabase_to_notion(self, full_sync: bool, since_hours: int, metrics: Optional[SyncMetrics] = None) -> SyncResult:
+        """Sync from Supabase to Notion with metrics tracking."""
         stats = SyncStats()
         start_time = time.time()
         
@@ -1464,16 +1614,24 @@ class TwoWaySyncService(BaseSyncService):
                 cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
                 supabase_records = self.supabase.select_updated_since(cutoff)
             
+            if metrics:
+                metrics.supabase_api_calls += 1
+            
             # Filter to records without notion_page_id (new) or updated locally
+            # Also filter out soft-deleted records
             records_to_sync = [
                 r for r in supabase_records 
-                if not r.get('notion_page_id') or r.get('last_sync_source') == 'supabase'
+                if (not r.get('notion_page_id') or r.get('last_sync_source') == 'supabase')
+                and not r.get('deleted_at')
             ]
             
             self.logger.info(f"Found {len(records_to_sync)} records to sync to Notion")
             
             # Safety valve
             notion_records = self.notion.query_database(self.notion_database_id)
+            if metrics:
+                metrics.notion_api_calls += 1
+            
             is_safe, msg = self.check_safety_valve(len(records_to_sync), len(notion_records), "Supabase → Notion")
             # For Supabase→Notion we don't abort, just warn
             if not is_safe:
@@ -1487,16 +1645,22 @@ class TwoWaySyncService(BaseSyncService):
                     if notion_page_id:
                         # Update existing
                         self.notion.update_page(notion_page_id, notion_props)
+                        if metrics:
+                            metrics.notion_api_calls += 1
                         stats.updated += 1
                     else:
                         # Create new
                         new_page = self.notion.create_page(self.notion_database_id, notion_props)
+                        if metrics:
+                            metrics.notion_api_calls += 1
                         # Update Supabase with new Notion ID
                         self.supabase.update(record['id'], {
                             'notion_page_id': new_page['id'],
                             'notion_updated_at': new_page.get('last_edited_time'),
                             'last_sync_source': 'notion'
                         })
+                        if metrics:
+                            metrics.supabase_api_calls += 1
                         stats.created += 1
                     
                 except Exception as e:
@@ -1547,6 +1711,7 @@ __all__ = [
     # Data classes
     'SyncDirection',
     'SyncStats',
+    'SyncMetrics',
     'SyncResult',
     
     # Clients

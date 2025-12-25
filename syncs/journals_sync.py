@@ -240,7 +240,7 @@ class JournalsSyncService(TwoWaySyncService):
         
         return blocks
     
-    def _sync_notion_to_supabase(self, full_sync: bool, since_hours: int) -> SyncResult:
+    def _sync_notion_to_supabase(self, full_sync: bool, since_hours: int, metrics=None) -> SyncResult:
         """
         Override to include content extraction and date-based matching.
         Notion → Supabase with content
@@ -262,6 +262,11 @@ class JournalsSyncService(TwoWaySyncService):
             notion_records = self.notion.query_database(self.notion_database_id, filter=filter_query)
             self.logger.info(f"Found {len(notion_records)} journals in Notion")
             
+            if metrics:
+                metrics.notion_api_calls += 1
+                metrics.source_total = len(notion_records)
+                metrics.records_read += len(notion_records)
+            
             # Get existing by both notion_page_id and date
             existing_by_notion_id = {}
             existing_by_date = {}
@@ -270,6 +275,10 @@ class JournalsSyncService(TwoWaySyncService):
                     existing_by_notion_id[r['notion_page_id']] = r
                 if r.get('date'):
                     existing_by_date[r['date']] = r
+            
+            if metrics:
+                metrics.supabase_api_calls += 1
+                metrics.destination_total = len(existing_by_notion_id)
             
             # Safety valve
             is_safe, msg = self.check_safety_valve(len(notion_records), len(existing_by_notion_id), "Notion → Supabase")
@@ -342,7 +351,7 @@ class JournalsSyncService(TwoWaySyncService):
         except Exception as e:
             return SyncResult(success=False, direction="notion_to_supabase", error_message=str(e))
     
-    def _sync_supabase_to_notion(self, full_sync: bool, since_hours: int) -> SyncResult:
+    def _sync_supabase_to_notion(self, full_sync: bool, since_hours: int, metrics=None) -> SyncResult:
         """
         Override to include content block creation.
         Supabase → Notion with structured content blocks
@@ -359,6 +368,9 @@ class JournalsSyncService(TwoWaySyncService):
                 all_records = self.supabase.select_updated_since(cutoff)
                 # Filter out soft-deleted records
                 supabase_records = [r for r in all_records if not r.get('deleted_at')]
+            
+            if metrics:
+                metrics.supabase_api_calls += 1
             
             # Filter to records without notion_page_id (new) or updated locally
             records_to_sync = [
