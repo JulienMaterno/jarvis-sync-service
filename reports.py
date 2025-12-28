@@ -89,7 +89,7 @@ def get_reading_data_for_journal() -> dict:
 async def generate_evening_journal_prompt():
     """
     Enhanced evening journal generation that:
-    1. Collects ALL activities from last 24 hours
+    1. Collects ALL activities from TODAY (user's timezone)
     2. Calls Intelligence Service for AI analysis
     3. Creates/updates journal entry in Supabase
     4. Sends interactive prompt to Telegram
@@ -98,10 +98,21 @@ async def generate_evening_journal_prompt():
     try:
         logger.info("Generating enhanced evening journal prompt...")
         
-        # Use 24-hour window
-        now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(hours=24)
-        today = now.date()
+        # Use TODAY's boundaries in user's timezone (Singapore)
+        # This ensures we only fetch events from the current day, not a rolling 24h window
+        import pytz
+        user_tz = pytz.timezone("Asia/Singapore")
+        now_local = datetime.now(user_tz)
+        today = now_local.date()
+        
+        # Start of today in user's timezone, converted to UTC for DB queries
+        today_start_local = user_tz.localize(datetime.combine(today, datetime.min.time()))
+        today_start_utc = today_start_local.astimezone(timezone.utc)
+        now_utc = datetime.now(timezone.utc)
+        
+        # Use today's start as cutoff (instead of rolling 24h)
+        cutoff = today_start_utc
+        logger.info(f"Fetching activities for today ({today}): {cutoff.isoformat()} to {now_utc.isoformat()}")
         
         # =================================================================
         # 1. COLLECT ALL ACTIVITY DATA
@@ -121,7 +132,7 @@ async def generate_evening_journal_prompt():
             "summary": {}
         }
         
-        # Meetings (last 24h)
+        # Meetings (today)
         meetings_resp = supabase.table("meetings") \
             .select("id, title, summary, contact_name, people_mentioned, topics_discussed, date, created_at") \
             .gte("created_at", cutoff.isoformat()) \
@@ -129,16 +140,16 @@ async def generate_evening_journal_prompt():
             .execute()
         activity_data["meetings"] = meetings_resp.data or []
         
-        # Calendar events (last 24h)
+        # Calendar events (today)
         events_resp = supabase.table("calendar_events") \
             .select("summary, description, attendees, location, start_time, end_time") \
             .gte("start_time", cutoff.isoformat()) \
-            .lte("start_time", now.isoformat()) \
+            .lte("start_time", now_utc.isoformat()) \
             .order("start_time") \
             .execute()
         activity_data["calendar_events"] = events_resp.data or []
         
-        # Emails (last 24h, filtered)
+        # Emails (today, filtered)
         emails_resp = supabase.table("emails") \
             .select("subject, sender, snippet, date, contact_id") \
             .gte("date", cutoff.isoformat()) \
@@ -157,7 +168,7 @@ async def generate_evening_journal_prompt():
                 filtered_emails.append(email)
         activity_data["emails"] = filtered_emails[:20]
         
-        # Completed tasks (last 24h)
+        # Completed tasks (today)
         tasks_completed_resp = supabase.table("tasks") \
             .select("id, title, description, priority, completed_at") \
             .not_.is_("completed_at", "null") \
@@ -165,14 +176,14 @@ async def generate_evening_journal_prompt():
             .execute()
         activity_data["tasks_completed"] = tasks_completed_resp.data or []
         
-        # Created tasks (last 24h)
+        # Created tasks (today)
         tasks_created_resp = supabase.table("tasks") \
             .select("id, title, description, priority, due_date, created_at") \
             .gte("created_at", cutoff.isoformat()) \
             .execute()
         activity_data["tasks_created"] = tasks_created_resp.data or []
         
-        # Reflections (last 24h)
+        # Reflections (today)
         reflections_resp = supabase.table("reflections") \
             .select("id, title, content, tags, created_at") \
             .gte("created_at", cutoff.isoformat()) \
@@ -180,7 +191,7 @@ async def generate_evening_journal_prompt():
             .execute()
         activity_data["reflections"] = reflections_resp.data or []
         
-        # Book highlights (last 24h) - NEW!
+        # Book highlights (today)
         highlights_resp = supabase.table("highlights") \
             .select("id, content, note, book_title, chapter, highlighted_at, is_favorite") \
             .gte("highlighted_at", cutoff.isoformat()) \
@@ -210,7 +221,7 @@ async def generate_evening_journal_prompt():
                 "top_sites": activity_summary.get("top_sites", [])[:5],
             }
         
-        # New contacts (last 24h)
+        # New contacts (today)
         contacts_resp = supabase.table("contacts") \
             .select("id, first_name, last_name, company, job_title, created_at") \
             .gte("created_at", cutoff.isoformat()) \

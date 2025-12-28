@@ -5,3 +5,4 @@ supabase
 httpx
 notion-client
 gunicorn
+pytz
