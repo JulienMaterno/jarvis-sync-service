@@ -101,7 +101,12 @@ class SystemHealthMonitor:
             )
     
     async def check_sync_errors(self) -> ComponentHealth:
-        """Analyze recent sync errors."""
+        """Analyze recent sync errors.
+        
+        Distinguishes between:
+        - Transient errors (recovered on next sync) - HEALTHY
+        - Persistent errors (multiple failures, or no recovery) - DEGRADED/UNHEALTHY
+        """
         try:
             since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
             
@@ -110,27 +115,49 @@ class SystemHealthMonitor:
                 .select("*") \
                 .eq("status", "error") \
                 .gte("created_at", since) \
+                .order("created_at", desc=True) \
                 .execute()
             
             errors = result.data or []
             error_count = len(errors)
             
-            # Categorize errors
+            # Categorize errors by type
             error_types = {}
             for err in errors:
                 event_type = err.get("event_type", "unknown")
                 error_types[event_type] = error_types.get(event_type, 0) + 1
             
+            # Check if errors are transient (recovered on next sync)
+            unrecovered_errors = 0
+            for event_type, count in error_types.items():
+                # Check if there's a success AFTER the error for this sync type
+                success_result = supabase.table("sync_logs") \
+                    .select("created_at") \
+                    .eq("status", "success") \
+                    .ilike("event_type", f"%{event_type.replace('_sync', '')}%") \
+                    .gte("created_at", since) \
+                    .order("created_at", desc=True) \
+                    .limit(1) \
+                    .execute()
+                
+                if not success_result.data:
+                    # No success after error - this is unrecovered
+                    unrecovered_errors += count
+            
             if error_count == 0:
                 status = HealthStatus.HEALTHY
                 message = "No errors in last 24h"
-            elif error_count < 10:
+            elif unrecovered_errors == 0:
+                # All errors recovered - transient issues only
+                status = HealthStatus.HEALTHY
+                message = f"{error_count} transient error(s) - all recovered"
+            elif error_count < 5:
                 status = HealthStatus.DEGRADED
-                message = f"{error_count} errors in last 24h"
-                self.warnings.append(f"Found {error_count} sync errors")
+                message = f"{unrecovered_errors} unrecovered error(s) in last 24h"
+                self.warnings.append(f"Found {unrecovered_errors} sync errors that haven't recovered")
             else:
                 status = HealthStatus.UNHEALTHY
-                message = f"{error_count} errors in last 24h - investigate!"
+                message = f"{error_count} errors ({unrecovered_errors} unrecovered) - investigate!"
                 self.recommendations.append("Review sync_logs table for recurring errors")
             
             return ComponentHealth(
