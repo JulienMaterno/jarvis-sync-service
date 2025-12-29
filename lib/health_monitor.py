@@ -445,16 +445,53 @@ class SystemHealthMonitor:
 
 # Legacy functions for backward compatibility
 async def check_sync_health(service_name: str, failure_threshold: int = 5):
-    """Legacy: Check if a sync service has failed too many times."""
-    monitor = SystemHealthMonitor()
-    if service_name == "calendar_sync":
-        result = await monitor.check_calendar_sync()
-    elif service_name == "gmail_sync":
-        result = await monitor.check_gmail_sync()
-    else:
-        result = await monitor.check_sync_errors()
+    """Check if a specific sync service has had recent errors.
     
-    return {"healthy": result.status == HealthStatus.HEALTHY}
+    Returns healthy=True if:
+    - No errors for this service in the last 24 hours, OR
+    - Last successful sync was more recent than last error
+    """
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        
+        # Check for recent errors for this specific service
+        error_result = supabase.table("sync_logs") \
+            .select("created_at, message") \
+            .eq("status", "error") \
+            .ilike("event_type", f"%{service_name.replace('_sync', '')}%") \
+            .gte("created_at", cutoff) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+        
+        # Check for recent successes for this service
+        success_result = supabase.table("sync_logs") \
+            .select("created_at") \
+            .eq("status", "success") \
+            .ilike("event_type", f"%{service_name.replace('_sync', '')}%") \
+            .gte("created_at", cutoff) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+        
+        has_recent_error = bool(error_result.data)
+        has_recent_success = bool(success_result.data)
+        
+        # Healthy if: no errors, OR last success is more recent than last error
+        if not has_recent_error:
+            return {"healthy": True}
+        
+        if has_recent_success and has_recent_error:
+            last_success = success_result.data[0]["created_at"]
+            last_error = error_result.data[0]["created_at"]
+            return {"healthy": last_success > last_error}
+        
+        # Has error but no recent success
+        return {"healthy": False, "last_error": error_result.data[0].get("message", "Unknown")}
+        
+    except Exception as e:
+        logger.warning(f"Could not check health for {service_name}: {e}")
+        return {"healthy": True}  # Assume healthy if we can't check
 
 
 async def get_sync_statistics(hours: int = 24):
@@ -504,7 +541,10 @@ async def get_sync_statistics(hours: int = 24):
 
 
 async def run_health_check(send_telegram: bool = False) -> SystemHealthReport:
-    """Run health check and optionally send to Telegram."""
+    """Run health check and optionally send to Telegram.
+    
+    When send_telegram=True, also includes "tomorrow's focus" from the latest journal.
+    """
     monitor = SystemHealthMonitor()
     report = await monitor.run_full_health_check()
     
@@ -519,6 +559,31 @@ async def run_health_check(send_telegram: bool = False) -> SystemHealthReport:
     if send_telegram:
         from lib.telegram_client import send_telegram_message
         message = monitor.format_report_markdown(report)
+        
+        # Add tomorrow's focus from latest journal
+        try:
+            from datetime import date, timedelta
+            
+            # Get the most recent journal (yesterday's or today's)
+            yesterday = (date.today() - timedelta(days=1)).isoformat()
+            today = date.today().isoformat()
+            
+            journal_result = supabase.table("journals") \
+                .select("date, tomorrow_focus") \
+                .in_("date", [yesterday, today]) \
+                .order("date", desc=True) \
+                .limit(1) \
+                .execute()
+            
+            if journal_result.data and journal_result.data[0].get("tomorrow_focus"):
+                focus_items = journal_result.data[0]["tomorrow_focus"]
+                if focus_items and len(focus_items) > 0:
+                    message += "\n\n**📋 Today's Focus:**"
+                    for item in focus_items[:5]:  # Max 5 items
+                        message += f"\n• {item}"
+        except Exception as e:
+            logger.warning(f"Could not fetch tomorrow's focus: {e}")
+        
         await send_telegram_message(message, force=True)
     
     return report
