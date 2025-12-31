@@ -34,8 +34,10 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
 # SCOPES - These determine what access you have
-# Full read/write scopes for all services
+# Comprehensive scopes for all Google services Jarvis might use
 SCOPES = [
+    # ========== CORE SERVICES (ALREADY USING) ==========
+    
     # Gmail - full access including send and drafts
     'https://www.googleapis.com/auth/gmail.readonly',
     'https://www.googleapis.com/auth/gmail.send',
@@ -46,12 +48,46 @@ SCOPES = [
     'https://www.googleapis.com/auth/calendar',
     'https://www.googleapis.com/auth/calendar.events',
     
-    # Contacts - for looking up people
+    # Contacts - for CRM integration
+    'https://www.googleapis.com/auth/contacts',       # Full read/write
     'https://www.googleapis.com/auth/contacts.readonly',
     
-    # Google Drive - for audio pipeline
+    # Google Drive - for audio pipeline and file storage
     'https://www.googleapis.com/auth/drive.readonly',
     'https://www.googleapis.com/auth/drive.file',
+    'https://www.googleapis.com/auth/drive',          # Full drive access
+    
+    # ========== LOCATION & MAPS ==========
+    
+    # Location History (Timeline)
+    'https://www.googleapis.com/auth/location.timeline',
+    
+    # ========== HEALTH & FITNESS ==========
+    
+    # Google Fit - health and fitness data
+    'https://www.googleapis.com/auth/fitness.activity.read',
+    'https://www.googleapis.com/auth/fitness.body.read',
+    'https://www.googleapis.com/auth/fitness.sleep.read',
+    'https://www.googleapis.com/auth/fitness.heart_rate.read',
+    'https://www.googleapis.com/auth/fitness.blood_pressure.read',
+    'https://www.googleapis.com/auth/fitness.nutrition.read',
+    'https://www.googleapis.com/auth/fitness.location.read',
+    
+    # ========== PRODUCTIVITY ==========
+    
+    # Google Tasks
+    'https://www.googleapis.com/auth/tasks',
+    
+    # Google Keep (Notes)
+    'https://www.googleapis.com/auth/keep',
+    
+    # ========== MEDIA ==========
+    
+    # Google Photos - for photo/video analysis
+    'https://www.googleapis.com/auth/photoslibrary.readonly',
+    
+    # YouTube - watch history, playlists
+    'https://www.googleapis.com/auth/youtube.readonly',
 ]
 
 def main():
