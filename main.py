@@ -462,6 +462,123 @@ async def create_calendar_event(request: CreateCalendarEventRequest):
         logger.error(f"Failed to create calendar event: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+class UpdateCalendarEventRequest(BaseModel):
+    """Request body for updating a calendar event."""
+    event_id: str
+    summary: Optional[str] = None
+    start_time: Optional[str] = None  # ISO 8601 format
+    end_time: Optional[str] = None    # ISO 8601 format
+    description: Optional[str] = None
+    location: Optional[str] = None
+    attendees: Optional[List[str]] = None
+    timezone: Optional[str] = None
+    send_updates: str = "all"  # 'all', 'externalOnly', or 'none'
+
+
+@app.post("/calendar/update")
+async def update_calendar_event(request: UpdateCalendarEventRequest):
+    """
+    Update an existing Google Calendar event (reschedule).
+    
+    Use cases:
+    - Reschedule your own meeting: Update times and send notifications
+    - Add a reason/note: Update description with "Rescheduled due to..."
+    - Change location or attendees
+    
+    Args:
+        event_id: Google Calendar event ID
+        summary: Updated title (optional)
+        start_time: New start time in ISO 8601 format (optional)
+        end_time: New end time (optional)
+        description: Updated description - use this to add reschedule reason (optional)
+        location: Updated location (optional)
+        attendees: Updated attendee list (optional)
+        send_updates: 'all' (notify everyone), 'externalOnly', or 'none'
+    """
+    try:
+        from datetime import datetime
+        
+        # Parse datetime strings if provided
+        start_dt = None
+        end_dt = None
+        if request.start_time:
+            start_dt = datetime.fromisoformat(request.start_time.replace('Z', '+00:00'))
+        if request.end_time:
+            end_dt = datetime.fromisoformat(request.end_time.replace('Z', '+00:00'))
+        
+        logger.info(f"Updating calendar event: {request.event_id}")
+        
+        calendar_client = GoogleCalendarClient()
+        event = await calendar_client.update_event(
+            event_id=request.event_id,
+            summary=request.summary,
+            start_time=start_dt,
+            end_time=end_dt,
+            description=request.description,
+            location=request.location,
+            attendees=request.attendees,
+            timezone_str=request.timezone,
+            send_updates=request.send_updates
+        )
+        
+        logger.info(f"Updated calendar event: {event.get('id')}")
+        
+        return {
+            "status": "success",
+            "event_id": event.get("id"),
+            "html_link": event.get("htmlLink"),
+            "summary": event.get("summary"),
+            "start": event.get("start"),
+            "end": event.get("end"),
+            "updated": event.get("updated")
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to update calendar event: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class DeclineCalendarEventRequest(BaseModel):
+    """Request body for declining a calendar invitation."""
+    event_id: str
+    comment: Optional[str] = None  # Message to send with the decline
+
+
+@app.post("/calendar/decline")
+async def decline_calendar_event(request: DeclineCalendarEventRequest):
+    """
+    Decline a calendar invitation.
+    
+    Use case: Someone invited you to a meeting, you want to decline and optionally
+    suggest an alternative time via the comment.
+    
+    Args:
+        event_id: Google Calendar event ID
+        comment: Optional message (e.g., "Can we do 3pm instead?")
+    """
+    try:
+        logger.info(f"Declining calendar event: {request.event_id}")
+        
+        calendar_client = GoogleCalendarClient()
+        event = await calendar_client.decline_event(
+            event_id=request.event_id,
+            comment=request.comment
+        )
+        
+        logger.info(f"Declined calendar event: {event.get('id')}")
+        
+        return {
+            "status": "success",
+            "event_id": event.get("id"),
+            "summary": event.get("summary"),
+            "response_status": "declined"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to decline calendar event: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # --- Gmail Sync ---
 
 @app.post("/sync/gmail")

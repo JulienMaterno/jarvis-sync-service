@@ -184,3 +184,160 @@ class GoogleCalendarClient:
             
             response.raise_for_status()
             return response.json()
+
+    @retry_on_error()
+    async def update_event(self,
+                          event_id: str,
+                          calendar_id: str = 'primary',
+                          summary: Optional[str] = None,
+                          start_time: Optional[datetime] = None,
+                          end_time: Optional[datetime] = None,
+                          description: Optional[str] = None,
+                          location: Optional[str] = None,
+                          attendees: Optional[List[str]] = None,
+                          timezone_str: Optional[str] = None,
+                          send_updates: str = "all") -> Dict[str, Any]:
+        """
+        Update an existing calendar event.
+        
+        Args:
+            event_id: The Google Calendar event ID
+            send_updates: 'all' (notify all), 'externalOnly' (external only), 'none' (no notifications)
+        """
+        await self._ensure_token()
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        # First, get the existing event
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            get_response = await client.get(
+                f"{GOOGLE_CALENDAR_API_BASE}/calendars/{calendar_id}/events/{event_id}",
+                headers=headers
+            )
+            
+            if get_response.status_code == 401:
+                self.access_token = await get_access_token()
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                get_response = await client.get(
+                    f"{GOOGLE_CALENDAR_API_BASE}/calendars/{calendar_id}/events/{event_id}",
+                    headers=headers
+                )
+            
+            get_response.raise_for_status()
+            event_body = get_response.json()
+        
+        # Update only provided fields
+        if summary is not None:
+            event_body["summary"] = summary
+            
+        if start_time is not None:
+            event_body["start"] = {
+                "dateTime": format_rfc3339(start_time),
+                "timeZone": timezone_str or event_body.get("start", {}).get("timeZone", "UTC")
+            }
+            
+        if end_time is not None:
+            event_body["end"] = {
+                "dateTime": format_rfc3339(end_time),
+                "timeZone": timezone_str or event_body.get("end", {}).get("timeZone", "UTC")
+            }
+            
+        if description is not None:
+            event_body["description"] = description
+            
+        if location is not None:
+            event_body["location"] = location
+            
+        if attendees is not None:
+            event_body["attendees"] = [{"email": email} for email in attendees]
+        
+        # Update the event
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.put(
+                f"{GOOGLE_CALENDAR_API_BASE}/calendars/{calendar_id}/events/{event_id}",
+                headers=headers,
+                json=event_body,
+                params={"sendUpdates": send_updates}
+            )
+            
+            if response.status_code == 401:
+                self.access_token = await get_access_token()
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                response = await client.put(
+                    f"{GOOGLE_CALENDAR_API_BASE}/calendars/{calendar_id}/events/{event_id}",
+                    headers=headers,
+                    json=event_body,
+                    params={"sendUpdates": send_updates}
+                )
+            
+            response.raise_for_status()
+            return response.json()
+
+    @retry_on_error()
+    async def decline_event(self,
+                           event_id: str,
+                           calendar_id: str = 'primary',
+                           comment: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Decline a calendar invitation.
+        
+        Args:
+            event_id: The Google Calendar event ID
+            comment: Optional message to include with the decline
+        """
+        await self._ensure_token()
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        # Get the event first
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            get_response = await client.get(
+                f"{GOOGLE_CALENDAR_API_BASE}/calendars/{calendar_id}/events/{event_id}",
+                headers=headers
+            )
+            
+            if get_response.status_code == 401:
+                self.access_token = await get_access_token()
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                get_response = await client.get(
+                    f"{GOOGLE_CALENDAR_API_BASE}/calendars/{calendar_id}/events/{event_id}",
+                    headers=headers
+                )
+            
+            get_response.raise_for_status()
+            event_body = get_response.json()
+        
+        # Find yourself in the attendees and set response to "declined"
+        if "attendees" in event_body:
+            # You're usually the calendar owner
+            for attendee in event_body["attendees"]:
+                if attendee.get("self", False):
+                    attendee["responseStatus"] = "declined"
+                    if comment:
+                        attendee["comment"] = comment
+        
+        # Update the event
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.put(
+                f"{GOOGLE_CALENDAR_API_BASE}/calendars/{calendar_id}/events/{event_id}",
+                headers=headers,
+                json=event_body,
+                params={"sendUpdates": "all"}  # Notify organizer
+            )
+            
+            if response.status_code == 401:
+                self.access_token = await get_access_token()
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                response = await client.put(
+                    f"{GOOGLE_CALENDAR_API_BASE}/calendars/{calendar_id}/events/{event_id}",
+                    headers=headers,
+                    json=event_body,
+                    params={"sendUpdates": "all"}
+                )
+            
+            response.raise_for_status()
+            return response.json()
