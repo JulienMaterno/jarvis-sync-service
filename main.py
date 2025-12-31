@@ -594,6 +594,64 @@ async def sync_gmail():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/gmail/search")
+async def search_gmail_live(q: str, max_results: int = 10):
+    """
+    Search Gmail in real-time using Gmail's search syntax.
+    
+    Args:
+        q: Gmail search query (e.g., 'from:john subject:meeting after:2025/01/01')
+        max_results: Maximum number of emails to return
+        
+    Returns:
+        List of matching emails with full details
+    """
+    try:
+        logger.info(f"Live Gmail search: {q}")
+        gmail_client = GmailClient()
+        
+        # Search for messages
+        messages = await gmail_client.search_messages(query=q, max_results=max_results)
+        
+        # Fetch full details for each message
+        detailed_emails = []
+        for msg_meta in messages:
+            try:
+                msg = await gmail_client.get_message(msg_meta["id"], format="full")
+                payload = msg.get("payload", {})
+                
+                body_content = gmail_client.parse_message_body(payload) or {}
+                subject = gmail_client.get_header(payload, "Subject")
+                sender = gmail_client.get_header(payload, "From")
+                recipient = gmail_client.get_header(payload, "To")
+                date_str = gmail_client.get_header(payload, "Date")
+                
+                detailed_emails.append({
+                    "id": msg["id"],
+                    "thread_id": msg.get("threadId"),
+                    "subject": subject or "(no subject)",
+                    "from": sender or "Unknown",
+                    "to": recipient or "Unknown",
+                    "date": date_str,
+                    "snippet": msg.get("snippet", ""),
+                    "body": body_content.get("text", msg.get("snippet", "")),
+                    "labels": msg.get("labelIds", [])
+                })
+            except Exception as e:
+                logger.warning(f"Failed to fetch message {msg_meta['id']}: {e}")
+                continue
+        
+        return {
+            "emails": detailed_emails,
+            "count": len(detailed_emails),
+            "query": q
+        }
+        
+    except Exception as e:
+        logger.error(f"Gmail search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # --- Gmail Send ---
 from lib.google_gmail import GmailClient
 

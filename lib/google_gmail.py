@@ -115,6 +115,20 @@ class GmailClient:
         response.raise_for_status()
         return response.json()
 
+    async def search_messages(self, query: str, max_results: int = 10) -> List[Dict[str, Any]]:
+        """
+        Search for messages using Gmail's search syntax.
+        This is an alias for list_messages with a query.
+        
+        Args:
+            query: Gmail search query (e.g., 'from:john subject:meeting')
+            max_results: Maximum messages to return
+            
+        Returns:
+            List of message objects with id and threadId
+        """
+        return await self.list_messages(query=query, max_results=max_results)
+
     @retry_on_error()
     async def get_profile(self) -> Dict[str, Any]:
         """
