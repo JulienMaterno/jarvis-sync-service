@@ -223,3 +223,96 @@ class GmailClient:
             if h["name"].lower() == name.lower():
                 return h["value"]
         return ""
+
+    @retry_on_error()
+    async def send_email(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        cc: Optional[str] = None,
+        bcc: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        is_html: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Send an email via Gmail API.
+        
+        Args:
+            to: Recipient email address (can be comma-separated for multiple)
+            subject: Email subject line
+            body: Email body (plain text or HTML)
+            cc: CC recipients (optional, comma-separated)
+            bcc: BCC recipients (optional, comma-separated)
+            reply_to_message_id: If replying to an email, the original message ID
+            is_html: If True, body is treated as HTML
+            
+        Returns:
+            Dict with id, threadId, labelIds of sent message
+        """
+        import email
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+        
+        await self._ensure_token()
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        
+        # Build the email message
+        if is_html:
+            msg = MIMEMultipart('alternative')
+            msg.attach(MIMEText(body, 'html'))
+        else:
+            msg = MIMEText(body)
+        
+        msg['To'] = to
+        msg['Subject'] = subject
+        
+        if cc:
+            msg['Cc'] = cc
+        if bcc:
+            msg['Bcc'] = bcc
+        
+        # If this is a reply, add threading headers
+        thread_id = None
+        if reply_to_message_id:
+            # Get the original message to get its headers
+            original = await self.get_message(reply_to_message_id, format='metadata')
+            original_subject = self.get_header(original.get('payload', {}), 'Subject')
+            message_id_header = self.get_header(original.get('payload', {}), 'Message-ID')
+            
+            if message_id_header:
+                msg['In-Reply-To'] = message_id_header
+                msg['References'] = message_id_header
+            
+            thread_id = original.get('threadId')
+            
+            # Prepend Re: if not already there
+            if original_subject and not subject.lower().startswith('re:'):
+                msg.replace_header('Subject', f"Re: {original_subject}")
+        
+        # Encode to base64url
+        raw_message = base64.urlsafe_b64encode(msg.as_bytes()).decode('utf-8')
+        
+        # Build request body
+        request_body = {"raw": raw_message}
+        if thread_id:
+            request_body["threadId"] = thread_id
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{GOOGLE_GMAIL_API_BASE}/messages/send",
+                headers=headers,
+                json=request_body
+            )
+            
+            if response.status_code == 401:
+                self.access_token = await get_access_token()
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                response = await client.post(
+                    f"{GOOGLE_GMAIL_API_BASE}/messages/send",
+                    headers=headers,
+                    json=request_body
+                )
+            
+            response.raise_for_status()
+            return response.json()

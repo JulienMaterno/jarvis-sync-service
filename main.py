@@ -477,6 +477,65 @@ async def sync_gmail():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# --- Gmail Send ---
+from lib.google_gmail import GmailClient
+
+class SendEmailRequest(BaseModel):
+    """Request body for sending an email."""
+    to: str  # Recipient email (can be comma-separated for multiple)
+    subject: str
+    body: str
+    cc: Optional[str] = None
+    bcc: Optional[str] = None
+    reply_to_message_id: Optional[str] = None  # For replying to existing thread
+    is_html: bool = False  # If True, body is treated as HTML
+
+
+@app.post("/gmail/send")
+async def send_email(request: SendEmailRequest):
+    """
+    Send an email via Gmail API.
+    
+    Args:
+        to: Recipient email address (comma-separated for multiple)
+        subject: Email subject line
+        body: Email body (plain text or HTML)
+        cc: Optional CC recipients
+        bcc: Optional BCC recipients
+        reply_to_message_id: If replying to an email thread
+        is_html: If True, body is HTML formatted
+        
+    Returns:
+        Sent message details including ID and thread ID
+    """
+    try:
+        logger.info(f"Sending email to: {request.to}, subject: {request.subject[:50]}...")
+        
+        gmail_client = GmailClient()
+        result = await gmail_client.send_email(
+            to=request.to,
+            subject=request.subject,
+            body=request.body,
+            cc=request.cc,
+            bcc=request.bcc,
+            reply_to_message_id=request.reply_to_message_id,
+            is_html=request.is_html
+        )
+        
+        logger.info(f"Email sent successfully: {result.get('id')}")
+        
+        return {
+            "status": "success",
+            "message_id": result.get("id"),
+            "thread_id": result.get("threadId"),
+            "label_ids": result.get("labelIds", [])
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to send email: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # --- Books Sync ---
 
 @app.post("/sync/books")
