@@ -33,6 +33,9 @@ from sync_highlights import run_sync as run_highlights_sync
 # Import ActivityWatch sync
 from sync_activitywatch import run_activitywatch_sync, ActivityWatchSync, format_activity_summary_for_journal
 
+# Import Beeper sync
+from sync_beeper import run_beeper_sync, run_beeper_relink
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1076,6 +1079,675 @@ async def get_today_activity_summary():
         }
     except Exception as e:
         logger.error(f"Failed to get activity summary: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# BEEPER MESSAGING INTEGRATION
+# ============================================================================
+# NOTE: Beeper sync requires the beeper-bridge service running locally with
+# Tailscale access. The BEEPER_BRIDGE_URL environment variable must be set.
+
+from sync_beeper import BeeperSyncService, run_beeper_sync
+from lib.supabase_client import supabase
+import httpx
+import os
+
+BEEPER_BRIDGE_URL = os.getenv("BEEPER_BRIDGE_URL", "http://localhost:8377")
+
+
+@app.post("/sync/beeper")
+async def sync_beeper(full: bool = False):
+    """
+    Sync Beeper messages from the bridge to Supabase.
+    
+    This syncs chats and messages from WhatsApp, Telegram, LinkedIn, etc.
+    Requires the beeper-bridge service to be running and accessible.
+    
+    Args:
+        full: If True, resync all messages (up to 30 days). 
+              If False, only sync since last sync time per chat.
+    
+    Returns:
+        Sync statistics including chats synced, new messages, contacts linked.
+    """
+    try:
+        logger.info(f"Starting Beeper sync via API (full={full})")
+        result = await run_beeper_sync(supabase, full_sync=full)
+        return {"status": "success", **result}
+    except Exception as e:
+        logger.error(f"Beeper sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/beeper/relink")
+async def relink_beeper_chats():
+    """
+    Re-process all unlinked Beeper chats to try contact linking again.
+    
+    Use this after:
+    - Adding new contacts to the database
+    - Improving the matching algorithm
+    - Fixing contact data (phone numbers, names)
+    
+    This uses improved fuzzy matching that:
+    - Checks both chat_name AND remote_user_name
+    - Looks for cross-platform matches (same person on WhatsApp + LinkedIn)
+    - Uses more aggressive name matching
+    
+    Returns:
+        Statistics on newly linked chats
+    """
+    try:
+        logger.info("Starting Beeper relink of unlinked chats")
+        result = await run_beeper_relink(supabase)
+        return {"status": "success", **result}
+    except Exception as e:
+        logger.error(f"Beeper relink failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/beeper/status")
+async def beeper_status():
+    """
+    Check Beeper bridge connectivity and account status.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{BEEPER_BRIDGE_URL}/health")
+            if response.status_code != 200:
+                return {
+                    "status": "error",
+                    "bridge_reachable": True,
+                    "error": f"Bridge returned status {response.status_code}"
+                }
+            
+            health = response.json()
+            
+            # Get accounts
+            accounts_resp = await client.get(f"{BEEPER_BRIDGE_URL}/accounts")
+            accounts = accounts_resp.json() if accounts_resp.status_code == 200 else []
+            
+            return {
+                "status": "healthy",
+                "bridge_url": BEEPER_BRIDGE_URL,
+                "beeper_connected": health.get("beeper_connected", False),
+                "accounts": len(accounts),
+                "account_details": [
+                    {"id": a.get("id") or a.get("accountID"), "platform": a.get("platform") or a.get("network")}
+                    for a in accounts
+                ]
+            }
+    except httpx.ConnectError:
+        return {
+            "status": "error",
+            "bridge_reachable": False,
+            "error": f"Cannot connect to bridge at {BEEPER_BRIDGE_URL}",
+            "hint": "Ensure beeper-bridge is running and Tailscale is connected"
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.get("/beeper/chats")
+async def list_beeper_chats(
+    platform: Optional[str] = None,
+    unread_only: bool = False,
+    unlinked_only: bool = False,
+    limit: int = 50
+):
+    """
+    List synced Beeper chats from the database.
+    
+    Args:
+        platform: Filter by platform (whatsapp, telegram, linkedin, etc.)
+        unread_only: Only return chats with unread messages
+        unlinked_only: Only return chats not linked to a contact
+        limit: Maximum number of chats to return
+    
+    Returns:
+        List of chats with contact info where linked
+    """
+    try:
+        query = supabase.table("beeper_chats").select(
+            "*, contacts(id, first_name, last_name, company)"
+        ).order("last_message_at", desc=True).limit(limit)
+        
+        if platform:
+            query = query.eq("platform", platform)
+        if unread_only:
+            query = query.gt("unread_count", 0)
+        if unlinked_only:
+            query = query.is_("contact_id", "null")
+        
+        result = query.execute()
+        
+        # Transform for cleaner output
+        chats = []
+        for chat in result.data or []:
+            contact = chat.pop("contacts", None)
+            chat["contact"] = {
+                "id": contact["id"],
+                "name": f"{contact.get('first_name', '')} {contact.get('last_name', '')}".strip(),
+                "company": contact.get("company")
+            } if contact else None
+            chats.append(chat)
+        
+        return {"chats": chats, "count": len(chats)}
+    except Exception as e:
+        logger.error(f"Failed to list Beeper chats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/beeper/chats/{beeper_chat_id}/messages")
+async def get_chat_messages(
+    beeper_chat_id: str,
+    limit: int = 50,
+    before: Optional[str] = None  # ISO timestamp for pagination
+):
+    """
+    Get messages for a specific chat from the database.
+    
+    Args:
+        beeper_chat_id: The Beeper chat ID
+        limit: Maximum number of messages to return
+        before: Only return messages before this timestamp (for pagination)
+    
+    Returns:
+        List of messages, newest first
+    """
+    try:
+        import urllib.parse
+        decoded_id = urllib.parse.unquote(beeper_chat_id)
+        
+        query = supabase.table("beeper_messages").select("*").eq(
+            "beeper_chat_id", decoded_id
+        ).order("timestamp", desc=True).limit(limit)
+        
+        if before:
+            query = query.lt("timestamp", before)
+        
+        result = query.execute()
+        
+        return {"messages": result.data or [], "count": len(result.data or [])}
+    except Exception as e:
+        logger.error(f"Failed to get messages for chat {beeper_chat_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/beeper/messages/search")
+async def search_beeper_messages(
+    q: str,
+    platform: Optional[str] = None,
+    contact_id: Optional[str] = None,
+    limit: int = 50
+):
+    """
+    Full-text search across synced Beeper messages.
+    
+    Args:
+        q: Search query
+        platform: Filter by platform (optional)
+        contact_id: Filter by linked contact (optional)
+        limit: Maximum results to return
+    
+    Returns:
+        Matching messages with chat context
+    """
+    try:
+        # Use Postgres full-text search
+        query = supabase.table("beeper_messages").select(
+            "*, beeper_chats(chat_name, platform, contact_id, contacts(first_name, last_name))"
+        ).text_search("content", q, type_="websearch").order(
+            "timestamp", desc=True
+        ).limit(limit)
+        
+        if platform:
+            query = query.eq("platform", platform)
+        if contact_id:
+            query = query.eq("contact_id", contact_id)
+        
+        result = query.execute()
+        
+        return {"messages": result.data or [], "count": len(result.data or []), "query": q}
+    except Exception as e:
+        logger.error(f"Failed to search Beeper messages: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/beeper/messages/unread")
+async def get_unread_messages(limit: int = 100):
+    """
+    Get all unread messages across all platforms.
+    
+    Returns:
+        Messages grouped by chat with contact info
+    """
+    try:
+        # Get chats with unread messages
+        chats_result = supabase.table("beeper_chats").select(
+            "beeper_chat_id, chat_name, platform, unread_count, contact_id, contacts(first_name, last_name, company)"
+        ).gt("unread_count", 0).order("last_message_at", desc=True).execute()
+        
+        unread_chats = []
+        for chat in chats_result.data or []:
+            # Get recent unread messages for this chat
+            msgs_result = supabase.table("beeper_messages").select("*").eq(
+                "beeper_chat_id", chat["beeper_chat_id"]
+            ).eq("is_read", False).eq("is_outgoing", False).order(
+                "timestamp", desc=True
+            ).limit(5).execute()
+            
+            contact = chat.pop("contacts", None)
+            unread_chats.append({
+                **chat,
+                "contact": {
+                    "id": chat["contact_id"],
+                    "name": f"{contact.get('first_name', '')} {contact.get('last_name', '')}".strip() if contact else None,
+                    "company": contact.get("company") if contact else None
+                } if contact else None,
+                "recent_messages": msgs_result.data or []
+            })
+        
+        total_unread = sum(c.get("unread_count", 0) for c in unread_chats)
+        
+        return {
+            "total_unread": total_unread,
+            "chats_with_unread": len(unread_chats),
+            "chats": unread_chats
+        }
+    except Exception as e:
+        logger.error(f"Failed to get unread messages: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class LinkChatToContactRequest(BaseModel):
+    """Request to link a Beeper chat to a contact."""
+    contact_id: str
+
+
+@app.patch("/beeper/chats/{beeper_chat_id}/link-contact")
+async def link_chat_to_contact(beeper_chat_id: str, request: LinkChatToContactRequest):
+    """
+    Manually link a Beeper chat to a contact.
+    
+    Use this when automatic matching failed or was incorrect.
+    """
+    try:
+        import urllib.parse
+        decoded_id = urllib.parse.unquote(beeper_chat_id)
+        
+        result = supabase.table("beeper_chats").update({
+            "contact_id": request.contact_id,
+            "contact_link_method": "manual",
+            "contact_link_confidence": 1.0,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }).eq("beeper_chat_id", decoded_id).execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        
+        # Also update all messages in this chat
+        supabase.table("beeper_messages").update({
+            "contact_id": request.contact_id
+        }).eq("beeper_chat_id", decoded_id).execute()
+        
+        return {"status": "linked", "chat_id": decoded_id, "contact_id": request.contact_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to link chat to contact: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/beeper/chats/{beeper_chat_id}/link-contact")
+async def unlink_chat_from_contact(beeper_chat_id: str):
+    """
+    Remove the contact link from a Beeper chat.
+    
+    Use this when automatic matching was incorrect.
+    The chat will become available for manual re-linking.
+    """
+    try:
+        import urllib.parse
+        decoded_id = urllib.parse.unquote(beeper_chat_id)
+        
+        result = supabase.table("beeper_chats").update({
+            "contact_id": None,
+            "contact_link_method": None,
+            "contact_link_confidence": None,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }).eq("beeper_chat_id", decoded_id).execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        
+        # Also remove from messages
+        supabase.table("beeper_messages").update({
+            "contact_id": None
+        }).eq("beeper_chat_id", decoded_id).execute()
+        
+        return {"status": "unlinked", "chat_id": decoded_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to unlink chat from contact: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class SendMessageRequest(BaseModel):
+    """Request to send a message via Beeper."""
+    content: str
+    reply_to_event_id: Optional[str] = None
+
+
+@app.post("/beeper/chats/{beeper_chat_id}/send")
+async def send_beeper_message(beeper_chat_id: str, request: SendMessageRequest):
+    """
+    Send a message via Beeper bridge.
+    
+    ⚠️ IMPORTANT: This endpoint should only be called AFTER explicit user confirmation.
+    The Intelligence Service should present the message to the user and get approval
+    before calling this endpoint.
+    
+    Args:
+        beeper_chat_id: The chat to send to (URL encoded)
+        content: Message text to send
+        reply_to_event_id: Optional event ID to reply to
+    
+    Returns:
+        Sent message details
+    """
+    try:
+        import urllib.parse
+        decoded_id = urllib.parse.unquote(beeper_chat_id)
+        
+        logger.info(f"Sending Beeper message to chat {decoded_id}")
+        
+        # Get chat info for context
+        chat_result = supabase.table("beeper_chats").select("platform, chat_name").eq(
+            "beeper_chat_id", decoded_id
+        ).execute()
+        
+        if not chat_result.data:
+            raise HTTPException(status_code=404, detail="Chat not found in database")
+        
+        chat_info = chat_result.data[0]
+        
+        # Send via bridge
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{BEEPER_BRIDGE_URL}/chats/{urllib.parse.quote(decoded_id, safe='')}/send",
+                json={
+                    "content": request.content,
+                    "reply_to_event_id": request.reply_to_event_id
+                }
+            )
+            
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Bridge error: {response.text}"
+                )
+            
+            result = response.json()
+        
+        return {
+            "status": "sent",
+            "platform": chat_info.get("platform"),
+            "chat_name": chat_info.get("chat_name"),
+            "message_preview": request.content[:100] + ("..." if len(request.content) > 100 else ""),
+            "beeper_event_id": result.get("event_id")
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to send Beeper message: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Beeper Archive/Unarchive (Inbox-Zero Workflow) ---
+
+@app.post("/beeper/chats/{beeper_chat_id}/archive")
+async def archive_beeper_chat(beeper_chat_id: str):
+    """
+    Archive a Beeper chat (marks it as "answered" in inbox-zero workflow).
+    
+    In the inbox-zero model:
+    - Archived = you've handled this conversation
+    - Unarchived = might still need attention
+    - needs_response is set to FALSE when archived
+    
+    This also triggers archive on the Beeper bridge if available.
+    """
+    try:
+        import urllib.parse
+        decoded_id = urllib.parse.unquote(beeper_chat_id)
+        
+        # Update in database
+        result = supabase.table("beeper_chats").update({
+            "is_archived": True,
+            "needs_response": False,  # Archived = handled
+            "archived_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }).eq("beeper_chat_id", decoded_id).execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        
+        # Try to archive on Beeper side too (best effort)
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(
+                    f"{BEEPER_BRIDGE_URL}/chats/{urllib.parse.quote(decoded_id, safe='')}/archive"
+                )
+        except Exception as e:
+            logger.warning(f"Could not archive on Beeper side: {e}")
+        
+        chat = result.data[0]
+        return {
+            "status": "archived",
+            "chat_id": decoded_id,
+            "chat_name": chat.get("chat_name"),
+            "platform": chat.get("platform"),
+            "message": f"Chat archived. It's now considered 'handled' in your inbox."
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to archive chat: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/beeper/chats/{beeper_chat_id}/unarchive")
+async def unarchive_beeper_chat(beeper_chat_id: str):
+    """
+    Unarchive a Beeper chat (brings it back to active inbox).
+    
+    This recalculates needs_response based on the last message.
+    """
+    try:
+        import urllib.parse
+        decoded_id = urllib.parse.unquote(beeper_chat_id)
+        
+        # Get current chat data to recalculate needs_response
+        existing = supabase.table("beeper_chats").select("*").eq(
+            "beeper_chat_id", decoded_id
+        ).execute()
+        
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        
+        chat = existing.data[0]
+        
+        # Recalculate needs_response: TRUE if DM and last message was incoming
+        is_dm = chat.get("chat_type") == "dm"
+        last_was_incoming = not chat.get("last_message_is_outgoing", True)
+        needs_response = is_dm and last_was_incoming
+        
+        # Update in database
+        result = supabase.table("beeper_chats").update({
+            "is_archived": False,
+            "needs_response": needs_response,
+            "archived_at": None,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }).eq("beeper_chat_id", decoded_id).execute()
+        
+        return {
+            "status": "unarchived",
+            "chat_id": decoded_id,
+            "chat_name": chat.get("chat_name"),
+            "platform": chat.get("platform"),
+            "needs_response": needs_response,
+            "message": f"Chat unarchived. needs_response={needs_response}"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to unarchive chat: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/beeper/inbox")
+async def get_beeper_inbox(
+    include_groups: bool = False,
+    limit: int = 50
+):
+    """
+    Get the Beeper inbox (chats that need attention).
+    
+    This is the main view for inbox-zero workflow:
+    - Only DMs by default (groups are usually less urgent)
+    - Only non-archived chats
+    - Sorted by: needs_response first, then by last_message_at
+    - Filters out Slack and Matrix (ignored platforms)
+    
+    Args:
+        include_groups: If True, also include group chats (separately)
+        limit: Max chats to return
+    
+    Returns:
+        Inbox with needs_response chats highlighted
+    """
+    try:
+        # Platforms to ignore (high noise, no personal value)
+        ignored_platforms = ["slack", "hungryserv", "matrix"]
+        
+        # Get DMs that need response
+        needs_response_query = supabase.table("beeper_chats").select(
+            "*, contacts(id, first_name, last_name, company)"
+        ).eq("chat_type", "dm").eq("is_archived", False).eq(
+            "needs_response", True
+        ).not_.in_("platform", ignored_platforms).order(
+            "last_message_at", desc=True
+        ).limit(limit)
+        
+        needs_response_result = needs_response_query.execute()
+        
+        # Get other active DMs
+        other_dms_query = supabase.table("beeper_chats").select(
+            "*, contacts(id, first_name, last_name, company)"
+        ).eq("chat_type", "dm").eq("is_archived", False).eq(
+            "needs_response", False
+        ).not_.in_("platform", ignored_platforms).order(
+            "last_message_at", desc=True
+        ).limit(limit)
+        
+        other_dms_result = other_dms_query.execute()
+        
+        def format_chat(chat):
+            contact = chat.pop("contacts", None)
+            return {
+                **chat,
+                "contact": {
+                    "id": contact["id"],
+                    "name": f"{contact.get('first_name', '')} {contact.get('last_name', '')}".strip(),
+                    "company": contact.get("company")
+                } if contact else None
+            }
+        
+        inbox = {
+            "needs_response": [format_chat(c) for c in (needs_response_result.data or [])],
+            "needs_response_count": len(needs_response_result.data or []),
+            "other_active": [format_chat(c) for c in (other_dms_result.data or [])],
+            "other_active_count": len(other_dms_result.data or []),
+        }
+        
+        # Optionally include groups
+        if include_groups:
+            groups_query = supabase.table("beeper_chats").select("*").in_(
+                "chat_type", ["group", "channel"]
+            ).eq("is_archived", False).order("last_message_at", desc=True).limit(20)
+            
+            groups_result = groups_query.execute()
+            inbox["groups"] = groups_result.data or []
+            inbox["groups_count"] = len(groups_result.data or [])
+        
+        return inbox
+    except Exception as e:
+        logger.error(f"Failed to get Beeper inbox: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/beeper/chats/groups")
+async def list_beeper_groups(limit: int = 30):
+    """
+    List group chats (lower priority, for reference).
+    
+    Groups are generally less urgent than DMs in the inbox-zero model.
+    Filters out Slack and Matrix (ignored platforms).
+    """
+    try:
+        ignored_platforms = ["slack", "hungryserv", "matrix"]
+        
+        result = supabase.table("beeper_chats").select("*").in_(
+            "chat_type", ["group", "channel"]
+        ).eq("is_archived", False).not_.in_(
+            "platform", ignored_platforms
+        ).order("last_message_at", desc=True).limit(limit).execute()
+        
+        return {
+            "groups": result.data or [],
+            "count": len(result.data or []),
+            "note": "Group chats are lower priority in inbox-zero workflow"
+        }
+    except Exception as e:
+        logger.error(f"Failed to list groups: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/beeper/chats/{beeper_chat_id}/mark-read")
+async def mark_chat_read(beeper_chat_id: str):
+    """
+    Mark all messages in a chat as read.
+    """
+    try:
+        import urllib.parse
+        decoded_id = urllib.parse.unquote(beeper_chat_id)
+        
+        # Update chat unread count
+        supabase.table("beeper_chats").update({
+            "unread_count": 0,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }).eq("beeper_chat_id", decoded_id).execute()
+        
+        # Update messages
+        supabase.table("beeper_messages").update({
+            "is_read": True
+        }).eq("beeper_chat_id", decoded_id).eq("is_read", False).execute()
+        
+        # Try to mark read on Beeper side
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(
+                    f"{BEEPER_BRIDGE_URL}/chats/{urllib.parse.quote(decoded_id, safe='')}/read"
+                )
+        except Exception as e:
+            logger.warning(f"Could not mark read on Beeper side: {e}")
+        
+        return {"status": "marked_read", "chat_id": decoded_id}
+    except Exception as e:
+        logger.error(f"Failed to mark chat as read: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
