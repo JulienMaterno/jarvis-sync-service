@@ -18,6 +18,10 @@ venv/
 # Local data
 backups/
 *.log
+
+# OAuth credentials (sensitive!)
+scripts/credentials.json
+scripts/token.json
 *.csv
 *.json.backup
 
