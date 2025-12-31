@@ -108,3 +108,79 @@ class GoogleCalendarClient:
             )
             response.raise_for_status()
             return response.json()
+
+    @retry_on_error()
+    async def create_event(
+        self,
+        summary: str,
+        start_time: datetime,
+        end_time: datetime,
+        description: str = None,
+        location: str = None,
+        attendees: List[str] = None,
+        calendar_id: str = 'primary',
+        timezone_str: str = None
+    ) -> Dict[str, Any]:
+        """
+        Create a new calendar event.
+        
+        Args:
+            summary: Event title
+            start_time: Event start datetime
+            end_time: Event end datetime  
+            description: Event description/notes
+            location: Event location
+            attendees: List of email addresses to invite
+            calendar_id: Calendar to create event in (default: primary)
+            timezone_str: Timezone for the event (e.g., 'Asia/Singapore')
+            
+        Returns:
+            Created event data from Google Calendar API
+        """
+        await self._ensure_token()
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        # Build event body
+        event_body = {
+            "summary": summary,
+            "start": {
+                "dateTime": format_rfc3339(start_time),
+                "timeZone": timezone_str or "UTC"
+            },
+            "end": {
+                "dateTime": format_rfc3339(end_time),
+                "timeZone": timezone_str or "UTC"
+            }
+        }
+        
+        if description:
+            event_body["description"] = description
+            
+        if location:
+            event_body["location"] = location
+            
+        if attendees:
+            event_body["attendees"] = [{"email": email} for email in attendees]
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{GOOGLE_CALENDAR_API_BASE}/calendars/{calendar_id}/events",
+                headers=headers,
+                json=event_body
+            )
+            
+            if response.status_code == 401:
+                # Token expired, refresh and retry
+                self.access_token = await get_access_token()
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                response = await client.post(
+                    f"{GOOGLE_CALENDAR_API_BASE}/calendars/{calendar_id}/events",
+                    headers=headers,
+                    json=event_body
+                )
+            
+            response.raise_for_status()
+            return response.json()

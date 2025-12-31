@@ -380,6 +380,88 @@ async def sync_calendar():
         logger.error(f"Calendar sync failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# --- Calendar Event Creation ---
+from pydantic import BaseModel
+from typing import Optional, List
+from lib.google_calendar import GoogleCalendarClient
+
+class CreateCalendarEventRequest(BaseModel):
+    """Request body for creating a calendar event."""
+    summary: str
+    start_time: str  # ISO 8601 format
+    end_time: str    # ISO 8601 format
+    description: Optional[str] = None
+    location: Optional[str] = None
+    attendees: Optional[List[str]] = None  # List of email addresses
+    timezone: Optional[str] = None  # e.g., 'Asia/Singapore'
+
+
+@app.post("/calendar/create")
+async def create_calendar_event(request: CreateCalendarEventRequest):
+    """
+    Create a new Google Calendar event.
+    
+    Args:
+        summary: Event title
+        start_time: ISO 8601 datetime string (e.g., '2025-01-15T14:00:00')
+        end_time: ISO 8601 datetime string
+        description: Optional event description
+        location: Optional location
+        attendees: Optional list of email addresses to invite
+        timezone: Optional timezone (defaults to user's timezone or UTC)
+        
+    Returns:
+        Created event details including Google event ID and link
+    """
+    try:
+        from datetime import datetime
+        
+        # Parse datetime strings
+        start_dt = datetime.fromisoformat(request.start_time.replace('Z', '+00:00'))
+        end_dt = datetime.fromisoformat(request.end_time.replace('Z', '+00:00'))
+        
+        # Get user's timezone if not provided
+        tz = request.timezone
+        if not tz:
+            try:
+                from lib.supabase_client import supabase
+                result = supabase.table("sync_state").select("value").eq("key", "user_timezone").execute()
+                if result.data:
+                    tz = result.data[0]["value"]
+            except Exception:
+                pass
+        tz = tz or "UTC"
+        
+        logger.info(f"Creating calendar event: {request.summary} at {request.start_time}")
+        
+        calendar_client = GoogleCalendarClient()
+        event = await calendar_client.create_event(
+            summary=request.summary,
+            start_time=start_dt,
+            end_time=end_dt,
+            description=request.description,
+            location=request.location,
+            attendees=request.attendees,
+            timezone_str=tz
+        )
+        
+        logger.info(f"Created calendar event: {event.get('id')}")
+        
+        return {
+            "status": "success",
+            "event_id": event.get("id"),
+            "html_link": event.get("htmlLink"),
+            "summary": event.get("summary"),
+            "start": event.get("start"),
+            "end": event.get("end"),
+            "created": event.get("created")
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to create calendar event: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # --- Gmail Sync ---
 
 @app.post("/sync/gmail")
