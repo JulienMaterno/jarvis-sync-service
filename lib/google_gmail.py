@@ -316,3 +316,316 @@ class GmailClient:
             
             response.raise_for_status()
             return response.json()
+
+    # =========================================================================
+    # DRAFT MANAGEMENT - Create, read, update, delete, send drafts
+    # =========================================================================
+    
+    def _build_email_message(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        cc: Optional[str] = None,
+        bcc: Optional[str] = None,
+        is_html: bool = False,
+        in_reply_to: Optional[str] = None,
+        references: Optional[str] = None
+    ) -> str:
+        """Build a raw RFC 2822 email message encoded as base64url."""
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+        
+        if is_html:
+            msg = MIMEMultipart('alternative')
+            msg.attach(MIMEText(body, 'html'))
+        else:
+            msg = MIMEText(body)
+        
+        msg['To'] = to
+        msg['Subject'] = subject
+        
+        if cc:
+            msg['Cc'] = cc
+        if bcc:
+            msg['Bcc'] = bcc
+        if in_reply_to:
+            msg['In-Reply-To'] = in_reply_to
+        if references:
+            msg['References'] = references
+        
+        return base64.urlsafe_b64encode(msg.as_bytes()).decode('utf-8')
+
+    @retry_on_error()
+    async def list_drafts(self, max_results: int = 20) -> List[Dict[str, Any]]:
+        """
+        List all drafts in the mailbox.
+        
+        Returns:
+            List of draft objects with id, message.id, message.threadId
+        """
+        await self._ensure_token()
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.get(
+                f"{GOOGLE_GMAIL_API_BASE}/drafts",
+                headers=headers,
+                params={"maxResults": max_results}
+            )
+            
+            if response.status_code == 401:
+                self.access_token = await get_access_token()
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                response = await client.get(
+                    f"{GOOGLE_GMAIL_API_BASE}/drafts",
+                    headers=headers,
+                    params={"maxResults": max_results}
+                )
+            
+            response.raise_for_status()
+            data = response.json()
+            return data.get("drafts", [])
+
+    @retry_on_error()
+    async def get_draft(self, draft_id: str, format: str = 'full') -> Dict[str, Any]:
+        """
+        Get a specific draft by ID.
+        
+        Args:
+            draft_id: The draft ID
+            format: 'full', 'metadata', 'minimal', 'raw'
+            
+        Returns:
+            Draft object with id, message (containing headers, body, etc.)
+        """
+        await self._ensure_token()
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.get(
+                f"{GOOGLE_GMAIL_API_BASE}/drafts/{draft_id}",
+                headers=headers,
+                params={"format": format}
+            )
+            
+            if response.status_code == 401:
+                self.access_token = await get_access_token()
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                response = await client.get(
+                    f"{GOOGLE_GMAIL_API_BASE}/drafts/{draft_id}",
+                    headers=headers,
+                    params={"format": format}
+                )
+            
+            response.raise_for_status()
+            return response.json()
+
+    @retry_on_error()
+    async def create_draft(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        cc: Optional[str] = None,
+        bcc: Optional[str] = None,
+        is_html: bool = False,
+        reply_to_message_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Create a new draft in Gmail.
+        
+        Args:
+            to: Recipient email address
+            subject: Email subject
+            body: Email body (plain text or HTML)
+            cc: CC recipients (optional)
+            bcc: BCC recipients (optional)
+            is_html: If True, body is HTML
+            reply_to_message_id: If replying to an existing message
+            
+        Returns:
+            Created draft object with id, message.id, message.threadId
+        """
+        await self._ensure_token()
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        
+        # Handle reply threading
+        thread_id = None
+        in_reply_to = None
+        references = None
+        
+        if reply_to_message_id:
+            original = await self.get_message(reply_to_message_id, format='metadata')
+            message_id_header = self.get_header(original.get('payload', {}), 'Message-ID')
+            original_subject = self.get_header(original.get('payload', {}), 'Subject')
+            
+            if message_id_header:
+                in_reply_to = message_id_header
+                references = message_id_header
+            
+            thread_id = original.get('threadId')
+            
+            if original_subject and not subject.lower().startswith('re:'):
+                subject = f"Re: {original_subject}"
+        
+        raw_message = self._build_email_message(
+            to=to,
+            subject=subject,
+            body=body,
+            cc=cc,
+            bcc=bcc,
+            is_html=is_html,
+            in_reply_to=in_reply_to,
+            references=references
+        )
+        
+        request_body = {
+            "message": {"raw": raw_message}
+        }
+        if thread_id:
+            request_body["message"]["threadId"] = thread_id
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{GOOGLE_GMAIL_API_BASE}/drafts",
+                headers=headers,
+                json=request_body
+            )
+            
+            if response.status_code == 401:
+                self.access_token = await get_access_token()
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                response = await client.post(
+                    f"{GOOGLE_GMAIL_API_BASE}/drafts",
+                    headers=headers,
+                    json=request_body
+                )
+            
+            response.raise_for_status()
+            return response.json()
+
+    @retry_on_error()
+    async def update_draft(
+        self,
+        draft_id: str,
+        to: str,
+        subject: str,
+        body: str,
+        cc: Optional[str] = None,
+        bcc: Optional[str] = None,
+        is_html: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Update an existing draft.
+        
+        Args:
+            draft_id: The draft ID to update
+            to: Recipient email address
+            subject: Email subject
+            body: Email body
+            cc: CC recipients (optional)
+            bcc: BCC recipients (optional)
+            is_html: If True, body is HTML
+            
+        Returns:
+            Updated draft object
+        """
+        await self._ensure_token()
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        
+        raw_message = self._build_email_message(
+            to=to,
+            subject=subject,
+            body=body,
+            cc=cc,
+            bcc=bcc,
+            is_html=is_html
+        )
+        
+        request_body = {
+            "message": {"raw": raw_message}
+        }
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.put(
+                f"{GOOGLE_GMAIL_API_BASE}/drafts/{draft_id}",
+                headers=headers,
+                json=request_body
+            )
+            
+            if response.status_code == 401:
+                self.access_token = await get_access_token()
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                response = await client.put(
+                    f"{GOOGLE_GMAIL_API_BASE}/drafts/{draft_id}",
+                    headers=headers,
+                    json=request_body
+                )
+            
+            response.raise_for_status()
+            return response.json()
+
+    @retry_on_error()
+    async def delete_draft(self, draft_id: str) -> bool:
+        """
+        Delete a draft permanently.
+        
+        Args:
+            draft_id: The draft ID to delete
+            
+        Returns:
+            True if successful
+        """
+        await self._ensure_token()
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.delete(
+                f"{GOOGLE_GMAIL_API_BASE}/drafts/{draft_id}",
+                headers=headers
+            )
+            
+            if response.status_code == 401:
+                self.access_token = await get_access_token()
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                response = await client.delete(
+                    f"{GOOGLE_GMAIL_API_BASE}/drafts/{draft_id}",
+                    headers=headers
+                )
+            
+            response.raise_for_status()
+            return True
+
+    @retry_on_error()
+    async def send_draft(self, draft_id: str) -> Dict[str, Any]:
+        """
+        Send an existing draft.
+        
+        Args:
+            draft_id: The draft ID to send
+            
+        Returns:
+            Sent message object with id, threadId, labelIds
+        """
+        await self._ensure_token()
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{GOOGLE_GMAIL_API_BASE}/drafts/send",
+                headers=headers,
+                json={"id": draft_id}
+            )
+            
+            if response.status_code == 401:
+                self.access_token = await get_access_token()
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                response = await client.post(
+                    f"{GOOGLE_GMAIL_API_BASE}/drafts/send",
+                    headers=headers,
+                    json={"id": draft_id}
+                )
+            
+            response.raise_for_status()
+            return response.json()

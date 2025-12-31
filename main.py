@@ -536,6 +536,284 @@ async def send_email(request: SendEmailRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# =============================================================================
+# GMAIL DRAFTS API - Full draft management for agents
+# =============================================================================
+
+class CreateDraftRequest(BaseModel):
+    """Request body for creating an email draft."""
+    to: str
+    subject: str
+    body: str
+    cc: Optional[str] = None
+    bcc: Optional[str] = None
+    is_html: bool = False
+    reply_to_message_id: Optional[str] = None
+
+
+class UpdateDraftRequest(BaseModel):
+    """Request body for updating an email draft."""
+    to: str
+    subject: str
+    body: str
+    cc: Optional[str] = None
+    bcc: Optional[str] = None
+    is_html: bool = False
+
+
+@app.get("/gmail/drafts")
+async def list_drafts(limit: int = 20):
+    """
+    List all email drafts from Gmail.
+    
+    Args:
+        limit: Maximum number of drafts to return (default 20)
+        
+    Returns:
+        List of drafts with id, to, subject, snippet
+    """
+    try:
+        gmail_client = GmailClient()
+        drafts = await gmail_client.list_drafts(max_results=limit)
+        
+        # Fetch details for each draft
+        detailed_drafts = []
+        for draft in drafts:
+            try:
+                draft_detail = await gmail_client.get_draft(draft["id"], format="metadata")
+                message = draft_detail.get("message", {})
+                payload = message.get("payload", {})
+                
+                # Extract headers
+                to = gmail_client.get_header(payload, "To")
+                subject = gmail_client.get_header(payload, "Subject")
+                
+                detailed_drafts.append({
+                    "draft_id": draft["id"],
+                    "message_id": message.get("id"),
+                    "thread_id": message.get("threadId"),
+                    "to": to,
+                    "subject": subject,
+                    "snippet": message.get("snippet", "")[:100]
+                })
+            except Exception as e:
+                logger.warning(f"Failed to fetch draft {draft['id']}: {e}")
+                continue
+        
+        return {
+            "status": "success",
+            "count": len(detailed_drafts),
+            "drafts": detailed_drafts
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to list drafts: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/gmail/drafts/{draft_id}")
+async def get_draft(draft_id: str):
+    """
+    Get a specific draft by ID with full content.
+    
+    Args:
+        draft_id: The Gmail draft ID
+        
+    Returns:
+        Full draft details including body content
+    """
+    try:
+        gmail_client = GmailClient()
+        draft = await gmail_client.get_draft(draft_id, format="full")
+        
+        message = draft.get("message", {})
+        payload = message.get("payload", {})
+        
+        # Extract headers
+        to = gmail_client.get_header(payload, "To")
+        cc = gmail_client.get_header(payload, "Cc")
+        subject = gmail_client.get_header(payload, "Subject")
+        
+        # Extract body
+        body_parts = gmail_client.parse_message_body(payload)
+        
+        return {
+            "status": "success",
+            "draft": {
+                "draft_id": draft["id"],
+                "message_id": message.get("id"),
+                "thread_id": message.get("threadId"),
+                "to": to,
+                "cc": cc,
+                "subject": subject,
+                "body_text": body_parts.get("text", ""),
+                "body_html": body_parts.get("html", ""),
+                "snippet": message.get("snippet", "")
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get draft {draft_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/gmail/drafts")
+async def create_draft(request: CreateDraftRequest):
+    """
+    Create a new email draft in Gmail.
+    
+    The draft will appear in the user's Gmail Drafts folder immediately.
+    
+    Args:
+        to: Recipient email address
+        subject: Email subject line
+        body: Email body content
+        cc: Optional CC recipients
+        bcc: Optional BCC recipients
+        is_html: If True, body is HTML formatted
+        reply_to_message_id: If replying to an existing email thread
+        
+    Returns:
+        Created draft details including draft_id
+    """
+    try:
+        logger.info(f"Creating draft to: {request.to}, subject: {request.subject[:50]}...")
+        
+        gmail_client = GmailClient()
+        result = await gmail_client.create_draft(
+            to=request.to,
+            subject=request.subject,
+            body=request.body,
+            cc=request.cc,
+            bcc=request.bcc,
+            is_html=request.is_html,
+            reply_to_message_id=request.reply_to_message_id
+        )
+        
+        logger.info(f"Draft created: {result.get('id')}")
+        
+        return {
+            "status": "success",
+            "draft_id": result.get("id"),
+            "message_id": result.get("message", {}).get("id"),
+            "thread_id": result.get("message", {}).get("threadId"),
+            "message": f"Draft created and saved to Gmail Drafts folder"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to create draft: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/gmail/drafts/{draft_id}")
+async def update_draft(draft_id: str, request: UpdateDraftRequest):
+    """
+    Update an existing draft.
+    
+    Args:
+        draft_id: The draft ID to update
+        to: Recipient email address
+        subject: Email subject line
+        body: Email body content
+        cc: Optional CC recipients
+        bcc: Optional BCC recipients
+        is_html: If True, body is HTML formatted
+        
+    Returns:
+        Updated draft details
+    """
+    try:
+        logger.info(f"Updating draft {draft_id}...")
+        
+        gmail_client = GmailClient()
+        result = await gmail_client.update_draft(
+            draft_id=draft_id,
+            to=request.to,
+            subject=request.subject,
+            body=request.body,
+            cc=request.cc,
+            bcc=request.bcc,
+            is_html=request.is_html
+        )
+        
+        logger.info(f"Draft updated: {result.get('id')}")
+        
+        return {
+            "status": "success",
+            "draft_id": result.get("id"),
+            "message_id": result.get("message", {}).get("id"),
+            "message": "Draft updated successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to update draft {draft_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/gmail/drafts/{draft_id}")
+async def delete_draft(draft_id: str):
+    """
+    Delete a draft permanently.
+    
+    Args:
+        draft_id: The draft ID to delete
+        
+    Returns:
+        Success confirmation
+    """
+    try:
+        logger.info(f"Deleting draft {draft_id}...")
+        
+        gmail_client = GmailClient()
+        await gmail_client.delete_draft(draft_id)
+        
+        logger.info(f"Draft deleted: {draft_id}")
+        
+        return {
+            "status": "success",
+            "message": f"Draft {draft_id} deleted"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to delete draft {draft_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/gmail/drafts/{draft_id}/send")
+async def send_draft(draft_id: str):
+    """
+    Send an existing draft.
+    
+    This removes the draft from Drafts folder and sends it as an email.
+    Use this after user explicitly confirms they want to send.
+    
+    Args:
+        draft_id: The draft ID to send
+        
+    Returns:
+        Sent message details
+    """
+    try:
+        logger.info(f"Sending draft {draft_id}...")
+        
+        gmail_client = GmailClient()
+        result = await gmail_client.send_draft(draft_id)
+        
+        logger.info(f"Draft sent as message: {result.get('id')}")
+        
+        return {
+            "status": "success",
+            "message_id": result.get("id"),
+            "thread_id": result.get("threadId"),
+            "label_ids": result.get("labelIds", []),
+            "message": "Email sent successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to send draft {draft_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # --- Books Sync ---
 
 @app.post("/sync/books")
