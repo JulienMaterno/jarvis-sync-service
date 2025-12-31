@@ -58,9 +58,8 @@ SCOPES = [
     'https://www.googleapis.com/auth/drive',          # Full drive access
     
     # ========== LOCATION & MAPS ==========
-    
-    # Location History (Timeline)
-    'https://www.googleapis.com/auth/location.timeline',
+    # Note: location.timeline scope is not available for standard OAuth clients
+    # It requires Google to approve your app for "Sensitive Scopes"
     
     # ========== HEALTH & FITNESS ==========
     
@@ -78,8 +77,8 @@ SCOPES = [
     # Google Tasks
     'https://www.googleapis.com/auth/tasks',
     
-    # Google Keep (Notes)
-    'https://www.googleapis.com/auth/keep',
+    # Google Keep - Not available for standard OAuth (requires Google approval)
+    # 'https://www.googleapis.com/auth/keep',
     
     # ========== MEDIA ==========
     
