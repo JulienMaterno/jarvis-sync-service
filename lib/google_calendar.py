@@ -7,15 +7,30 @@ from lib.utils import retry_on_error
 GOOGLE_CALENDAR_API_BASE = "https://www.googleapis.com/calendar/v3"
 
 
-def format_rfc3339(dt: datetime) -> str:
-    """Normalize datetime to RFC3339 `YYYY-MM-DDTHH:MM:SSZ` format."""
+def format_datetime_local(dt: datetime) -> str:
+    """Format datetime for Google Calendar API without timezone conversion.
+    
+    Returns format: YYYY-MM-DDTHH:MM:SS (no Z suffix, no timezone offset)
+    This lets the timeZone field in the event body handle the timezone.
+    """
+    if dt.tzinfo is not None:
+        # If timezone-aware, strip the tzinfo but keep the time values
+        # (we'll let Google Calendar handle the timezone via timeZone field)
+        dt = dt.replace(tzinfo=None)
+    
+    return dt.replace(microsecond=0).isoformat(timespec="seconds")
 
+
+def format_rfc3339_utc(dt: datetime) -> str:
+    """Format datetime as RFC3339 UTC for API queries (timeMin/timeMax).
+    
+    Returns format: YYYY-MM-DDTHH:MM:SSZ (Z suffix = UTC)
+    """
     if dt.tzinfo is None:
-        # Assume naive datetimes are already UTC
         dt_utc = dt.replace(microsecond=0)
     else:
         dt_utc = dt.astimezone(timezone.utc).replace(tzinfo=None, microsecond=0)
-
+    
     return dt_utc.isoformat(timespec="seconds") + "Z"
 
 class GoogleCalendarClient:
@@ -53,9 +68,9 @@ class GoogleCalendarClient:
             params["orderBy"] = "startTime"
             if time_min:
                 # Google Calendar API requires RFC3339 format with Z suffix for UTC
-                params["timeMin"] = format_rfc3339(time_min)
+                params["timeMin"] = format_rfc3339_utc(time_min)
             if time_max:
-                params["timeMax"] = format_rfc3339(time_max)
+                params["timeMax"] = format_rfc3339_utc(time_max)
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.get(
@@ -143,15 +158,15 @@ class GoogleCalendarClient:
             "Content-Type": "application/json"
         }
         
-        # Build event body
+        # Build event body - use local time format, let timeZone field handle conversion
         event_body = {
             "summary": summary,
             "start": {
-                "dateTime": format_rfc3339(start_time),
+                "dateTime": format_datetime_local(start_time),
                 "timeZone": timezone_str or "UTC"
             },
             "end": {
-                "dateTime": format_rfc3339(end_time),
+                "dateTime": format_datetime_local(end_time),
                 "timeZone": timezone_str or "UTC"
             }
         }
@@ -234,13 +249,13 @@ class GoogleCalendarClient:
             
         if start_time is not None:
             event_body["start"] = {
-                "dateTime": format_rfc3339(start_time),
+                "dateTime": format_datetime_local(start_time),
                 "timeZone": timezone_str or event_body.get("start", {}).get("timeZone", "UTC")
             }
             
         if end_time is not None:
             event_body["end"] = {
-                "dateTime": format_rfc3339(end_time),
+                "dateTime": format_datetime_local(end_time),
                 "timeZone": timezone_str or event_body.get("end", {}).get("timeZone", "UTC")
             }
             
