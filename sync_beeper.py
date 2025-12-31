@@ -681,13 +681,50 @@ async def run_beeper_sync(
     """
     Run Beeper sync with the given Supabase client.
     
+    Handles offline scenarios gracefully - if the bridge is unreachable,
+    the sync is skipped and will catch up on the next run.
+    
     Args:
         supabase_client: Supabase client instance
         full_sync: If True, resync all messages (up to LOOKBACK_DAYS)
     
     Returns:
-        Sync statistics dict
+        Sync statistics dict (or offline status if bridge unreachable)
     """
+    # First check if bridge is reachable
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{BEEPER_BRIDGE_URL}/health")
+            if response.status_code != 200:
+                logger.warning(f"Beeper bridge returned status {response.status_code}, skipping sync")
+                return {
+                    "status": "skipped",
+                    "reason": "bridge_unhealthy",
+                    "message": "Beeper bridge is not healthy, will sync on next run"
+                }
+    except httpx.ConnectError:
+        logger.warning("Beeper bridge unreachable (laptop offline?), skipping sync")
+        return {
+            "status": "skipped", 
+            "reason": "bridge_offline",
+            "message": "Beeper bridge unreachable (laptop may be offline), will catch up on next run"
+        }
+    except httpx.TimeoutException:
+        logger.warning("Beeper bridge timed out, skipping sync")
+        return {
+            "status": "skipped",
+            "reason": "bridge_timeout", 
+            "message": "Beeper bridge timed out, will sync on next run"
+        }
+    except Exception as e:
+        logger.warning(f"Beeper bridge check failed: {e}, skipping sync")
+        return {
+            "status": "skipped",
+            "reason": "bridge_error",
+            "message": f"Beeper bridge check failed: {e}"
+        }
+    
+    # Bridge is healthy, proceed with sync
     async with BeeperSyncService(supabase_client) as sync_service:
         return await sync_service.sync_all(full_sync=full_sync)
 

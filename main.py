@@ -254,6 +254,10 @@ async def sync_everything(background_tasks: BackgroundTasks):
         # === HIGHLIGHTS SYNC (Notion → Supabase) ===
         await run_step("highlights_sync", run_highlights_sync, full_sync=False, since_hours=24)
         
+        # === BEEPER SYNC (WhatsApp/Telegram/LinkedIn messages) ===
+        # This gracefully handles offline laptop - just skips and catches up next run
+        await run_step("beeper_sync", run_beeper_sync, supabase, full_sync=False)
+        
         # Track sync completion
         _last_sync_end = datetime.now(timezone.utc)
         _last_sync_results = results
