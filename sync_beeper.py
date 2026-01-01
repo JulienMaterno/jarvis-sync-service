@@ -16,6 +16,7 @@ import httpx
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
 from supabase import Client
+from lib.logging_service import log_sync_event_sync
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +108,20 @@ class BeeperSyncService:
             
             self.stats["finished_at"] = datetime.now(timezone.utc).isoformat()
             
-            # Log summary
+            # Log summary to sync_logs
+            summary_msg = f"{self.stats['messages_new']} new msgs, {self.stats['chats_synced']} chats, {self.stats['contacts_linked']} linked"
+            log_sync_event_sync(
+                "beeper_sync",
+                "success",
+                summary_msg,
+                details={
+                    "chats_synced": self.stats["chats_synced"],
+                    "messages_new": self.stats["messages_new"],
+                    "contacts_linked": self.stats["contacts_linked"],
+                    "errors": len(self.stats["errors"])
+                }
+            )
+            
             logger.info(
                 f"Beeper sync complete: "
                 f"{self.stats['chats_synced']} chats, "
@@ -119,6 +133,7 @@ class BeeperSyncService:
             
         except Exception as e:
             logger.error(f"Beeper sync failed: {e}")
+            log_sync_event_sync("beeper_sync", "error", f"Fatal error: {str(e)[:200]}")
             self.stats["errors"].append({"fatal": str(e)})
             self.stats["finished_at"] = datetime.now(timezone.utc).isoformat()
             raise
@@ -697,6 +712,7 @@ async def run_beeper_sync(
             response = await client.get(f"{BEEPER_BRIDGE_URL}/health")
             if response.status_code != 200:
                 logger.warning(f"Beeper bridge returned status {response.status_code}, skipping sync")
+                log_sync_event_sync("beeper_sync", "info", f"Skipped: bridge unhealthy (status {response.status_code})")
                 return {
                     "status": "skipped",
                     "reason": "bridge_unhealthy",
@@ -704,6 +720,7 @@ async def run_beeper_sync(
                 }
     except httpx.ConnectError:
         logger.warning("Beeper bridge unreachable (laptop offline?), skipping sync")
+        log_sync_event_sync("beeper_sync", "info", "Skipped: bridge offline (laptop may be offline)")
         return {
             "status": "skipped", 
             "reason": "bridge_offline",
@@ -711,6 +728,7 @@ async def run_beeper_sync(
         }
     except httpx.TimeoutException:
         logger.warning("Beeper bridge timed out, skipping sync")
+        log_sync_event_sync("beeper_sync", "info", "Skipped: bridge timeout")
         return {
             "status": "skipped",
             "reason": "bridge_timeout", 
@@ -718,6 +736,7 @@ async def run_beeper_sync(
         }
     except Exception as e:
         logger.warning(f"Beeper bridge check failed: {e}, skipping sync")
+        log_sync_event_sync("beeper_sync", "info", f"Skipped: {str(e)[:100]}")
         return {
             "status": "skipped",
             "reason": "bridge_error",

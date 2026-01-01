@@ -350,6 +350,106 @@ class SystemHealthMonitor:
                 message=f"Could not check: {str(e)[:100]}"
             )
     
+    async def check_beeper_sync(self) -> ComponentHealth:
+        """Check Beeper messaging sync status.
+        
+        Beeper sync depends on a local bridge running on the user's laptop.
+        This is expected to be offline when the laptop is off/away.
+        
+        Status logic:
+        - HEALTHY: Recent successful sync, or graceful skip (bridge offline)
+        - DEGRADED: No sync activity in 48h+ (may indicate issue)
+        - UNHEALTHY: Repeated errors (not just offline skips)
+        """
+        try:
+            since_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+            since_48h = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+            
+            # Get recent Beeper sync logs
+            result = supabase.table("sync_logs") \
+                .select("*") \
+                .eq("event_type", "beeper_sync") \
+                .gte("created_at", since_48h) \
+                .order("created_at", desc=True) \
+                .limit(20) \
+                .execute()
+            
+            logs = result.data or []
+            
+            if not logs:
+                # No logs at all - check if we have data (sync worked before)
+                chats = supabase.table("beeper_chats").select("id", count="exact").limit(1).execute()
+                if chats.count and chats.count > 0:
+                    return ComponentHealth(
+                        name="Beeper Sync",
+                        status=HealthStatus.DEGRADED,
+                        message=f"No sync in 48h (have {chats.count} chats from before)"
+                    )
+                else:
+                    # Never synced - might be first time or not configured
+                    return ComponentHealth(
+                        name="Beeper Sync",
+                        status=HealthStatus.UNKNOWN,
+                        message="No Beeper data - may not be configured"
+                    )
+            
+            # Categorize logs
+            successes = [l for l in logs if l.get("status") == "success"]
+            errors = [l for l in logs if l.get("status") == "error"]
+            skips = [l for l in logs if l.get("status") == "info" and "skip" in l.get("message", "").lower()]
+            
+            latest = logs[0]
+            latest_status = latest.get("status")
+            latest_msg = latest.get("message", "")[:60]
+            
+            # Get message counts for context
+            msgs_24h = supabase.table("beeper_messages") \
+                .select("id", count="exact") \
+                .gte("created_at", since_24h) \
+                .execute()
+            
+            new_msgs = msgs_24h.count or 0
+            
+            # Determine health
+            if errors and len(errors) > len(successes):
+                # More errors than successes - problem
+                self.warnings.append(f"Beeper sync has {len(errors)} errors in 48h")
+                return ComponentHealth(
+                    name="Beeper Sync",
+                    status=HealthStatus.DEGRADED,
+                    message=f"{len(errors)} errors - check bridge connectivity",
+                    details={"successes": len(successes), "errors": len(errors), "skips": len(skips)}
+                )
+            elif latest_status == "success":
+                return ComponentHealth(
+                    name="Beeper Sync",
+                    status=HealthStatus.HEALTHY,
+                    message=f"Last sync OK, {new_msgs} new msgs in 24h",
+                    details={"successes": len(successes), "skips": len(skips), "new_messages_24h": new_msgs}
+                )
+            elif latest_status == "info" and "skip" in latest_msg.lower():
+                # Bridge was offline - this is normal/expected behavior
+                return ComponentHealth(
+                    name="Beeper Sync",
+                    status=HealthStatus.HEALTHY,
+                    message=f"Bridge offline (expected if laptop away), {len(successes)} syncs in 48h",
+                    details={"successes": len(successes), "skips": len(skips)}
+                )
+            else:
+                return ComponentHealth(
+                    name="Beeper Sync",
+                    status=HealthStatus.DEGRADED,
+                    message=f"Latest: {latest_msg}",
+                    details={"latest_status": latest_status}
+                )
+            
+        except Exception as e:
+            return ComponentHealth(
+                name="Beeper Sync",
+                status=HealthStatus.UNKNOWN,
+                message=f"Could not check: {str(e)[:100]}"
+            )
+    
     async def check_recent_activity(self) -> ComponentHealth:
         """Check for recent processing activity."""
         try:
@@ -399,6 +499,7 @@ class SystemHealthMonitor:
             self.check_calendar_sync(),
             self.check_gmail_sync(),
             self.check_contact_sync(),
+            self.check_beeper_sync(),
             self.check_recent_activity(),
         ]
         
