@@ -51,6 +51,19 @@ NOTION_TO_SUPABASE_STATUS = {
     'Done': 'completed',
 }
 
+# Priority mapping between Supabase and Notion
+SUPABASE_TO_NOTION_PRIORITY = {
+    'high': 'High',
+    'medium': 'Medium',
+    'low': 'Low',
+}
+
+NOTION_TO_SUPABASE_PRIORITY = {
+    'High': 'high',
+    'Medium': 'medium',
+    'Low': 'low',
+}
+
 
 # ============================================================================
 # TASKS SYNC SERVICE
@@ -64,11 +77,15 @@ class TasksSyncService(TwoWaySyncService):
     - Name (title): Task title
     - Status (status): Not started / Done
     - Due (date): Due date
+    - Priority (select): High / Medium / Low
+    - Created (date): Creation date (read-only from Supabase)
     
     Supabase Fields:
     - title (text): Task title
     - status (text): pending / in_progress / completed / cancelled
     - due_date (date): Due date
+    - priority (text): high / medium / low
+    - created_at (timestamp): Creation timestamp
     - notion_page_id, notion_updated_at, last_sync_source (sync tracking)
     """
     
@@ -99,11 +116,20 @@ class TasksSyncService(TwoWaySyncService):
         # Extract due date
         due_date = NotionPropertyExtractor.date(props, 'Due')
         
-        return {
+        # Extract priority
+        notion_priority = NotionPropertyExtractor.select(props, 'Priority')
+        priority = NOTION_TO_SUPABASE_PRIORITY.get(notion_priority)
+        
+        result = {
             'title': title,
             'status': status,
             'due_date': due_date,
         }
+        
+        if priority:
+            result['priority'] = priority
+        
+        return result
     
     def convert_to_source(self, supabase_record: Dict) -> Dict[str, Any]:
         """
@@ -113,6 +139,8 @@ class TasksSyncService(TwoWaySyncService):
         title = supabase_record.get('title', 'Untitled')
         status = supabase_record.get('status', 'pending')
         due_date = supabase_record.get('due_date')
+        priority = supabase_record.get('priority')
+        created_at = supabase_record.get('created_at')
         
         # Map status to Notion format
         notion_status = SUPABASE_TO_NOTION_STATUS.get(status, 'Not started')
@@ -124,6 +152,18 @@ class TasksSyncService(TwoWaySyncService):
         
         if due_date:
             properties['Due'] = NotionPropertyBuilder.date(due_date)
+        
+        # Map priority to Notion select
+        if priority:
+            notion_priority = SUPABASE_TO_NOTION_PRIORITY.get(priority)
+            if notion_priority:
+                properties['Priority'] = NotionPropertyBuilder.select(notion_priority)
+        
+        # Map created_at to Notion date (read-only, for display)
+        if created_at:
+            # Convert timestamp to date string (YYYY-MM-DD)
+            created_date = created_at[:10] if isinstance(created_at, str) else created_at.strftime('%Y-%m-%d')
+            properties['Created'] = NotionPropertyBuilder.date(created_date)
         
         return properties
 

@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 BEEPER_BRIDGE_URL = os.getenv("BEEPER_BRIDGE_URL", "http://localhost:8377")
+BEEPER_BRIDGE_API_KEY = os.getenv("BEEPER_BRIDGE_API_KEY", "")  # API key for bridge authentication
 SYNC_LOOKBACK_DAYS = int(os.getenv("BEEPER_SYNC_LOOKBACK_DAYS", "30"))  # Default: 30 days on first sync
 
 # Platforms to completely ignore during sync
@@ -54,9 +55,15 @@ class BeeperSyncService:
         }
     
     async def __aenter__(self):
+        # Build headers with optional API key
+        headers = {}
+        if BEEPER_BRIDGE_API_KEY:
+            headers["X-API-Key"] = BEEPER_BRIDGE_API_KEY
+        
         self.http_client = httpx.AsyncClient(
             base_url=BEEPER_BRIDGE_URL,
-            timeout=120.0
+            timeout=120.0,
+            headers=headers
         )
         return self
     

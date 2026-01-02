@@ -339,7 +339,7 @@ async def generate_evening_journal_prompt():
                     supabase.table("journals") \
                         .update({
                             "content": new_content,
-                            "updated_at": now.isoformat(),
+                            "updated_at": now_utc.isoformat(),
                             "last_sync_source": "supabase"
                         }) \
                         .eq("id", journal_id) \
