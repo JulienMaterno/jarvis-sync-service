@@ -36,6 +36,9 @@ from sync_activitywatch import run_activitywatch_sync, ActivityWatchSync, format
 # Import Beeper sync
 from sync_beeper import run_beeper_sync, run_beeper_relink
 
+# Import Supabase client for Beeper sync
+from lib.supabase_client import supabase
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
