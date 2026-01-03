@@ -962,17 +962,60 @@ class SyncLogger:
     def log_start(self, sync_type: str = "sync"):
         self.log('start', 'info', f"Starting {sync_type}")
     
-    def log_complete(self, result: SyncResult):
+    def log_complete(self, result: SyncResult, direction_details: Optional[Dict] = None):
+        """Log sync completion with detailed per-direction breakdown.
+        
+        Args:
+            result: The overall sync result
+            direction_details: Optional dict with per-direction stats, e.g.:
+                {
+                    'notion_to_supabase': {'created': 3, 'updated': 2, 'deleted': 1},
+                    'supabase_to_notion': {'created': 1, 'updated': 0, 'deleted': 0},
+                    'notion_deletions': 1,
+                    'supabase_deletions': 0
+                }
+        """
         status = 'success' if result.success else 'error'
         
         # Build comprehensive metrics summary
         m = result.metrics
-        metrics_summary = (
-            f"Completed: {result.stats.created}c/{result.stats.updated}u/{result.stats.deleted}d/{result.stats.errors}err "
-            f"| {m.total_duration_seconds:.1f}s | "
-            f"API: {m.notion_api_calls}N/{m.supabase_api_calls}S | "
-            f"Rate limits: {m.rate_limit_events} | Retries: {m.retries}"
-        )
+        
+        # If we have per-direction details, use them for a detailed breakdown
+        if direction_details:
+            parts = []
+            
+            # Notion deletions
+            if direction_details.get('notion_deletions', 0) > 0:
+                parts.append(f"Notion deletions→Supabase: {direction_details['notion_deletions']} soft-deleted")
+            
+            # Supabase deletions
+            if direction_details.get('supabase_deletions', 0) > 0:
+                parts.append(f"Supabase deletions→Notion: {direction_details['supabase_deletions']} archived")
+            
+            # Notion → Supabase
+            n2s = direction_details.get('notion_to_supabase', {})
+            if n2s.get('created', 0) + n2s.get('updated', 0) + n2s.get('deleted', 0) > 0:
+                parts.append(f"Notion→Supabase: {n2s.get('created', 0)}c/{n2s.get('updated', 0)}u/{n2s.get('deleted', 0)}d")
+            
+            # Supabase → Notion
+            s2n = direction_details.get('supabase_to_notion', {})
+            if s2n.get('created', 0) + s2n.get('updated', 0) + s2n.get('deleted', 0) > 0:
+                parts.append(f"Supabase→Notion: {s2n.get('created', 0)}c/{s2n.get('updated', 0)}u/{s2n.get('deleted', 0)}d")
+            
+            direction_summary = " | ".join(parts) if parts else "No changes"
+            
+            metrics_summary = (
+                f"{direction_summary} | "
+                f"{m.total_duration_seconds:.1f}s | "
+                f"API: {m.notion_api_calls}N/{m.supabase_api_calls}S"
+            )
+        else:
+            # Fallback to basic summary
+            metrics_summary = (
+                f"Completed: {result.stats.created}c/{result.stats.updated}u/{result.stats.deleted}d/{result.stats.errors}err "
+                f"| {m.total_duration_seconds:.1f}s | "
+                f"API: {m.notion_api_calls}N/{m.supabase_api_calls}S"
+            )
         
         if m.staleness_seconds > 0:
             metrics_summary += f" | Staleness: {m.staleness_seconds:.0f}s"
@@ -1509,7 +1552,27 @@ class TwoWaySyncService(BaseSyncService):
             elapsed_seconds=elapsed
         )
         
-        self.sync_logger.log_complete(result)
+        # Prepare detailed per-direction breakdown for logging
+        direction_details = {
+            'notion_deletions': notion_deletions,
+            'supabase_deletions': supabase_deletions,
+            'notion_to_supabase': {
+                'created': result1.stats.created,
+                'updated': result1.stats.updated,
+                'deleted': result1.stats.deleted,
+                'skipped': result1.stats.skipped,
+                'errors': result1.stats.errors
+            },
+            'supabase_to_notion': {
+                'created': result2.stats.created,
+                'updated': result2.stats.updated,
+                'deleted': result2.stats.deleted,
+                'skipped': result2.stats.skipped,
+                'errors': result2.stats.errors
+            }
+        }
+        
+        self.sync_logger.log_complete(result, direction_details)
         return result
 
     def _sync_notion_to_supabase(self, full_sync: bool, since_hours: int, metrics: Optional[SyncMetrics] = None) -> SyncResult:

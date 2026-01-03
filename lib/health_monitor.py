@@ -485,6 +485,166 @@ class SystemHealthMonitor:
                 message=f"Could not check: {str(e)[:100]}"
             )
     
+    async def check_notion_supabase_consistency(self) -> ComponentHealth:
+        """Check that Notion and Supabase databases have consistent record counts.
+        
+        This validates that bidirectional syncs are working properly.
+        Checks: meetings, tasks, reflections, journals
+        Excludes soft-deleted records from Supabase counts.
+        """
+        try:
+            import os
+            import httpx
+            
+            NOTION_API_TOKEN = os.environ.get('NOTION_API_TOKEN')
+            if not NOTION_API_TOKEN:
+                return ComponentHealth(
+                    name="Notion↔Supabase Consistency",
+                    status=HealthStatus.UNKNOWN,
+                    message="Notion API token not available"
+                )
+            
+            # Database IDs for bidirectional syncs
+            databases_to_check = {
+                'meetings': os.environ.get('NOTION_MEETING_DB_ID', '297cd3f1-eb28-810f-86f0-f142f7e3a5ca'),
+                'tasks': os.environ.get('NOTION_TASKS_DB_ID', '2b3cd3f1-eb28-8004-a33a-d26b8bb3fa58'),
+                'reflections': os.environ.get('NOTION_REFLECTIONS_DB_ID', '2cacd3f1-eb28-80d9-903a-ee73d2f84b59'),
+                'journals': os.environ.get('NOTION_JOURNAL_DB_ID', '2cecd3f1-eb28-8098-bf5e-d49ae4a68f6b'),
+                'contacts': os.environ.get('NOTION_CRM_DATABASE_ID', '2c7cd3f1eb2880269e53ed4d45e99b69')
+            }
+            
+            headers = {
+                'Authorization': f'Bearer {NOTION_API_TOKEN}',
+                'Notion-Version': '2022-06-28',
+                'Content-Type': 'application/json'
+            }
+            
+            discrepancies = []
+            counts_detail = {}
+            
+            async with httpx.AsyncClient(headers=headers, timeout=30.0) as client:
+                for table_name, db_id in databases_to_check.items():
+                    try:
+                        # Get Notion count (all non-archived pages)
+                        notion_response = await client.post(
+                            f'https://api.notion.com/v1/databases/{db_id}/query',
+                            json={"page_size": 1}
+                        )
+                        notion_response.raise_for_status()
+                        notion_data = notion_response.json()
+                        notion_count = len(notion_data.get('results', []))
+                        
+                        # For accurate count, we need to paginate through all results
+                        # But we can get estimate from has_more
+                        if notion_data.get('has_more'):
+                            # Do a full count
+                            all_pages = notion_data.get('results', [])
+                            next_cursor = notion_data.get('next_cursor')
+                            
+                            while next_cursor:
+                                page_response = await client.post(
+                                    f'https://api.notion.com/v1/databases/{db_id}/query',
+                                    json={"page_size": 100, "start_cursor": next_cursor}
+                                )
+                                page_response.raise_for_status()
+                                page_data = page_response.json()
+                                all_pages.extend(page_data.get('results', []))
+                                next_cursor = page_data.get('next_cursor')
+                                
+                                # Safety limit to prevent infinite loops
+                                if len(all_pages) > 10000:
+                                    break
+                            
+                            notion_count = len(all_pages)
+                        
+                        # Get Supabase count (excluding soft-deleted)
+                        supabase_result = supabase.table(table_name) \
+                            .select("id", count="exact") \
+                            .is_("deleted_at", "null") \
+                            .execute()
+                        supabase_count = supabase_result.count or 0
+                        
+                        counts_detail[table_name] = {
+                            'notion': notion_count,
+                            'supabase': supabase_count,
+                            'diff': abs(notion_count - supabase_count)
+                        }
+                        
+                        # Check for significant discrepancy (>10% and >5 records difference)
+                        if supabase_count > 0:
+                            diff_pct = abs(notion_count - supabase_count) / max(supabase_count, notion_count) * 100
+                            diff_abs = abs(notion_count - supabase_count)
+                            
+                            if diff_pct > 10 and diff_abs > 5:
+                                discrepancies.append(
+                                    f"{table_name}: Notion={notion_count}, Supabase={supabase_count} ({diff_pct:.0f}% diff)"
+                                )
+                        elif notion_count > 5:
+                            # Supabase has no records but Notion does
+                            discrepancies.append(
+                                f"{table_name}: Notion={notion_count}, Supabase=0 (sync may have failed)"
+                            )
+                    
+                    except Exception as e:
+                        logger.warning(f"Failed to check {table_name} consistency: {e}")
+                        counts_detail[table_name] = {"error": str(e)[:50]}
+            
+            # Check Google Contacts count
+            try:
+                # Get Supabase contacts count
+                supabase_contacts = supabase.table("contacts") \
+                    .select("id", count="exact") \
+                    .is_("deleted_at", "null") \
+                    .execute()
+                supabase_contacts_count = supabase_contacts.count or 0
+                
+                # Get count of contacts synced to Google (have google_resource_name)
+                google_synced = supabase.table("contacts") \
+                    .select("id", count="exact") \
+                    .is_("deleted_at", "null") \
+                    .not_.is_("google_resource_name", "null") \
+                    .execute()
+                google_synced_count = google_synced.count or 0
+                
+                counts_detail['contacts_google_sync'] = {
+                    'total': supabase_contacts_count,
+                    'synced_to_google': google_synced_count,
+                    'not_synced': supabase_contacts_count - google_synced_count
+                }
+                
+                # Warn if many contacts aren't synced to Google
+                if supabase_contacts_count - google_synced_count > 10:
+                    self.warnings.append(
+                        f"{supabase_contacts_count - google_synced_count} contacts not synced to Google"
+                    )
+            
+            except Exception as e:
+                logger.warning(f"Failed to check Google contacts sync: {e}")
+            
+            if not discrepancies:
+                return ComponentHealth(
+                    name="Notion↔Supabase Consistency",
+                    status=HealthStatus.HEALTHY,
+                    message=f"Counts match across {len(databases_to_check)} databases",
+                    details=counts_detail
+                )
+            else:
+                self.warnings.extend(discrepancies)
+                self.recommendations.append("Run full sync to reconcile Notion and Supabase databases")
+                return ComponentHealth(
+                    name="Notion↔Supabase Consistency",
+                    status=HealthStatus.DEGRADED,
+                    message=f"{len(discrepancies)} database(s) have count mismatches",
+                    details=counts_detail
+                )
+        
+        except Exception as e:
+            return ComponentHealth(
+                name="Notion↔Supabase Consistency",
+                status=HealthStatus.UNKNOWN,
+                message=f"Could not check: {str(e)[:100]}"
+            )
+    
     async def run_full_health_check(self) -> SystemHealthReport:
         """Run comprehensive health check across all components."""
         self.components = []
@@ -496,6 +656,7 @@ class SystemHealthMonitor:
             self.check_database_health(),
             self.check_sync_errors(),
             self.check_data_integrity(),
+            self.check_notion_supabase_consistency(),  # New consistency check
             self.check_calendar_sync(),
             self.check_gmail_sync(),
             self.check_contact_sync(),
