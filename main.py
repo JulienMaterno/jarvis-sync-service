@@ -255,7 +255,7 @@ async def sync_everything(background_tasks: BackgroundTasks):
         await run_step("books_sync", run_books_sync, full_sync=False, since_hours=24)
         
         # === HIGHLIGHTS SYNC (Notion → Supabase) ===
-        await run_step("highlights_sync", run_highlights_sync, full_sync=False, since_hours=24)
+        await run_step("highlights_sync", run_highlights_sync, full_sync=False, hours=24)
         
         # === BEEPER SYNC (WhatsApp/Telegram/LinkedIn messages) ===
         # This gracefully handles offline laptop - just skips and catches up next run
@@ -1034,7 +1034,7 @@ async def sync_highlights(full: bool = False, hours: int = 24):
     """
     try:
         logger.info(f"Starting highlights sync via API (full={full}, hours={hours})")
-        result = await run_in_threadpool(run_highlights_sync, full_sync=full, since_hours=hours)
+        result = await run_in_threadpool(run_highlights_sync, full_sync=full, hours=hours)
         return result
     except Exception as e:
         logger.error(f"Highlights sync failed: {e}")

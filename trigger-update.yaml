@@ -1,0 +1,17 @@
+createTime: '2025-12-20T02:10:29.103879833Z'
+filename: cloudbuild.yaml
+id: 82c1cecd-2f53-455a-ab5a-adbd80b49365
+name: jarvis-telegram-bot-deploy
+repositoryEventConfig:
+  push:
+    branch: ^main$
+  repository: projects/jarvis-478401/locations/asia-southeast1/connections/github-connection/repositories/jarvis-telegram-bot
+  repositoryType: GITHUB
+resourceName: projects/jarvis-478401/locations/asia-southeast1/triggers/82c1cecd-2f53-455a-ab5a-adbd80b49365
+serviceAccount: projects/jarvis-478401/serviceAccounts/776871804948-compute@developer.gserviceaccount.com
+substitutions:
+  _ALLOWED_USER_IDS: ''
+  _AUDIO_PIPELINE_URL: https://jarvis-audio-pipeline-776871804948.asia-southeast1.run.app
+  _INTELLIGENCE_SERVICE_URL: https://jarvis-intelligence-service-776871804948.asia-southeast1.run.app
+  _SYNC_SERVICE_URL: https://jarvis-sync-service-776871804948.asia-southeast1.run.app
+  _WEBHOOK_URL: https://jarvis-telegram-bot-776871804948.asia-southeast1.run.app
