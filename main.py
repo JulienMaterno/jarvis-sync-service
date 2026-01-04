@@ -208,6 +208,113 @@ async def get_inventory_health():
         return {"status": "error", "error": str(e)}
 
 
+@app.get("/inventory/table")
+async def get_inventory_table():
+    """
+    Get a formatted table view of database inventory and sync status.
+    
+    Returns a human-readable table showing:
+    - Entity type
+    - Supabase count
+    - Notion count  
+    - Difference
+    - Sync status (✅/⚠️/❌)
+    """
+    try:
+        inventory = await run_in_threadpool(get_database_inventory)
+        
+        # Build formatted table
+        table_rows = []
+        total_supabase = 0
+        total_notion = 0
+        
+        for entity, counts in inventory.items():
+            sb = counts.get('supabase', 0)
+            n = counts.get('notion', 0)
+            diff = counts.get('difference', 0)
+            
+            if sb >= 0:
+                total_supabase += sb
+            if n >= 0:
+                total_notion += n
+            
+            # Status indicator
+            if diff is None:
+                status = "❓"
+            elif diff == 0:
+                status = "✅"
+            elif abs(diff) <= 3:
+                status = "⚠️"
+            else:
+                status = "❌"
+            
+            table_rows.append({
+                "entity": entity.title(),
+                "supabase": sb if sb >= 0 else "Error",
+                "notion": n if n >= 0 else "Error",
+                "difference": diff if diff is not None else "N/A",
+                "status": status
+            })
+        
+        # Add totals row
+        total_diff = total_notion - total_supabase
+        table_rows.append({
+            "entity": "TOTAL",
+            "supabase": total_supabase,
+            "notion": total_notion,
+            "difference": total_diff,
+            "status": "✅" if total_diff == 0 else ("⚠️" if abs(total_diff) <= 5 else "❌")
+        })
+        
+        # Format as text table
+        header = "| Entity      | Supabase | Notion | Diff | Status |"
+        separator = "|-------------|----------|--------|------|--------|"
+        rows = [
+            f"| {r['entity']:<11} | {str(r['supabase']):>8} | {str(r['notion']):>6} | {str(r['difference']):>4} | {r['status']:>6} |"
+            for r in table_rows
+        ]
+        
+        table_text = "\n".join([header, separator] + rows)
+        
+        return {
+            "status": "success",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "table": table_rows,
+            "formatted": table_text,
+            "summary": {
+                "total_supabase": total_supabase,
+                "total_notion": total_notion,
+                "difference": total_diff,
+                "all_synced": total_diff == 0
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error getting inventory table: {e}")
+        return {"status": "error", "error": str(e)}
+
+
+@app.get("/sync/history")
+async def get_sync_history_endpoint(entity: str = None, days: int = 7):
+    """
+    Get recent sync history from the audit table.
+    
+    Args:
+        entity: Filter by entity type (contacts, meetings, tasks, etc.)
+        days: Number of days to look back (default 7)
+    """
+    try:
+        from lib.sync_audit import get_sync_history
+        history = await run_in_threadpool(get_sync_history, entity, days)
+        return {
+            "status": "success",
+            "count": len(history),
+            "history": history
+        }
+    except Exception as e:
+        logger.error(f"Error getting sync history: {e}")
+        return {"status": "error", "error": str(e)}
+
+
 @app.post("/sync/contacts")
 async def sync_all_contacts():
     """

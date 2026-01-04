@@ -214,6 +214,12 @@ class ReflectionsSyncService(TwoWaySyncService):
                     existing_record = supabase_lookup.get(notion_id)
                     
                     if existing_record:
+                        # Skip if Supabase has local changes that need to sync TO Notion
+                        if existing_record.get('last_sync_source') == 'supabase':
+                            self.logger.info(f"Skipping '{existing_record.get('title', 'Untitled')}' - has local Supabase changes pending sync to Notion")
+                            stats.skipped += 1
+                            continue
+                        
                         # Compare timestamps
                         comparison = self.compare_timestamps(
                             notion_record.get('last_edited_time'),
