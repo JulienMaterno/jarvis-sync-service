@@ -327,6 +327,11 @@ class ReflectionsSyncService(TwoWaySyncService):
                             except Exception as e:
                                 self.logger.warning(f"Failed to update content blocks: {e}")
                         
+                        # Mark as synced from notion (so future Notion edits flow back)
+                        self.supabase.update(record['id'], {
+                            'last_sync_source': 'notion'
+                        })
+                        
                         stats.updated += 1
                     else:
                         # Create new page
@@ -345,10 +350,11 @@ class ReflectionsSyncService(TwoWaySyncService):
                                 self.logger.warning(f"Failed to add content blocks: {e}")
                         
                         # Update Supabase with notion_page_id
+                        # Set last_sync_source to 'notion' so future Notion edits flow back to Supabase
                         self.supabase.update(record['id'], {
                             'notion_page_id': new_page_id,
                             'notion_updated_at': new_page.get('last_edited_time'),
-                            'last_sync_source': 'supabase'
+                            'last_sync_source': 'notion'
                         })
                         
                         stats.created += 1
