@@ -154,8 +154,12 @@ class CalendarSync:
                 except Exception as e:
                     logger.warning(f"Failed to clear invalid token: {e}")
 
-            await log_sync_event("calendar_sync", "success", f"Synced {len(upsert_data)} events")
-            return {"status": "success", "count": len(upsert_data)}
+            # Enhanced logging with breakdown
+            sync_msg = f"Synced {len(upsert_data)} events to Supabase"
+            if full_sync:
+                sync_msg += f" (full sync)"
+            await log_sync_event("calendar_sync", "success", sync_msg)
+            return {"status": "success", "count": len(upsert_data), "synced_to_supabase": len(upsert_data)}
 
         except Exception as e:
             logger.error(f"Calendar sync failed: {str(e)}")
