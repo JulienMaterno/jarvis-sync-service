@@ -216,7 +216,8 @@ async def get_inventory_table():
     Returns a human-readable table showing:
     - Entity type
     - Supabase count
-    - Notion count  
+    - Notion count
+    - Google count (contacts only)
     - Difference
     - Sync status (✅/⚠️/❌)
     """
@@ -231,6 +232,7 @@ async def get_inventory_table():
         for entity, counts in inventory.items():
             sb = counts.get('supabase', 0)
             n = counts.get('notion', 0)
+            g = counts.get('google')  # Only for contacts
             diff = counts.get('difference', 0)
             
             if sb >= 0:
@@ -248,13 +250,19 @@ async def get_inventory_table():
             else:
                 status = "❌"
             
-            table_rows.append({
+            row = {
                 "entity": entity.title(),
                 "supabase": sb if sb >= 0 else "Error",
                 "notion": n if n >= 0 else "Error",
                 "difference": diff if diff is not None else "N/A",
                 "status": status
-            })
+            }
+            
+            # Add Google count for contacts
+            if g is not None:
+                row["google"] = g
+            
+            table_rows.append(row)
         
         # Add totals row
         total_diff = total_notion - total_supabase
@@ -266,13 +274,22 @@ async def get_inventory_table():
             "status": "✅" if total_diff == 0 else ("⚠️" if abs(total_diff) <= 5 else "❌")
         })
         
-        # Format as text table
-        header = "| Entity      | Supabase | Notion | Diff | Status |"
-        separator = "|-------------|----------|--------|------|--------|"
-        rows = [
-            f"| {r['entity']:<11} | {str(r['supabase']):>8} | {str(r['notion']):>6} | {str(r['difference']):>4} | {r['status']:>6} |"
-            for r in table_rows
-        ]
+        # Format as text table (include Google column)
+        has_google = any(r.get('google') is not None for r in table_rows)
+        if has_google:
+            header = "| Entity      | Supabase | Notion | Google | Diff | Status |"
+            separator = "|-------------|----------|--------|--------|------|--------|"
+            rows = [
+                f"| {r['entity']:<11} | {str(r['supabase']):>8} | {str(r['notion']):>6} | {str(r.get('google', '-')):>6} | {str(r['difference']):>4} | {r['status']:>6} |"
+                for r in table_rows
+            ]
+        else:
+            header = "| Entity      | Supabase | Notion | Diff | Status |"
+            separator = "|-------------|----------|--------|------|--------|"
+            rows = [
+                f"| {r['entity']:<11} | {str(r['supabase']):>8} | {str(r['notion']):>6} | {str(r['difference']):>4} | {r['status']:>6} |"
+                for r in table_rows
+            ]
         
         table_text = "\n".join([header, separator] + rows)
         
@@ -356,6 +373,7 @@ async def sync_everything(background_tasks: BackgroundTasks):
     Failures in one module do not stop others.
     
     Uses sync locking to prevent overlapping sync cycles.
+    Records audit trail of all sync operations.
     """
     global _last_sync_start, _last_sync_end, _last_sync_results
     
@@ -372,9 +390,14 @@ async def sync_everything(background_tasks: BackgroundTasks):
     async with _sync_lock:
         _last_sync_start = datetime.now(timezone.utc)
         results = {}
-        logger.info("Starting full sync cycle via API (lock acquired)")
+        
+        # Generate a unique run_id for this sync cycle (for audit)
+        import uuid
+        run_id = str(uuid.uuid4())
+        logger.info(f"Starting full sync cycle via API (run_id: {run_id[:8]})")
 
         async def run_step(name, func, *args, **kwargs):
+            step_start = datetime.now(timezone.utc)
             try:
                 logger.info(f"Starting {name}...")
                 if asyncio.iscoroutinefunction(func):
@@ -430,10 +453,37 @@ async def sync_everything(background_tasks: BackgroundTasks):
         success_count = sum(1 for r in results.values() if r.get("status") == "success")
         error_count = sum(1 for r in results.values() if r.get("status") == "error")
         
+        # Record audit for this sync cycle
+        try:
+            inventory = get_database_inventory()
+            for entity in ['contacts', 'meetings', 'tasks', 'reflections', 'journals']:
+                if entity in inventory:
+                    stats = SyncStats(
+                        entity_type=entity,
+                        supabase_count=inventory[entity].get('supabase', 0),
+                        notion_count=inventory[entity].get('notion', 0),
+                        google_count=inventory[entity].get('google')
+                    )
+                    record_sync_audit(
+                        run_id=run_id,
+                        sync_type='scheduled',
+                        entity_type=entity,
+                        stats=stats,
+                        triggered_by='api',
+                        started_at=_last_sync_start,
+                        completed_at=_last_sync_end,
+                        status='success' if error_count == 0 else 'partial',
+                        details={'results': {k: v.get('status') for k, v in results.items()}}
+                    )
+            logger.info(f"Recorded audit for sync run {run_id[:8]}")
+        except Exception as e:
+            logger.warning(f"Failed to record sync audit: {e}")
+        
         logger.info(f"Full sync cycle complete: {success_count} success, {error_count} errors")
         
         return {
             "status": "completed",
+            "run_id": run_id,
             "summary": {
                 "success_count": success_count,
                 "error_count": error_count,

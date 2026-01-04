@@ -302,6 +302,12 @@ class JournalsSyncService(TwoWaySyncService):
                     if not existing_record and data.get('date'):
                         existing_record = existing_by_date.get(data['date'])
                     
+                    # Skip if Supabase has local changes that need to sync TO Notion
+                    if existing_record and existing_record.get('last_sync_source') == 'supabase':
+                        self.logger.info(f"Skipping journal '{existing_record.get('title', 'Untitled')}' - has local Supabase changes pending sync to Notion")
+                        stats.skipped += 1
+                        continue
+                    
                     # Compare timestamps if record exists
                     if existing_record:
                         comparison = self.compare_timestamps(

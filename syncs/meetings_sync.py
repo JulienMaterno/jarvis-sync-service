@@ -595,6 +595,12 @@ class MeetingsSyncService(TwoWaySyncService):
                     notion_id = self.get_source_id(notion_record)
                     existing_record = existing_map.get(notion_id)
                     
+                    # Skip if Supabase has local changes that need to sync TO Notion
+                    if existing_record and existing_record.get('last_sync_source') == 'supabase':
+                        self.logger.info(f"Skipping '{existing_record.get('title', 'Untitled')}' - has local Supabase changes pending sync to Notion")
+                        stats.skipped += 1
+                        continue
+                    
                     # Compare timestamps if record exists
                     if existing_record:
                         comparison = self.compare_timestamps(

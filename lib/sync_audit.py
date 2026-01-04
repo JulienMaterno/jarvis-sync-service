@@ -10,6 +10,7 @@ Provides functionality for:
 import os
 import uuid
 import logging
+import asyncio
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, field
@@ -27,6 +28,34 @@ NOTION_DBS = {
     'reflections': os.environ.get('NOTION_REFLECTIONS_DB_ID', ''),
     'journals': os.environ.get('NOTION_JOURNAL_DB_ID', '')
 }
+
+
+def get_google_contacts_count() -> int:
+    """
+    Get count of contacts in Google People API.
+    Uses stored OAuth token from Supabase.
+    """
+    try:
+        from lib.google_contacts import get_all_contacts
+        from lib.oauth_handler import get_valid_google_token
+        
+        # Get token
+        loop = asyncio.new_event_loop()
+        try:
+            token = loop.run_until_complete(get_valid_google_token())
+            if not token:
+                logger.warning("No valid Google token available")
+                return -1
+            
+            # Get contacts count
+            contacts = loop.run_until_complete(get_all_contacts(token))
+            return len(contacts)
+        finally:
+            loop.close()
+            
+    except Exception as e:
+        logger.error(f"Error counting Google contacts: {e}")
+        return -1
 
 
 @dataclass
@@ -121,7 +150,13 @@ def get_database_inventory() -> Dict[str, Dict[str, int]]:
             'notion': get_notion_count(entity)
         }
         
-        # Calculate difference and health
+        # Add Google contacts count for contacts entity
+        if entity == 'contacts':
+            google_count = get_google_contacts_count()
+            if google_count >= 0:
+                inventory[entity]['google'] = google_count
+        
+        # Calculate difference and health (Supabase vs Notion)
         sb = inventory[entity]['supabase']
         n = inventory[entity]['notion']
         if sb >= 0 and n >= 0:

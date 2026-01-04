@@ -1285,6 +1285,14 @@ class OneWaySyncService(BaseSyncService):
             for notion_record in notion_records:
                 try:
                     notion_id = self.get_source_id(notion_record)
+                    
+                    # Skip if Supabase has local changes that need to sync TO Notion
+                    existing_record = existing.get(notion_id)
+                    if existing_record and existing_record.get('last_sync_source') == 'supabase':
+                        self.logger.info(f"Skipping '{existing_record.get('title', 'Untitled')}' - has local Supabase changes pending sync to Notion")
+                        stats.skipped += 1
+                        continue
+                    
                     data = self.convert_from_source(notion_record)
                     data['notion_page_id'] = notion_id
                     data['notion_updated_at'] = notion_record.get('last_edited_time')
@@ -1312,7 +1320,7 @@ class OneWaySyncService(BaseSyncService):
                 elapsed_seconds=elapsed
             )
             
-            self.logger.info(f"Sync complete: {stats.created} created, {stats.updated} updated, {stats.errors} errors in {elapsed:.1f}s")
+            self.logger.info(f"Sync complete: {stats.created} created, {stats.updated} updated, {stats.skipped} skipped, {stats.errors} errors in {elapsed:.1f}s")
             self.sync_logger.log_complete(result)
             
             return result
