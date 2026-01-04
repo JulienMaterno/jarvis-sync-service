@@ -500,14 +500,15 @@ async def sync_everything(background_tasks: BackgroundTasks):
                     )
             
             # Calendar events (Google → Supabase only)
+            # sync_calendar.py returns: {"status": "success", "count": N}
             if 'calendar_sync' in results:
                 cal_data = results['calendar_sync'].get('data', {})
-                created, updated, _ = extract_counts(cal_data)
+                # Calendar uses 'count' for total events synced
+                cal_count = cal_data.get('count', 0) or cal_data.get('total_events', 0) or 0
                 stats = SyncStats(
                     entity_type='calendar_events',
-                    supabase_count=cal_data.get('total_events', 0),
-                    created_in_supabase=created,
-                    updated_in_supabase=updated
+                    supabase_count=cal_count,
+                    updated_in_supabase=cal_count  # Calendar does upsert, so all are "updated"
                 )
                 record_sync_audit(
                     run_id=run_id,
@@ -522,14 +523,16 @@ async def sync_everything(background_tasks: BackgroundTasks):
                 )
             
             # Gmail (Google → Supabase only)
+            # sync_gmail.py returns various formats depending on incremental vs full sync
             if 'gmail_sync' in results:
                 gmail_data = results['gmail_sync'].get('data', {})
-                created, updated, _ = extract_counts(gmail_data)
+                # Try various field names Gmail might return
+                emails_count = gmail_data.get('emails_synced', 0) or gmail_data.get('total_emails', 0) or gmail_data.get('count', 0) or 0
+                emails_created = gmail_data.get('emails_created', 0) or gmail_data.get('new_emails', 0) or 0
                 stats = SyncStats(
                     entity_type='emails',
-                    supabase_count=gmail_data.get('total_emails', 0),
-                    created_in_supabase=created,
-                    updated_in_supabase=updated
+                    supabase_count=emails_count,
+                    created_in_supabase=emails_created
                 )
                 record_sync_audit(
                     run_id=run_id,
@@ -544,13 +547,19 @@ async def sync_everything(background_tasks: BackgroundTasks):
                 )
             
             # Beeper (Beeper Bridge → Supabase)
+            # sync_beeper.py returns: chats_synced, chats_created, chats_updated, messages_new, etc.
             if 'beeper_sync' in results:
                 beeper_data = results['beeper_sync'].get('data', {})
+                # Use actual field names from sync_beeper.py
+                chats_synced = beeper_data.get('chats_synced', 0) or 0
+                chats_created = beeper_data.get('chats_created', 0) or 0
+                chats_updated = beeper_data.get('chats_updated', 0) or 0
+                messages_new = beeper_data.get('messages_new', 0) or 0
                 stats = SyncStats(
                     entity_type='beeper_messages',
-                    supabase_count=beeper_data.get('total_chats', 0),
-                    created_in_supabase=beeper_data.get('new_chats', 0),
-                    updated_in_supabase=beeper_data.get('updated_chats', 0)
+                    supabase_count=chats_synced,
+                    created_in_supabase=chats_created + messages_new,
+                    updated_in_supabase=chats_updated
                 )
                 record_sync_audit(
                     run_id=run_id,
@@ -565,12 +574,16 @@ async def sync_everything(background_tasks: BackgroundTasks):
                 )
             
             # Books (Notion → Supabase only)
+            # sync_books.py returns: {'success': True, 'stats': {'created': N, 'updated': M, 'errors': X}}
             if 'books_sync' in results:
                 books_data = results['books_sync'].get('data', {})
-                created, updated, _ = extract_counts(books_data)
+                # Books has nested 'stats' structure
+                books_stats = books_data.get('stats', {})
+                created = books_stats.get('created', 0) or 0
+                updated = books_stats.get('updated', 0) or 0
                 stats = SyncStats(
                     entity_type='books',
-                    supabase_count=books_data.get('total_books', 0),
+                    supabase_count=created + updated,  # Total books synced this run
                     created_in_supabase=created,
                     updated_in_supabase=updated
                 )
@@ -587,12 +600,16 @@ async def sync_everything(background_tasks: BackgroundTasks):
                 )
             
             # Highlights (Notion → Supabase only)
+            # sync_highlights.py returns: {'success': True, 'stats': {'created': N, 'updated': M, ...}}
             if 'highlights_sync' in results:
                 highlights_data = results['highlights_sync'].get('data', {})
-                created, updated, _ = extract_counts(highlights_data)
+                # Highlights has nested 'stats' structure
+                hl_stats = highlights_data.get('stats', {})
+                created = hl_stats.get('created', 0) or 0
+                updated = hl_stats.get('updated', 0) or 0
                 stats = SyncStats(
                     entity_type='highlights',
-                    supabase_count=highlights_data.get('total_highlights', 0),
+                    supabase_count=created + updated,  # Total highlights synced this run
                     created_in_supabase=created,
                     updated_in_supabase=updated
                 )

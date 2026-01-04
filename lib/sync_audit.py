@@ -137,14 +137,20 @@ def get_database_inventory() -> Dict[str, Dict[str, int]]:
         {
             'contacts': {'supabase': 126, 'notion': 126, 'google': 150},
             'meetings': {'supabase': 120, 'notion': 120},
+            'calendar_events': {'supabase': 200},  # Google → Supabase only
+            'emails': {'supabase': 150},  # Gmail → Supabase only
+            'beeper_chats': {'supabase': 208},  # Beeper → Supabase only
+            'books': {'supabase': 50, 'notion': 50},
+            'highlights': {'supabase': 300, 'notion': 300},
             ...
         }
     """
     inventory = {}
     
-    entities = ['contacts', 'meetings', 'tasks', 'reflections', 'journals']
+    # Core bidirectional entities (Notion ↔ Supabase)
+    bidirectional_entities = ['contacts', 'meetings', 'tasks', 'reflections', 'journals']
     
-    for entity in entities:
+    for entity in bidirectional_entities:
         inventory[entity] = {
             'supabase': get_supabase_count(entity),
             'notion': get_notion_count(entity)
@@ -165,6 +171,42 @@ def get_database_inventory() -> Dict[str, Dict[str, int]]:
         else:
             inventory[entity]['difference'] = None
             inventory[entity]['is_in_sync'] = None
+    
+    # Supabase-only entities (Google/Beeper → Supabase, no Notion sync)
+    supabase_only_entities = ['calendar_events', 'emails', 'beeper_chats', 'beeper_messages']
+    
+    for entity in supabase_only_entities:
+        count = get_supabase_count(entity)
+        inventory[entity] = {
+            'supabase': count,
+            'source': 'google' if entity in ['calendar_events', 'emails'] else 'beeper'
+        }
+    
+    # Notion → Supabase only entities (read-only from Notion)
+    notion_to_supabase = {
+        'books': os.environ.get('NOTION_BOOKS_DB_ID', ''),
+        'highlights': os.environ.get('NOTION_HIGHLIGHTS_DB_ID', '')
+    }
+    
+    for entity, db_id in notion_to_supabase.items():
+        sb_count = get_supabase_count(entity)
+        n_count = -1
+        if db_id:
+            try:
+                pages = list(notion.query_database_all(db_id))
+                n_count = len(pages)
+            except Exception as e:
+                logger.warning(f"Error counting {entity} in Notion: {e}")
+        
+        inventory[entity] = {
+            'supabase': sb_count,
+            'notion': n_count if n_count >= 0 else None
+        }
+        
+        # Calculate sync health if both counts available
+        if sb_count >= 0 and n_count >= 0:
+            inventory[entity]['difference'] = n_count - sb_count
+            inventory[entity]['is_in_sync'] = (n_count == sb_count)
     
     return inventory
 
