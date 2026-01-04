@@ -39,6 +39,15 @@ from sync_beeper import run_beeper_sync, run_beeper_relink
 # Import Supabase client for Beeper sync
 from lib.supabase_client import supabase
 
+# Import sync audit for inventory and health checks
+from lib.sync_audit import (
+    get_database_inventory,
+    check_sync_health as check_database_sync_health,
+    SyncStats,
+    record_sync_audit,
+    generate_sync_report
+)
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -153,6 +162,51 @@ async def send_health_report(background_tasks: BackgroundTasks):
     
     background_tasks.add_task(run_report)
     return {"status": "queued", "message": "Health report generation started"}
+
+
+# ============================================================================
+# DATABASE INVENTORY & SYNC AUDIT ENDPOINTS
+# ============================================================================
+
+@app.get("/inventory")
+async def get_inventory():
+    """
+    Get current counts for all synced entities across Supabase and Notion.
+    
+    Returns:
+        - Count of records in each database
+        - Difference between databases
+        - Whether databases are in sync
+    """
+    try:
+        inventory = await run_in_threadpool(get_database_inventory)
+        return {
+            "status": "success",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "inventory": inventory
+        }
+    except Exception as e:
+        logger.error(f"Error getting inventory: {e}")
+        return {"status": "error", "error": str(e)}
+
+
+@app.get("/inventory/health")
+async def get_inventory_health():
+    """
+    Check sync health across all databases.
+    
+    Returns:
+        - Overall health status (healthy/warning/critical)
+        - Per-entity status and counts
+        - List of any sync issues detected
+    """
+    try:
+        health = await run_in_threadpool(check_database_sync_health)
+        return health
+    except Exception as e:
+        logger.error(f"Error checking sync health: {e}")
+        return {"status": "error", "error": str(e)}
+
 
 @app.post("/sync/contacts")
 async def sync_all_contacts():
