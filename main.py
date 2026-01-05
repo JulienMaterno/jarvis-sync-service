@@ -556,11 +556,32 @@ async def sync_everything(background_tasks: BackgroundTasks):
                 chats_created = beeper_data.get('chats_created', 0) or 0
                 chats_updated = beeper_data.get('chats_updated', 0) or 0
                 messages_new = beeper_data.get('messages_new', 0) or 0
+                
+                # Record beeper_chats audit
+                stats_chats = SyncStats(
+                    entity_type='beeper_chats',
+                    supabase_count=inventory.get('beeper_chats', {}).get('supabase', 0),
+                    created_in_supabase=chats_created,
+                    updated_in_supabase=chats_updated
+                )
+                record_sync_audit(
+                    run_id=run_id,
+                    sync_type='scheduled',
+                    entity_type='beeper_chats',
+                    stats=stats_chats,
+                    triggered_by='api',
+                    started_at=_last_sync_start,
+                    completed_at=_last_sync_end,
+                    status=results['beeper_sync'].get('status', 'success'),
+                    details={'sync_results': results['beeper_sync']}
+                )
+                
+                # Record beeper_messages audit
                 stats = SyncStats(
                     entity_type='beeper_messages',
                     supabase_count=inventory.get('beeper_messages', {}).get('supabase', 0),
-                    created_in_supabase=chats_created + messages_new,
-                    updated_in_supabase=chats_updated
+                    created_in_supabase=messages_new,
+                    updated_in_supabase=0
                 )
                 record_sync_audit(
                     run_id=run_id,
@@ -580,7 +601,7 @@ async def sync_everything(background_tasks: BackgroundTasks):
                 stats = SyncStats(
                     entity_type='books',
                     supabase_count=inventory.get('books', {}).get('supabase', 0),
-                    notion_count=inventory.get('books', {}).get('notion'),
+                    notion_count=inventory.get('books', {}).get('notion') or 0,
                     created_in_supabase=created,
                     updated_in_supabase=updated
                 )
@@ -602,7 +623,7 @@ async def sync_everything(background_tasks: BackgroundTasks):
                 stats = SyncStats(
                     entity_type='highlights',
                     supabase_count=inventory.get('highlights', {}).get('supabase', 0),
-                    notion_count=inventory.get('highlights', {}).get('notion'),
+                    notion_count=inventory.get('highlights', {}).get('notion') or 0,
                     created_in_supabase=created,
                     updated_in_supabase=updated
                 )

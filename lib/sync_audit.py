@@ -75,10 +75,14 @@ class SyncStats:
     
     @property
     def count_difference(self) -> int:
-        return abs(self.notion_count - self.supabase_count)
+        # Handle None values gracefully
+        n = self.notion_count or 0
+        s = self.supabase_count or 0
+        return abs(n - s)
     
     @property
     def is_in_sync(self) -> bool:
+        # Considered in sync if both are 0 or equal
         return self.count_difference == 0
     
     @property
