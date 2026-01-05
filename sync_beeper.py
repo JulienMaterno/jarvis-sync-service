@@ -203,12 +203,30 @@ class BeeperSyncService:
             # Incremental: from last sync
             since = datetime.fromisoformat(db_chat["last_synced_at"].replace("Z", "+00:00"))
         
-        # 3. Fetch and sync messages
+        # 3. Fetch messages from bridge
         messages = await self._fetch_messages(beeper_chat_id, since=since)
         
+        if not messages:
+            # Update last_synced_at even if no messages
+            await self._update_chat_sync_time(beeper_chat_id)
+            return
+        
+        # 4. OPTIMIZATION: Batch fetch existing message IDs to avoid N+1 queries
+        message_event_ids = [m.get("beeper_event_id") for m in messages if m.get("beeper_event_id")]
+        existing_ids = await self._get_existing_message_ids(message_event_ids)
+        
+        # 5. Get contact_id ONCE for all messages in this chat
+        contact_id = db_chat.get("contact_id")
+        
+        # 6. Process messages with pre-fetched data
         for msg in messages:
             try:
-                was_new = await self._upsert_message(msg, chat_data)
+                beeper_event_id = msg.get("beeper_event_id")
+                if beeper_event_id in existing_ids:
+                    self.stats["messages_skipped"] += 1
+                    continue
+                    
+                was_new = await self._insert_message(msg, chat_data, contact_id)
                 self.stats["messages_synced"] += 1
                 if was_new:
                     self.stats["messages_new"] += 1
@@ -220,7 +238,7 @@ class BeeperSyncService:
                 else:
                     logger.error(f"Error syncing message: {e}")
         
-        # 4. Update last_synced_at
+        # 7. Update last_synced_at
         await self._update_chat_sync_time(beeper_chat_id)
     
     async def _upsert_chat(self, chat_data: Dict) -> Dict:
@@ -281,6 +299,29 @@ class BeeperSyncService:
         
         return db_chat
     
+    async def _get_existing_message_ids(self, event_ids: List[str]) -> set:
+        """
+        Batch fetch existing message IDs to avoid N+1 queries.
+        Returns a set of beeper_event_ids that already exist in DB.
+        """
+        if not event_ids:
+            return set()
+        
+        # Supabase has a limit on query length, so batch if needed
+        batch_size = 200
+        existing_ids = set()
+        
+        for i in range(0, len(event_ids), batch_size):
+            batch = event_ids[i:i + batch_size]
+            # Use 'in' filter for batch lookup
+            result = self.db.table("beeper_messages").select("beeper_event_id").in_(
+                "beeper_event_id", batch
+            ).execute()
+            
+            existing_ids.update(r["beeper_event_id"] for r in result.data)
+        
+        return existing_ids
+    
     async def _fetch_messages(
         self, 
         beeper_chat_id: str, 
@@ -308,10 +349,61 @@ class BeeperSyncService:
         data = response.json()
         return data.get("messages", [])
     
+    async def _insert_message(self, msg_data: Dict, chat_data: Dict, contact_id: Optional[str] = None) -> bool:
+        """
+        Insert a message (assumes it doesn't exist - caller should check).
+        
+        Args:
+            msg_data: Message data from bridge
+            chat_data: Parent chat data
+            contact_id: Pre-fetched contact_id from chat (avoids N+1 query)
+            
+        Returns True if inserted successfully, False otherwise.
+        """
+        beeper_event_id = msg_data.get("beeper_event_id")
+        if not beeper_event_id:
+            logger.warning(f"Message missing beeper_event_id")
+            return False
+        
+        # Generate content_description for media messages
+        message_type = msg_data.get("message_type", "text")
+        content_description = self._generate_content_description(msg_data)
+        
+        # Prepare record
+        record = {
+            "beeper_event_id": beeper_event_id,
+            "beeper_chat_id": msg_data.get("beeper_chat_id"),
+            "platform": chat_data.get("platform"),
+            "sender_id": msg_data.get("sender_id"),
+            "sender_name": msg_data.get("sender_name"),
+            "is_outgoing": msg_data.get("is_outgoing", False),
+            "content": msg_data.get("content"),
+            "content_description": content_description,
+            "message_type": message_type,
+            "timestamp": msg_data.get("timestamp"),
+            "is_read": msg_data.get("is_read", False),
+            "contact_id": contact_id,  # Use pre-fetched contact_id
+            "has_media": msg_data.get("has_media", False),
+            "media_url": msg_data.get("media_url"),
+            "media_mime_type": msg_data.get("media_mime_type"),
+            "media_filename": msg_data.get("media_filename"),
+            "reply_to_event_id": msg_data.get("reply_to_event_id"),
+            "reactions": msg_data.get("reactions"),
+        }
+        
+        try:
+            self.db.table("beeper_messages").insert(record).execute()
+            return True
+        except Exception as e:
+            if "duplicate key" in str(e).lower():
+                return False
+            raise
+    
+    # Legacy method kept for backward compatibility with single-chat sync
     async def _upsert_message(self, msg_data: Dict, chat_data: Dict) -> bool:
         """
-        Insert a message if it doesn't exist.
-        Returns True if new, False if already existed.
+        Insert a message if it doesn't exist. 
+        DEPRECATED: Use _insert_message with pre-fetched contact_id for better performance.
         """
         beeper_event_id = msg_data.get("beeper_event_id")
         if not beeper_event_id:
@@ -332,39 +424,7 @@ class BeeperSyncService:
         ).execute()
         contact_id = chat_record.data[0].get("contact_id") if chat_record.data else None
         
-        # Generate content_description for media messages
-        message_type = msg_data.get("message_type", "text")
-        content_description = self._generate_content_description(msg_data)
-        
-        # Prepare record
-        record = {
-            "beeper_event_id": beeper_event_id,
-            "beeper_chat_id": msg_data.get("beeper_chat_id"),
-            "platform": chat_data.get("platform"),
-            "sender_id": msg_data.get("sender_id"),
-            "sender_name": msg_data.get("sender_name"),
-            "is_outgoing": msg_data.get("is_outgoing", False),
-            "content": msg_data.get("content"),
-            "content_description": content_description,
-            "message_type": message_type,
-            "timestamp": msg_data.get("timestamp"),
-            "is_read": msg_data.get("is_read", False),
-            "contact_id": contact_id,
-            "has_media": msg_data.get("has_media", False),
-            "media_url": msg_data.get("media_url"),
-            "media_mime_type": msg_data.get("media_mime_type"),
-            "media_filename": msg_data.get("media_filename"),
-            "reply_to_event_id": msg_data.get("reply_to_event_id"),
-            "reactions": msg_data.get("reactions"),
-        }
-        
-        try:
-            self.db.table("beeper_messages").insert(record).execute()
-            return True
-        except Exception as e:
-            if "duplicate key" in str(e).lower():
-                return False
-            raise
+        return await self._insert_message(msg_data, chat_data, contact_id)
     
     def _generate_content_description(self, msg_data: Dict) -> Optional[str]:
         """

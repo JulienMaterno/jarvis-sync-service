@@ -36,7 +36,8 @@ load_dotenv()
 # Add lib to path
 sys.path.insert(0, os.path.dirname(__file__))
 
-from lib.utils import retry_on_error_sync
+# Import shared clients from lib
+from lib.sync_base import NotionClient, retry_on_error
 from lib.logging_service import log_sync_event_sync
 
 # Configure logging
@@ -62,67 +63,11 @@ SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
 
 
 # ============================================================================
-# NOTION CLIENT
+# SUPABASE CLIENT (Highlights-specific)
 # ============================================================================
 
-class NotionClient:
-    """Notion API client with retry logic."""
-    
-    def __init__(self, token: str):
-        self.headers = {
-            'Authorization': f'Bearer {token}',
-            'Notion-Version': '2022-06-28',
-            'Content-Type': 'application/json'
-        }
-        self.client = httpx.Client(headers=self.headers, timeout=30.0)
-    
-    @retry_on_error_sync()
-    def query_database(
-        self, 
-        database_id: str, 
-        filter: Optional[Dict] = None,
-        page_size: int = 100
-    ) -> List[Dict]:
-        """Query all pages from a database with pagination."""
-        results = []
-        start_cursor = None
-        
-        while True:
-            body = {"page_size": page_size}
-            if filter:
-                body["filter"] = filter
-            if start_cursor:
-                body["start_cursor"] = start_cursor
-            
-            response = self.client.post(
-                f'https://api.notion.com/v1/databases/{database_id}/query',
-                json=body
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            results.extend(data.get('results', []))
-            
-            if not data.get('has_more'):
-                break
-            start_cursor = data.get('next_cursor')
-        
-        return results
-    
-    @retry_on_error_sync()
-    def get_database_schema(self, database_id: str) -> Dict:
-        """Get database schema to understand properties."""
-        response = self.client.get(f'https://api.notion.com/v1/databases/{database_id}')
-        response.raise_for_status()
-        return response.json()
-
-
-# ============================================================================
-# SUPABASE CLIENT
-# ============================================================================
-
-class SupabaseClient:
-    """Supabase client for highlights."""
+class HighlightsSupabaseClient:
+    """Supabase client for highlights table with upsert support."""
     
     def __init__(self, url: str, key: str):
         self.base_url = f"{url}/rest/v1"
@@ -134,49 +79,32 @@ class SupabaseClient:
         }
         self.client = httpx.Client(headers=self.headers, timeout=30.0)
     
-    def upsert_highlight(self, data: Dict) -> Dict:
-        """Upsert a highlight (insert or update based on notion_page_id)."""
-        notion_page_id = data.get('notion_page_id')
-        
-        # Check if highlight exists
-        existing = self.get_highlight_by_notion_id(notion_page_id)
-        
-        if existing:
-            # Update existing record
-            response = self.client.patch(
-                f"{self.base_url}/highlights?notion_page_id=eq.{notion_page_id}",
-                json=data
-            )
-            response.raise_for_status()
-            result = response.json()
-            return result[0] if result else {}
-        else:
-            # Insert new record
-            response = self.client.post(
-                f"{self.base_url}/highlights",
-                json=data
-            )
-            response.raise_for_status()
-            result = response.json()
-            return result[0] if result else {}
+    def __del__(self):
+        if hasattr(self, 'client'):
+            self.client.close()
     
-    def get_highlight_by_notion_id(self, notion_page_id: str) -> Optional[Dict]:
-        """Get a highlight by its Notion page ID."""
-        response = self.client.get(
-            f"{self.base_url}/highlights?notion_page_id=eq.{notion_page_id}&limit=1"
+    @retry_on_error(max_retries=3, base_delay=1.0)
+    def upsert_highlight(self, data: Dict) -> Dict:
+        """Upsert a highlight using Supabase's native upsert."""
+        response = self.client.post(
+            f"{self.base_url}/highlights?on_conflict=notion_page_id",
+            json=data,
+            headers={**self.headers, "Prefer": "resolution=merge-duplicates,return=representation"}
         )
         response.raise_for_status()
         result = response.json()
-        return result[0] if result else None
+        return result[0] if result else {}
     
+    @retry_on_error(max_retries=3, base_delay=1.0)
     def get_all_highlights(self, limit: int = 1000) -> List[Dict]:
         """Get all highlights from Supabase."""
         response = self.client.get(
-            f"{self.base_url}/highlights?select=*&order=highlighted_at.desc&limit={limit}"
+            f"{self.base_url}/highlights?select=notion_page_id&order=highlighted_at.desc&limit={limit}"
         )
         response.raise_for_status()
         return response.json()
     
+    @retry_on_error(max_retries=3, base_delay=1.0)
     def get_book_id_by_title(self, title: str) -> Optional[str]:
         """Look up book ID by title."""
         response = self.client.get(
@@ -248,7 +176,7 @@ def extract_relation_titles(props: Dict, prop_name: str) -> List[str]:
 # CONVERSION FUNCTION
 # ============================================================================
 
-def convert_notion_to_supabase(page: Dict, supabase: SupabaseClient) -> Dict:
+def convert_notion_to_supabase(page: Dict, supabase: HighlightsSupabaseClient) -> Dict:
     """Convert Notion highlight page to Supabase format."""
     props = page.get('properties', {})
     
@@ -331,7 +259,7 @@ def run_sync(full_sync: bool = False, hours: int = 24) -> Dict:
     
     try:
         notion = NotionClient(NOTION_API_TOKEN)
-        supabase = SupabaseClient(SUPABASE_URL, SUPABASE_KEY)
+        supabase = HighlightsSupabaseClient(SUPABASE_URL, SUPABASE_KEY)
         
         # Build filter for incremental sync
         filter_obj = None
@@ -410,7 +338,7 @@ def get_recent_highlights(days: int = 1) -> List[Dict]:
     if not SUPABASE_URL or not SUPABASE_KEY:
         return []
     
-    supabase = SupabaseClient(SUPABASE_URL, SUPABASE_KEY)
+    supabase = HighlightsSupabaseClient(SUPABASE_URL, SUPABASE_KEY)
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     
     response = supabase.client.get(
@@ -431,7 +359,7 @@ def get_favorite_highlights(limit: int = 10) -> List[Dict]:
     if not SUPABASE_URL or not SUPABASE_KEY:
         return []
     
-    supabase = SupabaseClient(SUPABASE_URL, SUPABASE_KEY)
+    supabase = HighlightsSupabaseClient(SUPABASE_URL, SUPABASE_KEY)
     
     response = supabase.client.get(
         f"{supabase.base_url}/highlights"

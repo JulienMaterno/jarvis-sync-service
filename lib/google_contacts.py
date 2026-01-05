@@ -245,8 +245,8 @@ def transform_to_google_body(data: Dict[str, Any]) -> Dict[str, Any]:
                         "day": int(parts[2])
                     }
                 }]
-        except:
-            pass
+        except (ValueError, IndexError, TypeError):
+            pass  # Invalid birthday format
             
     # Addresses (Location)
     if data.get("location"):

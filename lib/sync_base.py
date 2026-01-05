@@ -375,7 +375,7 @@ class NotionClient:
                 page_data = get_resp.json()
                 if page_data.get('archived') or page_data.get('in_trash'):
                     return page_data  # Already archived, no action needed
-        except:
+        except Exception:
             pass  # Continue to try archiving
         
         response = self.client.patch(
@@ -1550,8 +1550,8 @@ class TwoWaySyncService(BaseSyncService):
                     newest = max(r.get('last_edited_time', '') for r in notion_records)
                     try:
                         metrics.newest_source_change = datetime.fromisoformat(newest.replace('Z', '+00:00'))
-                    except:
-                        pass
+                    except (ValueError, AttributeError):
+                        pass  # Invalid date format or None
             
             # Get existing for comparison
             existing = {r['notion_page_id']: r for r in self.supabase.select_all() if r.get('notion_page_id')}
