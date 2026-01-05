@@ -639,6 +639,28 @@ async def sync_everything(background_tasks: BackgroundTasks):
                     details={'sync_results': results['highlights_sync']}
                 )
             
+            # Build consolidated summary of changes
+            changes_summary = []
+            for entity in ['contacts', 'meetings', 'tasks', 'reflections', 'journals', 'calendar_events', 'emails', 'books', 'highlights', 'beeper_chats', 'beeper_messages']:
+                sync_key = f'{entity}_sync' if entity not in ['contacts', 'calendar_events', 'emails', 'beeper_chats', 'beeper_messages'] else entity.replace('_', ' ')
+                # Find the right key in results
+                for key in results:
+                    if entity.replace('_', '') in key.replace('_', '').lower():
+                        data = results[key].get('data', {})
+                        if isinstance(data, dict):
+                            stats = data.get('stats', data)
+                            c = stats.get('created', 0) or 0
+                            u = stats.get('updated', 0) or 0
+                            d = stats.get('deleted', 0) or 0
+                            if c or u or d:
+                                changes_summary.append(f"{entity}:{c}c/{u}u/{d}d")
+                        break
+            
+            if changes_summary:
+                logger.info(f"📊 SYNC CHANGES: {', '.join(changes_summary)}")
+            else:
+                logger.info("📊 SYNC CHANGES: No changes detected")
+            
             logger.info(f"Recorded comprehensive audit for sync run {run_id[:8]}")
         except Exception as e:
             logger.error(f"Failed to record sync audit: {e}", exc_info=True)

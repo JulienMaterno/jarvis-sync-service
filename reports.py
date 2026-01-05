@@ -34,7 +34,7 @@ def get_reading_data_for_journal() -> dict:
     reading_data = {
         "currently_reading": [],
         "todays_highlights": [],
-        "recent_finishes": []
+        "finished_today": []  # Only books finished TODAY, not last 7 days
     }
     
     try:
@@ -69,16 +69,15 @@ def get_reading_data_for_journal() -> dict:
         
         reading_data["todays_highlights"] = highlights_resp.data or []
         
-        # 3. Recently finished books (last 7 days)
-        week_ago = (today - timedelta(days=7)).isoformat()
+        # 3. Books finished TODAY only (not last 7 days - that was too much)
         finished_resp = supabase.table("books") \
             .select("title, author, rating, finished_at") \
             .eq("status", "Finished") \
-            .gte("finished_at", week_ago) \
+            .gte("finished_at", today_start.isoformat()) \
             .is_("deleted_at", "null") \
             .execute()
         
-        reading_data["recent_finishes"] = finished_resp.data or []
+        reading_data["finished_today"] = finished_resp.data or []
         
     except Exception as e:
         logger.warning(f"Failed to get reading data: {e}")
@@ -98,10 +97,18 @@ async def generate_evening_journal_prompt():
     try:
         logger.info("Generating enhanced evening journal prompt...")
         
-        # Use TODAY's boundaries in user's timezone (Singapore)
-        # This ensures we only fetch events from the current day, not a rolling 24h window
+        # Get user timezone from sync_state (set via Jarvis chat)
         import pytz
-        user_tz = pytz.timezone("Asia/Singapore")
+        user_tz_str = "Asia/Singapore"  # Default fallback
+        try:
+            tz_result = supabase.table("sync_state").select("value").eq("key", "user_timezone").execute()
+            if tz_result.data:
+                user_tz_str = tz_result.data[0]["value"]
+                logger.info(f"Using user timezone: {user_tz_str}")
+        except Exception as e:
+            logger.warning(f"Could not fetch user timezone, using default: {e}")
+        
+        user_tz = pytz.timezone(user_tz_str)
         now_local = datetime.now(user_tz)
         today = now_local.date()
         
@@ -112,7 +119,7 @@ async def generate_evening_journal_prompt():
         
         # Use today's start as cutoff (instead of rolling 24h)
         cutoff = today_start_utc
-        logger.info(f"Fetching activities for today ({today}): {cutoff.isoformat()} to {now_utc.isoformat()}")
+        logger.info(f"Fetching activities for today ({today} {user_tz_str}): {cutoff.isoformat()} to {now_utc.isoformat()}")
         
         # =================================================================
         # 1. COLLECT ALL ACTIVITY DATA
@@ -124,6 +131,7 @@ async def generate_evening_journal_prompt():
             "emails": [],
             "tasks_completed": [],
             "tasks_created": [],
+            "tasks_due_today": [],  # Tasks scheduled for today (may have been set earlier)
             "reflections": [],
             "highlights": [],  # Book highlights
             "reading": None,
@@ -183,6 +191,14 @@ async def generate_evening_journal_prompt():
             .execute()
         activity_data["tasks_created"] = tasks_created_resp.data or []
         
+        # Tasks due today (may have been set earlier - important for follow-up)
+        tasks_due_today_resp = supabase.table("tasks") \
+            .select("id, title, description, priority, due_date, status, created_at") \
+            .eq("due_date", today.isoformat()) \
+            .is_("deleted_at", "null") \
+            .execute()
+        activity_data["tasks_due_today"] = tasks_due_today_resp.data or []
+        
         # Reflections (today)
         reflections_resp = supabase.table("reflections") \
             .select("id, title, content, tags, created_at") \
@@ -200,13 +216,13 @@ async def generate_evening_journal_prompt():
             .execute()
         activity_data["highlights"] = highlights_resp.data or []
         
-        # Reading progress - NEW!
+        # Reading progress
         reading_data = get_reading_data_for_journal()
-        if reading_data.get("currently_reading") or reading_data.get("todays_highlights"):
+        if reading_data.get("currently_reading") or reading_data.get("todays_highlights") or reading_data.get("finished_today"):
             activity_data["reading"] = {
                 "currently_reading": reading_data.get("currently_reading", []),
                 "todays_highlights": reading_data.get("todays_highlights", []),
-                "recently_finished": reading_data.get("recent_finishes", [])
+                "finished_today": reading_data.get("finished_today", [])  # Only books finished TODAY
             }
         
         # Screen time (ActivityWatch)
@@ -233,6 +249,7 @@ async def generate_evening_journal_prompt():
             "meetings_count": len(activity_data["meetings"]),
             "tasks_completed_count": len(activity_data["tasks_completed"]),
             "tasks_created_count": len(activity_data["tasks_created"]),
+            "tasks_due_today_count": len(activity_data["tasks_due_today"]),
             "reflections_count": len(activity_data["reflections"]),
             "calendar_events_count": len(activity_data["calendar_events"]),
             "emails_count": len(activity_data["emails"]),
@@ -276,7 +293,7 @@ async def generate_evening_journal_prompt():
                     f"{INTELLIGENCE_SERVICE_URL}/api/v1/journal/evening-analysis",
                     json={
                         "activity_data": activity_data,
-                        "timezone": "Asia/Singapore",
+                        "timezone": user_tz_str,  # Use user's configured timezone
                         "user_name": "Aaron",
                         "previous_journals": previous_journals
                     }
@@ -293,7 +310,7 @@ async def generate_evening_journal_prompt():
                         f"{INTELLIGENCE_SERVICE_URL}/api/v1/journal/evening-prompt",
                         json={
                             "activity_data": activity_data,
-                            "timezone": "Asia/Singapore"
+                            "timezone": user_tz_str  # Use user's configured timezone
                         }
                     )
                     response.raise_for_status()
@@ -308,7 +325,7 @@ async def generate_evening_journal_prompt():
                         f"{INTELLIGENCE_SERVICE_URL}/api/v1/journal/evening-prompt",
                         json={
                             "activity_data": activity_data,
-                            "timezone": "Asia/Singapore"
+                            "timezone": user_tz_str  # Use user's configured timezone
                         }
                     )
                     response.raise_for_status()
