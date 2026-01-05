@@ -635,9 +635,11 @@ class SupabaseClient:
     @retry_on_error(max_retries=3, base_delay=1.0)
     def upsert(self, data: Dict, conflict_column: str = "notion_page_id") -> Dict:
         """Insert or update a record based on conflict column."""
+        # Upsert requires resolution=merge-duplicates to update on conflict
         response = self.client.post(
             f"{self.base_url}/{self.table_name}?on_conflict={conflict_column}",
-            json=data
+            json=data,
+            headers={"Prefer": "resolution=merge-duplicates,return=representation"}
         )
         response.raise_for_status()
         result = response.json()
