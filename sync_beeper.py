@@ -25,6 +25,9 @@ BEEPER_BRIDGE_URL = os.getenv("BEEPER_BRIDGE_URL", "http://localhost:8377")
 BEEPER_BRIDGE_API_KEY = os.getenv("BEEPER_BRIDGE_API_KEY", "")  # API key for bridge authentication
 SYNC_LOOKBACK_DAYS = int(os.getenv("BEEPER_SYNC_LOOKBACK_DAYS", "30"))  # Default: 30 days on first sync
 
+# If True, skip cloud Beeper sync (let local bridge handle it)
+BEEPER_SYNC_DISABLED = os.getenv("BEEPER_SYNC_DISABLED", "false").lower() in ("true", "1", "yes")
+
 # Platforms to completely ignore during sync
 IGNORED_PLATFORMS = ["slack", "hungryserv", "matrix"]  # Groups with high noise, no personal DM value
 
@@ -713,6 +716,16 @@ async def run_beeper_sync(
     Returns:
         Sync statistics dict (or offline status if bridge unreachable)
     """
+    # Check if Beeper sync is disabled (local bridge handles it now)
+    if BEEPER_SYNC_DISABLED:
+        logger.info("Beeper sync disabled (BEEPER_SYNC_DISABLED=true) - local bridge handles sync")
+        log_sync_event_sync("beeper_sync", "info", "Skipped: disabled (local bridge handles sync)")
+        return {
+            "status": "skipped",
+            "reason": "disabled",
+            "message": "Cloud Beeper sync disabled - local bridge handles sync"
+        }
+    
     # First check if bridge is reachable
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
