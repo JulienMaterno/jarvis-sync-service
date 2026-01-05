@@ -48,6 +48,14 @@ from lib.sync_audit import (
     generate_sync_report
 )
 
+# Import lean sync cursor for change detection
+from lib.sync_cursor import (
+    check_for_changes,
+    check_all_entities,
+    update_cursor_after_sync,
+    ChangeCheckResult
+)
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -366,11 +374,16 @@ async def endpoint_sync_supabase_to_notion():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/sync/all")
 async def sync_everything(background_tasks: BackgroundTasks):
     """
-    Runs all syncs in the correct order.
-    Failures in one module do not stop others.
+    LEAN SYNC - Only syncs entities that have actual changes.
+    
+    This endpoint is optimized for the 15-minute Cloud Scheduler calls:
+    1. First, does a lightweight "has anything changed?" check per entity
+    2. Only runs full sync for entities with detected changes
+    3. Skips entirely if nothing has changed (saves API calls and compute)
     
     Uses sync locking to prevent overlapping sync cycles.
     Records audit trail of all sync operations.
@@ -390,13 +403,30 @@ async def sync_everything(background_tasks: BackgroundTasks):
     async with _sync_lock:
         _last_sync_start = datetime.now(timezone.utc)
         results = {}
+        skipped_entities = []
+        synced_entities = []
         
         # Generate a unique run_id for this sync cycle (for audit)
         import uuid
         run_id = str(uuid.uuid4())
-        logger.info(f"Starting full sync cycle via API (run_id: {run_id[:8]})")
+        logger.info(f"Starting LEAN sync cycle (run_id: {run_id[:8]})")
 
-        async def run_step(name, func, *args, **kwargs):
+        # =====================================================================
+        # PHASE 1: Lightweight change detection for all entities
+        # =====================================================================
+        logger.info("Phase 1: Checking for changes across all entities...")
+        change_checks = await run_in_threadpool(check_all_entities, supabase)
+        
+        for entity, check in change_checks.items():
+            if check.has_changes:
+                synced_entities.append(entity)
+            else:
+                skipped_entities.append(entity)
+        
+        logger.info(f"Change detection complete: {len(synced_entities)} need sync, {len(skipped_entities)} skipped")
+
+        async def run_step(name, func, *args, entity_name=None, **kwargs):
+            """Run a sync step and update cursor on success."""
             step_start = datetime.now(timezone.utc)
             try:
                 logger.info(f"Starting {name}...")
@@ -407,38 +437,58 @@ async def sync_everything(background_tasks: BackgroundTasks):
                 results[name] = {"status": "success", "data": res}
                 # Reset failure counter on success
                 reset_failure_count(name)
+                
+                # Update sync cursor on success
+                if entity_name:
+                    await run_in_threadpool(update_cursor_after_sync, supabase, entity_name, datetime.now(timezone.utc))
+                    
             except Exception as e:
                 logger.error(f"{name} failed: {e}")
                 results[name] = {"status": "error", "error": str(e)}
-                # Error notifications are disabled - errors go to sync_logs table
 
-        # === CONTACTS SYNC ===
+        # =====================================================================
+        # PHASE 2: Run syncs only for entities with changes
+        # =====================================================================
+        
+        # === CONTACTS SYNC (always run - has Google component) ===
         await run_step("notion_to_supabase", sync_notion_to_supabase)
         await run_step("google_sync", sync_contacts)
         await run_step("supabase_to_notion", sync_supabase_to_notion)
         
-        # === MEETINGS SYNC ===
-        await run_step("meetings_sync", run_meeting_sync, full_sync=False, since_hours=24)
+        # === MEETINGS SYNC (conditional) ===
+        if 'meetings' in synced_entities:
+            await run_step("meetings_sync", run_meeting_sync, full_sync=False, since_hours=24, entity_name='meetings')
+        else:
+            results["meetings_sync"] = {"status": "skipped", "reason": "no_changes"}
         
-        # === TASKS SYNC ===
-        await run_step("tasks_sync", run_task_sync, full_sync=False, since_hours=24)
+        # === TASKS SYNC (conditional) ===
+        if 'tasks' in synced_entities:
+            await run_step("tasks_sync", run_task_sync, full_sync=False, since_hours=24, entity_name='tasks')
+        else:
+            results["tasks_sync"] = {"status": "skipped", "reason": "no_changes"}
         
-        # === REFLECTIONS SYNC ===
-        await run_step("reflections_sync", run_reflection_sync, full_sync=False, since_hours=24)
+        # === REFLECTIONS SYNC (conditional) ===
+        if 'reflections' in synced_entities:
+            await run_step("reflections_sync", run_reflection_sync, full_sync=False, since_hours=24, entity_name='reflections')
+        else:
+            results["reflections_sync"] = {"status": "skipped", "reason": "no_changes"}
         
-        # === JOURNALS SYNC ===
-        await run_step("journals_sync", run_journal_sync, full_sync=False, since_hours=24)
+        # === JOURNALS SYNC (conditional) ===
+        if 'journals' in synced_entities:
+            await run_step("journals_sync", run_journal_sync, full_sync=False, since_hours=24, entity_name='journals')
+        else:
+            results["journals_sync"] = {"status": "skipped", "reason": "no_changes"}
         
-        # === CALENDAR SYNC ===
+        # === CALENDAR SYNC (always run - external source) ===
         await run_step("calendar_sync", run_calendar_sync)
 
-        # === GMAIL SYNC ===
+        # === GMAIL SYNC (always run - external source) ===
         await run_step("gmail_sync", run_gmail_sync)
         
-        # === BOOKS SYNC (Notion → Supabase) ===
+        # === BOOKS SYNC (Notion → Supabase, one-way) ===
         await run_step("books_sync", run_books_sync, full_sync=False, since_hours=24)
         
-        # === HIGHLIGHTS SYNC (Notion → Supabase) ===
+        # === HIGHLIGHTS SYNC (Notion → Supabase, one-way) ===
         await run_step("highlights_sync", run_highlights_sync, full_sync=False, hours=24)
         
         # === BEEPER SYNC (WhatsApp/Telegram/LinkedIn messages) ===
@@ -449,8 +499,9 @@ async def sync_everything(background_tasks: BackgroundTasks):
         _last_sync_end = datetime.now(timezone.utc)
         _last_sync_results = results
         
-        # Count successes and errors for summary
+        # Count successes, skips, and errors for summary
         success_count = sum(1 for r in results.values() if r.get("status") == "success")
+        skipped_count = sum(1 for r in results.values() if r.get("status") == "skipped")
         error_count = sum(1 for r in results.values() if r.get("status") == "error")
         
         # Record audit for this sync cycle - ALL entities
@@ -665,15 +716,28 @@ async def sync_everything(background_tasks: BackgroundTasks):
         except Exception as e:
             logger.error(f"Failed to record sync audit: {e}", exc_info=True)
         
-        logger.info(f"Full sync cycle complete: {success_count} success, {error_count} errors")
+        logger.info(f"LEAN sync complete: {success_count} synced, {skipped_count} skipped (no changes), {error_count} errors")
         
         return {
             "status": "completed",
             "run_id": run_id,
+            "mode": "lean",
             "summary": {
                 "success_count": success_count,
+                "skipped_count": skipped_count,
                 "error_count": error_count,
-                "duration_seconds": (_last_sync_end - _last_sync_start).total_seconds()
+                "duration_seconds": (_last_sync_end - _last_sync_start).total_seconds(),
+                "entities_synced": synced_entities,
+                "entities_skipped": skipped_entities,
+            },
+            "change_detection": {
+                entity: {
+                    "has_changes": check.has_changes,
+                    "notion_changes": check.notion_changes,
+                    "supabase_changes": check.supabase_changes,
+                    "check_duration_ms": round(check.check_duration_ms, 1)
+                }
+                for entity, check in change_checks.items()
             },
             "results": results
         }
