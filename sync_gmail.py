@@ -300,8 +300,16 @@ class GmailSync:
             total_processed = len(new_email_records) + len(update_records)
             if new_history_id:
                 await self.save_history_id(new_history_id)
-            await log_sync_event("gmail_sync", "success", f"Synced {total_processed} emails")
-            return {"status": "success", "count": total_processed}
+            
+            # Enhanced logging with breakdown
+            sync_msg = f"Gmail→Supabase: {len(new_email_records)} new, {len(update_records)} updated"
+            await log_sync_event("gmail_sync", "success", sync_msg)
+            return {
+                "status": "success", 
+                "count": total_processed, 
+                "new": len(new_email_records), 
+                "updated": len(update_records)
+            }
 
         except Exception as e:
             logger.error(f"Gmail sync failed: {str(e)}")
