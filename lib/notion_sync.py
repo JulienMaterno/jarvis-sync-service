@@ -244,17 +244,23 @@ def sync_notion_deletions_to_supabase(last_synced_at: Optional[str]):
             
     logger.info(f"Processed {deleted_count} Notion deletions.")
 
-def sync_notion_to_supabase(full_sync: bool = False):
+def sync_notion_to_supabase(full_sync: bool = False, check_deletions: bool = None):
     """
     Syncs contacts from Notion to Supabase.
     
     Args:
         full_sync: If True, sync all contacts. If False, only sync recently changed.
+        check_deletions: If True, check for archived Notion pages. Defaults to full_sync value.
+                        Set to False for scheduled incremental syncs to improve performance.
     
     Returns:
         Dict with synced, created, skipped, errors counts
     """
     logger.info(f"Starting Notion -> Supabase sync (mode: {'full' if full_sync else 'incremental'})...")
+    
+    # Default: only check deletions on full sync (saves ~60s of API calls)
+    if check_deletions is None:
+        check_deletions = full_sync
     
     # Get current counts for safety valve
     existing_supabase = supabase.table("contacts").select("id").is_("deleted_at", "null").execute()
@@ -267,7 +273,11 @@ def sync_notion_to_supabase(full_sync: bool = False):
         last_synced_at = res.data[0]["notion_updated_at"] if res.data and res.data[0].get("notion_updated_at") else None
     
     # 1. Handle Deletions (Archived in Notion -> Soft delete in Supabase)
-    sync_notion_deletions_to_supabase(last_synced_at)
+    # Skip for incremental syncs to save API calls (127 contacts = 127 API calls = ~60s)
+    if check_deletions:
+        sync_notion_deletions_to_supabase(last_synced_at)
+    else:
+        logger.info("Skipping deletion check for incremental sync (run full sync periodically)")
     
     # Build filter for Notion query
     filter_params = None
