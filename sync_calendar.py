@@ -135,11 +135,13 @@ class CalendarSync:
             if upsert_data:
                 # Upsert in batches of 100 to avoid payload limits
                 batch_size = 100
+                total_upserted = 0
                 for i in range(0, len(upsert_data), batch_size):
                     batch = upsert_data[i:i+batch_size]
                     response = supabase.table("calendar_events").upsert(
                         batch, on_conflict="google_event_id"
                     ).execute()
+                    total_upserted += len(batch)
                     logger.info(f"Upserted batch {i//batch_size + 1}: {len(batch)} events")
 
             # Save sync token for next time
@@ -154,8 +156,16 @@ class CalendarSync:
                 except Exception as e:
                     logger.warning(f"Failed to clear invalid token: {e}")
 
+            # Log and return results
+            # Note: With upsert we can't distinguish created vs updated without pre-checking
+            # But incremental sync (sync_token) means most are updates, full sync means mostly creates/updates
             await log_sync_event("calendar_sync", "success", f"Synced {len(upsert_data)} events")
-            return {"status": "success", "count": len(upsert_data)}
+            return {
+                "status": "success", 
+                "count": len(upsert_data),
+                "sync_type": "incremental" if sync_token and not full_sync else "full",
+                "events_processed": len(upsert_data)
+            }
 
         except Exception as e:
             logger.error(f"Calendar sync failed: {str(e)}")
