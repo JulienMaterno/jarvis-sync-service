@@ -232,10 +232,12 @@ class ReflectionsSyncService(TwoWaySyncService):
                     else:
                         stats.created += 1
                     
-                    # Extract content from page blocks
+                    # Extract content from page blocks (returns tuple: text, has_unsupported)
                     try:
-                        content = self.notion.extract_page_content(notion_id)
-                        data['content'] = content
+                        content_text, has_unsupported = self.notion.extract_page_content(notion_id)
+                        data['content'] = content_text
+                        if has_unsupported:
+                            self.logger.info(f"Reflection '{data.get('title')}' has unsupported Notion blocks")
                     except Exception as e:
                         self.logger.warning(f"Failed to extract content: {e}")
                         data['content'] = ''
