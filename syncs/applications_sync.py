@@ -315,10 +315,32 @@ class ApplicationsSyncService(TwoWaySyncService):
                 metrics.supabase_api_calls += 1
             
             # Filter to records that need syncing to Notion
-            records_to_sync = [
-                r for r in supabase_records 
-                if not r.get('notion_page_id') or r.get('last_sync_source') == 'supabase'
-            ]
+            # A record needs syncing if:
+            # 1. It has no notion_page_id (new record), OR
+            # 2. last_sync_source is 'supabase' (explicitly marked), OR
+            # 3. updated_at > notion_updated_at (updated locally since last sync)
+            records_to_sync = []
+            for r in supabase_records:
+                needs_sync = False
+                
+                if not r.get('notion_page_id'):
+                    # New record - needs to be created in Notion
+                    needs_sync = True
+                elif r.get('last_sync_source') == 'supabase':
+                    # Explicitly marked for sync
+                    needs_sync = True
+                else:
+                    # Check if updated_at > notion_updated_at (local changes)
+                    comparison = self.compare_timestamps(
+                        r.get('updated_at'),
+                        r.get('notion_updated_at')
+                    )
+                    if comparison > 0:
+                        needs_sync = True
+                        self.logger.info(f"Application '{r.get('name')}' has local changes (updated_at > notion_updated_at)")
+                
+                if needs_sync:
+                    records_to_sync.append(r)
             
             self.logger.info(f"Found {len(records_to_sync)} applications to sync to Notion")
             

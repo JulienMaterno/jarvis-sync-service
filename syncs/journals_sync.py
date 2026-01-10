@@ -380,11 +380,30 @@ class JournalsSyncService(TwoWaySyncService):
             if metrics:
                 metrics.supabase_api_calls += 1
             
-            # Filter to records without notion_page_id (new) or updated locally
-            records_to_sync = [
-                r for r in supabase_records 
-                if not r.get('notion_page_id') or r.get('last_sync_source') == 'supabase'
-            ]
+            # Filter to records that need syncing to Notion
+            # A record needs syncing if:
+            # 1. It has no notion_page_id (new record), OR
+            # 2. last_sync_source is 'supabase' (explicitly marked), OR
+            # 3. updated_at > notion_updated_at (updated locally since last sync)
+            records_to_sync = []
+            for r in supabase_records:
+                needs_sync = False
+                
+                if not r.get('notion_page_id'):
+                    needs_sync = True
+                elif r.get('last_sync_source') == 'supabase':
+                    needs_sync = True
+                else:
+                    comparison = self.compare_timestamps(
+                        r.get('updated_at'),
+                        r.get('notion_updated_at')
+                    )
+                    if comparison > 0:
+                        needs_sync = True
+                        self.logger.info(f"Journal '{r.get('title')}' has local changes")
+                
+                if needs_sync:
+                    records_to_sync.append(r)
             
             self.logger.info(f"Found {len(records_to_sync)} journals to sync to Notion")
             
