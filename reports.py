@@ -85,6 +85,42 @@ def get_reading_data_for_journal() -> dict:
     return reading_data
 
 
+def _build_fallback_journal_prompt(activity_data: dict, today, user_tz_str: str) -> dict:
+    """Build a basic journal prompt when AI service is unavailable."""
+    summary = activity_data.get("summary", {})
+    meetings_count = summary.get("meetings_count", 0)
+    tasks_completed = summary.get("tasks_completed_count", 0)
+    tasks_pending = summary.get("tasks_pending_count", 0)
+    
+    # Build highlights from actual data
+    highlights = []
+    if meetings_count > 0:
+        highlights.append(f"📅 {meetings_count} meeting{'s' if meetings_count != 1 else ''} today")
+    if tasks_completed > 0:
+        highlights.append(f"✅ {tasks_completed} task{'s' if tasks_completed != 1 else ''} completed")
+    if tasks_pending > 0:
+        highlights.append(f"📋 {tasks_pending} task{'s' if tasks_pending != 1 else ''} pending")
+    
+    highlights_text = "\n".join(f"• {h}" for h in highlights) if highlights else "• No major activities logged"
+    
+    message = f"""📓 **Evening Journal**
+_{today.strftime('%A, %B %d, %Y')}_
+
+Time to reflect on your day!
+
+**Today's Activity:**
+{highlights_text}
+
+_Reply with a voice note or text to add your thoughts about the day._"""
+    
+    return {
+        "status": "fallback",
+        "message": message,
+        "highlights": highlights,
+        "journal_content": ""  # No AI content in fallback
+    }
+
+
 async def generate_evening_journal_prompt():
     """
     Enhanced evening journal generation that:
@@ -285,7 +321,11 @@ async def generate_evening_journal_prompt():
         # 3. CALL INTELLIGENCE SERVICE FOR AI ANALYSIS
         # =================================================================
         
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        result = {}  # Default empty result
+        
+        # Use 180s timeout - Intelligence Service can take time for AI analysis
+        # Also handles Cloud Run cold starts
+        async with httpx.AsyncClient(timeout=180.0) as client:
             # Try new endpoint first, fallback to legacy
             try:
                 logger.info("Calling Intelligence Service for evening analysis...")
@@ -317,21 +357,10 @@ async def generate_evening_journal_prompt():
                     result = response.json()
                 else:
                     raise
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 404:
-                    # Fallback to legacy endpoint
-                    logger.info("Falling back to legacy journal endpoint")
-                    response = await client.post(
-                        f"{INTELLIGENCE_SERVICE_URL}/api/v1/journal/evening-prompt",
-                        json={
-                            "activity_data": activity_data,
-                            "timezone": user_tz_str  # Use user's configured timezone
-                        }
-                    )
-                    response.raise_for_status()
-                    result = response.json()
-                else:
-                    raise
+            except httpx.ReadTimeout:
+                logger.error("Intelligence Service timed out after 180s - using fallback prompt")
+                # Generate a basic fallback prompt without AI
+                result = _build_fallback_journal_prompt(activity_data, today, user_tz_str)
         
         # =================================================================
         # 3. CREATE/UPDATE JOURNAL ENTRY IN SUPABASE
