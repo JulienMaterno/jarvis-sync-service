@@ -30,6 +30,10 @@ from syncs.journals_sync import run_sync as run_journal_sync
 from sync_books import run_sync as run_books_sync
 from sync_highlights import run_sync as run_highlights_sync
 
+# Import applications and LinkedIn posts sync
+from syncs.applications_sync import run_sync as run_applications_sync
+from syncs.linkedin_posts_sync import run_sync as run_linkedin_posts_sync
+
 # Import ActivityWatch sync
 from sync_activitywatch import run_activitywatch_sync, ActivityWatchSync, format_activity_summary_for_journal
 
@@ -490,6 +494,12 @@ async def sync_everything(background_tasks: BackgroundTasks):
         
         # === HIGHLIGHTS SYNC (Notion → Supabase, one-way) ===
         await run_step("highlights_sync", run_highlights_sync, full_sync=False, hours=24)
+        
+        # === APPLICATIONS SYNC (bidirectional) ===
+        await run_step("applications_sync", run_applications_sync, full_sync=False, since_hours=24)
+        
+        # === LINKEDIN POSTS SYNC (bidirectional) ===
+        await run_step("linkedin_posts_sync", run_linkedin_posts_sync, full_sync=False, since_hours=24)
         
         # === BEEPER SYNC (WhatsApp/Telegram/LinkedIn messages) ===
         # This gracefully handles offline laptop - just skips and catches up next run
@@ -1499,6 +1509,48 @@ async def sync_highlights(full: bool = False, hours: int = 24):
         return result
     except Exception as e:
         logger.error(f"Highlights sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Applications Sync ---
+
+@app.post("/sync/applications")
+async def sync_applications(full: bool = False, hours: int = 24):
+    """
+    Sync applications (grants, fellowships, accelerators) bidirectionally.
+    Source: Notion Applications database
+    
+    Args:
+        full: If True, sync all applications. If False, only recently updated.
+        hours: For incremental sync, how many hours to look back.
+    """
+    try:
+        logger.info(f"Starting applications sync via API (full={full}, hours={hours})")
+        result = await run_in_threadpool(run_applications_sync, full_sync=full, since_hours=hours)
+        return result
+    except Exception as e:
+        logger.error(f"Applications sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- LinkedIn Posts Sync ---
+
+@app.post("/sync/linkedin-posts")
+async def sync_linkedin_posts(full: bool = False, hours: int = 24):
+    """
+    Sync LinkedIn posts bidirectionally.
+    Source: Notion LinkedIn Posts database
+    
+    Args:
+        full: If True, sync all posts. If False, only recently updated.
+        hours: For incremental sync, how many hours to look back.
+    """
+    try:
+        logger.info(f"Starting LinkedIn posts sync via API (full={full}, hours={hours})")
+        result = await run_in_threadpool(run_linkedin_posts_sync, full_sync=full, since_hours=hours)
+        return result
+    except Exception as e:
+        logger.error(f"LinkedIn posts sync failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
