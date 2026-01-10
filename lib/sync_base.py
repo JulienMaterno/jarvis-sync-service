@@ -1654,9 +1654,20 @@ class TwoWaySyncService(BaseSyncService):
                     
                     if notion_page_id:
                         # Update existing
-                        self.notion.update_page(notion_page_id, notion_props)
+                        updated_page = self.notion.update_page(notion_page_id, notion_props)
                         if metrics:
                             metrics.notion_api_calls += 1
+                        
+                        # Update Supabase with new Notion timestamp to prevent re-sync loops
+                        # This is CRITICAL: without this, `last_sync_source` stays 'supabase'
+                        # and future Notion edits would be skipped!
+                        self.supabase.update(record['id'], {
+                            'notion_updated_at': updated_page.get('last_edited_time'),
+                            'last_sync_source': 'notion'
+                        })
+                        if metrics:
+                            metrics.supabase_api_calls += 1
+                        
                         stats.updated += 1
                     else:
                         # Create new

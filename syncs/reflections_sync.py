@@ -311,7 +311,7 @@ class ReflectionsSyncService(TwoWaySyncService):
                     
                     if notion_page_id:
                         # Update existing page
-                        self.notion.update_page(notion_page_id, notion_props)
+                        updated_page = self.notion.update_page(notion_page_id, notion_props)
                         
                         # Update content blocks
                         blocks = self._build_content_blocks(record)
@@ -327,8 +327,10 @@ class ReflectionsSyncService(TwoWaySyncService):
                             except Exception as e:
                                 self.logger.warning(f"Failed to update content blocks: {e}")
                         
-                        # Mark as synced from notion (so future Notion edits flow back)
+                        # Update Supabase with new Notion timestamp to prevent re-sync loops
+                        # This is CRITICAL: without this, future Notion edits would be skipped!
                         self.supabase.update(record['id'], {
+                            'notion_updated_at': updated_page.get('last_edited_time'),
                             'last_sync_source': 'notion'
                         })
                         

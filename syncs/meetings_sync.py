@@ -713,12 +713,20 @@ class MeetingsSyncService(TwoWaySyncService):
                     
                     if notion_page_id:
                         # Update existing page
-                        self.notion.update_page(notion_page_id, notion_props)
+                        updated_page = self.notion.update_page(notion_page_id, notion_props)
                         if metrics:
                             metrics.notion_api_calls += 1
                         
                         # Note: We don't update content blocks for existing pages to avoid
                         # overwriting AI meeting notes or other manual edits
+                        
+                        # Update Supabase with new Notion timestamp to prevent re-sync loops
+                        # This is CRITICAL: without this, `last_sync_source` stays 'supabase'
+                        # and future Notion edits would be skipped!
+                        self.supabase.update(record['id'], {
+                            'notion_updated_at': updated_page.get('last_edited_time'),
+                            'last_sync_source': 'notion'
+                        })
                         
                         stats.updated += 1
                     else:
