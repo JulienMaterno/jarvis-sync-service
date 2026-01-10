@@ -505,11 +505,47 @@ class ContactsSyncService(TwoWaySyncService):
                 cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
                 supabase_records = self.supabase.select_updated_since(cutoff)
             
-            # Filter to records without notion_page_id (need to create) or updated locally
-            records_to_sync = [
-                r for r in supabase_records 
-                if not r.get('notion_page_id') or r.get('last_sync_source') == 'supabase'
-            ]
+            # Filter to records that need syncing:
+            # 1. No notion_page_id (new record)
+            # 2. last_sync_source == 'supabase' (explicitly marked)
+            # 3. updated_at > notion_updated_at (updated locally since last sync)
+            records_to_sync = []
+            for r in supabase_records:
+                needs_sync = False
+                
+                if not r.get('notion_page_id'):
+                    # New record - needs sync
+                    needs_sync = True
+                elif r.get('last_sync_source') == 'supabase':
+                    # Explicitly marked - needs sync
+                    needs_sync = True
+                else:
+                    # Check timestamp comparison: updated_at > notion_updated_at
+                    updated_at = r.get('updated_at')
+                    notion_updated_at = r.get('notion_updated_at')
+                    
+                    if updated_at and notion_updated_at:
+                        # Parse timestamps for comparison
+                        from dateutil.parser import parse as parse_dt
+                        try:
+                            local_ts = parse_dt(updated_at) if isinstance(updated_at, str) else updated_at
+                            notion_ts = parse_dt(notion_updated_at) if isinstance(notion_updated_at, str) else notion_updated_at
+                            
+                            # Ensure both are timezone-aware
+                            if local_ts.tzinfo is None:
+                                local_ts = local_ts.replace(tzinfo=timezone.utc)
+                            if notion_ts.tzinfo is None:
+                                notion_ts = notion_ts.replace(tzinfo=timezone.utc)
+                            
+                            # 5-second buffer to account for timestamp precision
+                            if (local_ts - notion_ts).total_seconds() > 5:
+                                needs_sync = True
+                                self.logger.debug(f"Contact {r.get('id')[:8]}: local update ({local_ts}) > notion ({notion_ts})")
+                        except Exception as e:
+                            self.logger.warning(f"Timestamp comparison failed for {r.get('id')}: {e}")
+                
+                if needs_sync:
+                    records_to_sync.append(r)
             
             self.logger.info(f"Found {len(records_to_sync)} Supabase records to sync to Notion")
             
