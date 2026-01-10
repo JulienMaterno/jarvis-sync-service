@@ -1627,13 +1627,43 @@ class TwoWaySyncService(BaseSyncService):
             if metrics:
                 metrics.supabase_api_calls += 1
             
-            # Filter to records without notion_page_id (new) or updated locally
-            # Also filter out soft-deleted records
-            records_to_sync = [
-                r for r in supabase_records 
-                if (not r.get('notion_page_id') or r.get('last_sync_source') == 'supabase')
-                and not r.get('deleted_at')
-            ]
+            # Filter to records that need syncing to Notion
+            # FIXED: Don't rely on last_sync_source=='supabase' - it's never set when editing directly in Supabase!
+            # Instead, compare updated_at vs notion_updated_at to detect local changes
+            records_to_sync = []
+            for r in supabase_records:
+                # Skip soft-deleted records
+                if r.get('deleted_at'):
+                    continue
+                
+                # New records without notion_page_id always need syncing
+                if not r.get('notion_page_id'):
+                    records_to_sync.append(r)
+                    continue
+                
+                # For existing records, check if Supabase is newer than last Notion sync
+                updated_at = r.get('updated_at')
+                notion_updated_at = r.get('notion_updated_at')
+                
+                if not notion_updated_at:
+                    # No notion timestamp means it was created but never synced back
+                    records_to_sync.append(r)
+                    continue
+                
+                # Parse timestamps and compare
+                try:
+                    from dateutil import parser as date_parser
+                    local_time = date_parser.isoparse(updated_at) if isinstance(updated_at, str) else updated_at
+                    notion_time = date_parser.isoparse(notion_updated_at) if isinstance(notion_updated_at, str) else notion_updated_at
+                    
+                    # If Supabase was updated AFTER the last Notion sync, it needs syncing
+                    # Add 5 second buffer to account for sync timing
+                    if local_time > notion_time + timedelta(seconds=5):
+                        records_to_sync.append(r)
+                except Exception as e:
+                    self.logger.warning(f"Could not compare timestamps for record {r.get('id')}: {e}")
+                    # When in doubt, sync it
+                    records_to_sync.append(r)
             
             self.logger.info(f"Found {len(records_to_sync)} records to sync to Notion")
             
