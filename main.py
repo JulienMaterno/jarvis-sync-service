@@ -790,6 +790,39 @@ async def trigger_backup():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.post("/backup/full")
+async def trigger_full_backup(background_tasks: BackgroundTasks):
+    """
+    Triggers a FULL backup of ALL Supabase tables.
+    
+    ⚠️ CRITICAL: Supabase FREE tier has NO automatic backups!
+    This endpoint should be called daily via Cloud Scheduler.
+    
+    Tables backed up:
+    - Critical: contacts, meetings, tasks, journals, reflections, transcripts
+    - Important: calendar_events, emails, beeper_chats, beeper_messages
+    - Optional: books, highlights, applications, linkedin_posts
+    
+    Backup stored in: Supabase Storage bucket "backups" + optional GCS
+    """
+    from backup_full import run_full_backup
+    
+    async def run_backup():
+        try:
+            result = await run_full_backup()
+            logger.info(f"Full backup completed: {result}")
+        except Exception as e:
+            logger.error(f"Full backup failed: {e}", exc_info=True)
+    
+    background_tasks.add_task(run_backup)
+    return {
+        "status": "queued", 
+        "message": "Full backup started in background",
+        "warning": "Supabase FREE tier has no automatic backups - this is your only backup!"
+    }
+
+
 # --- Meeting Sync ---
 
 @app.post("/sync/meetings")
