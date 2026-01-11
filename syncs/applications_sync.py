@@ -64,6 +64,9 @@ APPLICATION_TYPES = ['Grant', 'Fellowship', 'Program', 'Accelerator', 'Residency
 # Valid statuses
 APPLICATION_STATUSES = ['Not Started', 'Researching', 'In Progress', 'Applied', 'Accepted']
 
+# Valid locations (where the program is based/remote)
+APPLICATION_LOCATIONS = ['Remote', 'Singapore', 'USA', 'Europe', 'UK', 'Global', 'Asia', 'Other']
+
 
 # ============================================================================
 # APPLICATIONS SYNC SERVICE
@@ -127,6 +130,7 @@ class ApplicationsSyncService(TwoWaySyncService):
             'website': NotionPropertyExtractor.url(props, 'Website'),
             'grant_amount': NotionPropertyExtractor.rich_text(props, 'Grant Amount'),
             'deadline': NotionPropertyExtractor.date(props, 'Deadline'),
+            'location': NotionPropertyExtractor.select(props, 'Location'),  # New field
             'context': NotionPropertyExtractor.rich_text(props, 'Context'),
             'notes': NotionPropertyExtractor.rich_text(props, 'Notes'),
         }
@@ -173,6 +177,11 @@ class ApplicationsSyncService(TwoWaySyncService):
         deadline = supabase_record.get('deadline')
         if deadline:
             properties['Deadline'] = NotionPropertyBuilder.date(deadline)
+        
+        # Location (select) - New field
+        location = supabase_record.get('location')
+        if location and location in APPLICATION_LOCATIONS:
+            properties['Location'] = NotionPropertyBuilder.select(location)
         
         # Context (rich_text)
         context = supabase_record.get('context')
