@@ -437,6 +437,12 @@ class ContactsSyncService(TwoWaySyncService):
                     existing_record = existing_by_notion_id.get(notion_id)
                     
                     if existing_record:
+                        # Skip if Supabase has local changes pending sync to Notion
+                        if existing_record.get('last_sync_source') == 'supabase':
+                            self.logger.info(f"Skipping contact '{data.get('first_name')} {data.get('last_name')}' - has local changes pending")
+                            stats.skipped += 1
+                            continue
+                        
                         # Already linked - check if update needed
                         comparison = self.compare_timestamps(
                             notion_record.get('last_edited_time'),
