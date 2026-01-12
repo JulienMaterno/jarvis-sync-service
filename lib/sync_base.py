@@ -61,15 +61,23 @@ def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     """Create a consistently formatted logger."""
     logger = logging.getLogger(name)
     logger.setLevel(level)
-    
+
     if not logger.handlers:
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter(
             '%(asctime)s [%(levelname)s] %(name)s: %(message)s'
         ))
         logger.addHandler(handler)
-    
+
     return logger
+
+
+def format_exception(e: Exception) -> str:
+    """Format exception with type name when str(e) is empty (e.g., timeouts)."""
+    msg = str(e)
+    if not msg:
+        msg = f"{type(e).__name__} (no message)"
+    return msg
 
 
 # ============================================================================
@@ -1182,8 +1190,8 @@ class BaseSyncService(ABC, Generic[T]):
         return True, ""
     
     def compare_timestamps(
-        self, 
-        source_updated: Optional[str], 
+        self,
+        source_updated: Optional[str],
         dest_updated: Optional[str],
         buffer_seconds: int = 5
     ) -> int:
@@ -1193,19 +1201,19 @@ class BaseSyncService(ABC, Generic[T]):
         """
         if not source_updated or not dest_updated:
             return 0
-        
+
         try:
             # Parse timestamps
             def parse_ts(ts: str) -> datetime:
                 if ts.endswith('Z'):
                     ts = ts[:-1] + '+00:00'
                 return datetime.fromisoformat(ts)
-            
+
             source_dt = parse_ts(source_updated)
             dest_dt = parse_ts(dest_updated)
-            
+
             diff = (source_dt - dest_dt).total_seconds()
-            
+
             if abs(diff) <= buffer_seconds:
                 return 0
             return 1 if diff > 0 else -1
@@ -1345,9 +1353,49 @@ class OneWaySyncService(BaseSyncService):
 class TwoWaySyncService(BaseSyncService):
     """
     Bidirectional sync between Notion and Supabase.
-    
+
     Use for: Meetings, Tasks, Reflections, Journals, etc.
     """
+
+    def filter_records_needing_notion_sync(self, records: List[Dict], name_field: str = 'title') -> List[Dict]:
+        """
+        Filter Supabase records that need syncing to Notion.
+
+        A record needs syncing if:
+        1. It has no notion_page_id (new record), OR
+        2. last_sync_source is 'supabase' (explicitly marked for sync), OR
+        3. updated_at > notion_updated_at (local changes since last sync)
+
+        Args:
+            records: List of Supabase records
+            name_field: Field name to use for logging (default: 'title')
+
+        Returns:
+            List of records that need syncing to Notion
+        """
+        result = []
+        for r in records:
+            # Skip soft-deleted records
+            if r.get('deleted_at'):
+                continue
+
+            if not r.get('notion_page_id'):
+                # New record - needs to be created in Notion
+                result.append(r)
+            elif r.get('last_sync_source') == 'supabase':
+                # Explicitly marked for sync
+                result.append(r)
+            else:
+                # Check if updated_at > notion_updated_at (local changes)
+                comparison = self.compare_timestamps(
+                    r.get('updated_at'),
+                    r.get('notion_updated_at')
+                )
+                if comparison > 0:
+                    name = r.get(name_field, r.get('name', 'Unknown'))
+                    self.logger.debug(f"Record '{name}' has local changes")
+                    result.append(r)
+        return result
     
     def __init__(
         self,
@@ -1570,9 +1618,16 @@ class TwoWaySyncService(BaseSyncService):
                 try:
                     notion_id = self.get_source_id(notion_record)
                     existing_record = existing.get(notion_id)
-                    
+
                     # Compare timestamps if record exists
                     if existing_record:
+                        # Skip if Supabase has local changes pending sync TO Notion
+                        # This prevents overwriting local edits before they sync out
+                        if existing_record.get('last_sync_source') == 'supabase':
+                            self.logger.debug(f"Skipping {notion_id} - has local Supabase changes pending sync to Notion")
+                            stats.skipped += 1
+                            continue
+
                         comparison = self.compare_timestamps(
                             notion_record.get('last_edited_time'),
                             existing_record.get('notion_updated_at')
@@ -1598,18 +1653,18 @@ class TwoWaySyncService(BaseSyncService):
                         metrics.supabase_api_calls += 1
                     
                 except Exception as e:
-                    self.logger.error(f"Error syncing from Notion: {e}")
+                    self.logger.error(f"Error syncing from Notion: {format_exception(e)}")
                     stats.errors += 1
-            
+
             return SyncResult(
                 success=True,
                 direction="notion_to_supabase",
                 stats=stats,
                 elapsed_seconds=time.time() - start_time
             )
-            
+
         except Exception as e:
-            return SyncResult(success=False, direction="notion_to_supabase", error_message=str(e))
+            return SyncResult(success=False, direction="notion_to_supabase", error_message=format_exception(e))
     
     def _sync_supabase_to_notion(self, full_sync: bool, since_hours: int, metrics: Optional[SyncMetrics] = None) -> SyncResult:
         """Sync from Supabase to Notion with metrics tracking."""
@@ -1715,9 +1770,9 @@ class TwoWaySyncService(BaseSyncService):
                         stats.created += 1
                     
                 except Exception as e:
-                    self.logger.error(f"Error syncing to Notion: {e}")
+                    self.logger.error(f"Error syncing to Notion: {format_exception(e)}")
                     stats.errors += 1
-            
+
             return SyncResult(
                 success=True,
                 direction="supabase_to_notion",
@@ -1726,7 +1781,7 @@ class TwoWaySyncService(BaseSyncService):
             )
             
         except Exception as e:
-            return SyncResult(success=False, direction="supabase_to_notion", error_message=str(e))
+            return SyncResult(success=False, direction="supabase_to_notion", error_message=format_exception(e))
 
 
 # ============================================================================

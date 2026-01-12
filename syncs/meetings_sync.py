@@ -381,13 +381,7 @@ class MeetingsSyncService(TwoWaySyncService):
         
         return True, ""
     
-    def compare_timestamps(self, source_ts: Optional[str], dest_ts: Optional[str]) -> int:
-        """Compare timestamps, returning -1, 0, or 1."""
-        if not source_ts:
-            return -1
-        if not dest_ts:
-            return 1
-        return 1 if source_ts > dest_ts else (-1 if source_ts < dest_ts else 0)
+    # Uses base class compare_timestamps with proper ISO parsing and 5-second buffer
     
     def convert_from_source(self, notion_record: Dict) -> Dict[str, Any]:
         """

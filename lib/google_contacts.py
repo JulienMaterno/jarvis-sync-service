@@ -1,10 +1,57 @@
 import os
 import httpx
 import asyncio
+import logging
 from typing import Dict, Any, List, Optional
 from lib.google_auth import get_access_token
 
 GOOGLE_PEOPLE_API_BASE = "https://people.googleapis.com/v1"
+
+# Configure timeout and retry settings
+# Per-request timeout: 60s total (for paginated requests that may have large payloads), 15s connect
+HTTP_TIMEOUT = httpx.Timeout(60.0, connect=15.0)
+MAX_RETRIES = 3
+RETRY_DELAY = 1.0  # seconds
+
+logger = logging.getLogger(__name__)
+
+
+def format_exception(e: Exception) -> str:
+    """Format exception with type name when str(e) is empty (e.g., timeouts)."""
+    msg = str(e)
+    if not msg:
+        msg = f"{type(e).__name__} (no message)"
+    return msg
+
+
+async def retry_async(func, *args, max_retries=MAX_RETRIES, **kwargs):
+    """Retry an async function with exponential backoff for transient errors."""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return await func(*args, **kwargs)
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                delay = RETRY_DELAY * (2 ** attempt)
+                logger.warning(f"Transient error (attempt {attempt + 1}/{max_retries}): {format_exception(e)}. Retrying in {delay}s...")
+                await asyncio.sleep(delay)
+            else:
+                logger.error(f"Max retries reached: {format_exception(e)}")
+                raise
+        except httpx.HTTPStatusError as e:
+            # Retry on 429 (rate limit) and 5xx errors
+            if e.response.status_code == 429 or e.response.status_code >= 500:
+                last_error = e
+                if attempt < max_retries - 1:
+                    delay = RETRY_DELAY * (2 ** attempt)
+                    logger.warning(f"HTTP {e.response.status_code} (attempt {attempt + 1}/{max_retries}). Retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                else:
+                    raise
+            else:
+                raise
+    raise last_error
 
 async def get_contact_groups(access_token: str) -> Dict[str, str]:
     """
@@ -13,9 +60,9 @@ async def get_contact_groups(access_token: str) -> Dict[str, str]:
     """
     headers = {"Authorization": f"Bearer {access_token}"}
     groups_mapping = {}
-    
-    async with httpx.AsyncClient() as client:
-        # We might need pagination here too if there are many groups, 
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        # We might need pagination here too if there are many groups,
         # but usually there are few.
         response = await client.get(
             f"{GOOGLE_PEOPLE_API_BASE}/contactGroups",
@@ -24,7 +71,7 @@ async def get_contact_groups(access_token: str) -> Dict[str, str]:
         )
         response.raise_for_status()
         data = response.json()
-        
+
         for group in data.get("contactGroups", []):
             resource_name = group.get("resourceName")
             # prefer formattedName (System groups like 'myContacts' have formattedName 'Contacts')
@@ -33,7 +80,7 @@ async def get_contact_groups(access_token: str) -> Dict[str, str]:
             name = group.get("formattedName") or group.get("name")
             if resource_name and name:
                 groups_mapping[resource_name] = name
-                
+
     return groups_mapping
 
 async def get_contact(access_token: str, resource_name: str) -> Dict[str, Any]:
@@ -42,8 +89,8 @@ async def get_contact(access_token: str, resource_name: str) -> Dict[str, Any]:
     """
     headers = {"Authorization": f"Bearer {access_token}"}
     fields = "names,emailAddresses,phoneNumbers,birthdays,organizations,urls,memberships,biographies,metadata,addresses"
-    
-    async with httpx.AsyncClient() as client:
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         response = await client.get(
             f"{GOOGLE_PEOPLE_API_BASE}/{resource_name}",
             headers=headers,
@@ -59,10 +106,10 @@ async def get_all_contacts(access_token: str) -> List[Dict[str, Any]]:
     headers = {"Authorization": f"Bearer {access_token}"}
     contacts = []
     page_token = None
-    
+
     fields = "names,emailAddresses,phoneNumbers,birthdays,organizations,urls,memberships,biographies,metadata,addresses"
-    
-    async with httpx.AsyncClient() as client:
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         while True:
             params = {
                 "personFields": fields,
@@ -78,14 +125,14 @@ async def get_all_contacts(access_token: str) -> List[Dict[str, Any]]:
             )
             response.raise_for_status()
             data = response.json()
-            
+
             connections = data.get("connections", [])
             contacts.extend(connections)
-            
+
             page_token = data.get("nextPageToken")
             if not page_token:
                 break
-                
+
     return contacts
 
 def transform_contact(google_contact: Dict[str, Any], group_mapping: Dict[str, str]) -> Dict[str, Any]:
@@ -260,8 +307,8 @@ async def create_contact_group(access_token: str, name: str) -> Dict[str, Any]:
     """
     headers = {"Authorization": f"Bearer {access_token}"}
     body = {"contactGroup": {"name": name}}
-    
-    async with httpx.AsyncClient() as client:
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         response = await client.post(
             f"{GOOGLE_PEOPLE_API_BASE}/contactGroups",
             headers=headers,
@@ -333,27 +380,27 @@ def calculate_memberships(
     return new_memberships
 
 async def create_contact(
-    access_token: str, 
+    access_token: str,
     contact_data: Dict[str, Any],
     name_to_id_map: Optional[Dict[str, str]] = None
 ) -> Dict[str, Any]:
     # Rate limit
-    await asyncio.sleep(0.2) 
+    await asyncio.sleep(0.2)
     headers = {"Authorization": f"Bearer {access_token}"}
     body = transform_to_google_body(contact_data)
-    
+
     # Handle Memberships for Create
     if name_to_id_map:
         memberships = calculate_memberships(
             contact_data.get("location"),
             contact_data.get("subscribed", False),
-            [], # No existing memberships
+            [],  # No existing memberships
             name_to_id_map
         )
         if memberships:
             body["memberships"] = memberships
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         response = await client.post(
             f"{GOOGLE_PEOPLE_API_BASE}/people:createContact",
             headers=headers,
@@ -363,9 +410,9 @@ async def create_contact(
         return response.json()
 
 async def update_contact(
-    access_token: str, 
-    resource_name: str, 
-    contact_data: Dict[str, Any], 
+    access_token: str,
+    resource_name: str,
+    contact_data: Dict[str, Any],
     etag: str,
     raw_google_contact: Optional[Dict[str, Any]] = None,
     name_to_id_map: Optional[Dict[str, str]] = None
@@ -375,11 +422,11 @@ async def update_contact(
     headers = {"Authorization": f"Bearer {access_token}"}
     body = transform_to_google_body(contact_data)
     body["etag"] = etag
-    
-    # We need to specify which fields to update. 
+
+    # We need to specify which fields to update.
     # For simplicity, we'll update all fields we support.
     update_fields = "names,emailAddresses,phoneNumbers,organizations,biographies,birthdays,addresses"
-    
+
     # Handle Memberships for Update
     if raw_google_contact and name_to_id_map:
         existing_memberships = raw_google_contact.get("memberships", [])
@@ -391,8 +438,8 @@ async def update_contact(
         )
         body["memberships"] = new_memberships
         update_fields += ",memberships"
-    
-    async with httpx.AsyncClient() as client:
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         response = await client.patch(
             f"{GOOGLE_PEOPLE_API_BASE}/{resource_name}:updateContact",
             headers=headers,
@@ -409,8 +456,8 @@ async def delete_contact(access_token: str, resource_name: str) -> None:
     # Rate limit
     await asyncio.sleep(0.2)
     headers = {"Authorization": f"Bearer {access_token}"}
-    
-    async with httpx.AsyncClient() as client:
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         response = await client.delete(
             f"{GOOGLE_PEOPLE_API_BASE}/{resource_name}:deleteContact",
             headers=headers

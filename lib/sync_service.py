@@ -1,12 +1,14 @@
 from lib.google_contacts import (
-    get_access_token, 
-    get_all_contacts, 
-    get_contact_groups, 
+    get_access_token,
+    get_all_contacts,
+    get_contact_groups,
     create_contact_group,
     transform_contact,
     create_contact,
     update_contact,
-    delete_contact
+    delete_contact,
+    format_exception,
+    retry_async
 )
 from lib.supabase_client import supabase
 from lib.logging_service import log_sync_event
@@ -19,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 async def ensure_group_exists(token, location_name, name_to_id_map):
     """
-    Checks if a location group exists in the mapping. 
+    Checks if a location group exists in the mapping.
     If not, creates it in Google Contacts and updates the mapping.
     """
     if not location_name:
@@ -29,15 +31,16 @@ async def ensure_group_exists(token, location_name, name_to_id_map):
     if location_name not in name_to_id_map:
         logger.info(f"Location '{location_name}' not found in Google Groups. Creating...")
         try:
-            new_group_id = await create_contact_group(token, location_name)
+            new_group_id = await retry_async(create_contact_group, token, location_name)
             if new_group_id:
                 name_to_id_map[location_name] = new_group_id
                 await log_sync_event("create_group", "success", f"Created new Google Group: {location_name}")
             else:
                 logger.error(f"Failed to create group for {location_name}")
         except Exception as e:
-            logger.error(f"Error creating group {location_name}: {e}")
-            await log_sync_event("create_group", "error", f"Failed to create group {location_name}: {str(e)}")
+            error_msg = format_exception(e)
+            logger.error(f"Error creating group {location_name}: {error_msg}")
+            await log_sync_event("create_group", "error", f"Failed to create group {location_name}: {error_msg}")
 
 async def sync_contacts():
     """
@@ -112,22 +115,22 @@ async def sync_contacts():
                     # Case: Soft-deleted in Supabase -> Delete from Google
                     if resource_name and resource_name in google_contacts_map:
                         logger.info(f"Deleting Google contact {resource_name} (Deleted in Supabase)")
-                        await delete_contact(token, resource_name)
+                        await retry_async(delete_contact, token, resource_name)
                         await log_sync_event("delete_google", "success", f"Deleted {sb_contact.get('email')} from Google")
                         # Remove from map so we don't re-ingest it
                         del google_contacts_map[resource_name]
                         synced_count += 1
                     continue
-                        
+
                 # Case: Active in Supabase
                 if not resource_name:
                     # Case: New in Supabase (Notion/Manual) -> Create in Google
                     logger.info(f"Creating contact in Google: {sb_contact.get('email')}")
-                    
+
                     # Ensure group exists
                     await ensure_group_exists(token, sb_contact.get("location"), name_to_id_map)
-                    
-                    new_contact = await create_contact(token, sb_contact, name_to_id_map)
+
+                    new_contact = await retry_async(create_contact, token, sb_contact, name_to_id_map)
                     new_resource_name = new_contact["resourceName"]
                     
                     # Update Supabase with the new ID
@@ -235,8 +238,8 @@ async def sync_contacts():
                             
                             # Ensure group exists
                             await ensure_group_exists(token, sb_contact.get("location"), name_to_id_map)
-                            
-                            await update_contact(token, resource_name, sb_contact, etag, google_contact, name_to_id_map)
+
+                            await retry_async(update_contact, token, resource_name, sb_contact, etag, google_contact, name_to_id_map)
                             await log_sync_event("update_google", "success", f"Updated {sb_contact.get('email')} in Google")
                             synced_count += 1
                     
@@ -265,8 +268,9 @@ async def sync_contacts():
                         await log_sync_event("delete_skipped", "warning", f"Skipped deletion of {sb_contact.get('email')} - Google returned only {len(google_contacts_list)} contacts")
                     
             except Exception as e:
-                logger.error(f"Error processing Supabase contact {sb_contact.get('id')}: {e}")
-                await log_sync_event("sync_error", "error", f"Error processing {sb_contact.get('email')}: {str(e)}")
+                error_msg = format_exception(e)
+                logger.error(f"Error processing Supabase contact {sb_contact.get('id')}: {error_msg}")
+                await log_sync_event("sync_error", "error", f"Error processing {sb_contact.get('email')}: {error_msg}")
                 errors_count += 1
 
         # 5. Process remaining Google Contacts
@@ -290,8 +294,9 @@ async def sync_contacts():
                 synced_count += 1
                 
             except Exception as e:
-                logger.error(f"Error ingesting Google contact {resource_name}: {e}")
-                await log_sync_event("sync_error", "error", f"Error ingesting Google contact {resource_name}: {str(e)}")
+                error_msg = format_exception(e)
+                logger.error(f"Error ingesting Google contact {resource_name}: {error_msg}")
+                await log_sync_event("sync_error", "error", f"Error ingesting Google contact {resource_name}: {error_msg}")
                 errors_count += 1
                 
         logger.info(f"Sync complete. Synced: {synced_count}, Errors: {errors_count}")
@@ -299,9 +304,10 @@ async def sync_contacts():
         return {"synced": synced_count, "errors": errors_count}
 
     except Exception as e:
-        logger.error(f"Fatal error during sync: {e}")
-        await log_sync_event("sync_fatal", "error", f"Fatal error: {str(e)}")
-        raise e
+        error_msg = format_exception(e)
+        logger.error(f"Fatal error during sync: {error_msg}")
+        await log_sync_event("sync_fatal", "error", f"Fatal error: {error_msg}")
+        raise
 
 # Legacy alias if needed, or we can remove it
 sync_google_contacts_to_supabase = sync_contacts

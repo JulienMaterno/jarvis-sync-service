@@ -49,7 +49,9 @@ from lib.sync_audit import (
     check_sync_health as check_database_sync_health,
     SyncStats,
     record_sync_audit,
-    generate_sync_report
+    generate_sync_report,
+    generate_24h_summary,
+    format_24h_summary_text
 )
 
 # Import lean sync cursor for change detection
@@ -326,7 +328,7 @@ async def get_inventory_table():
 async def get_sync_history_endpoint(entity: str = None, days: int = 7):
     """
     Get recent sync history from the audit table.
-    
+
     Args:
         entity: Filter by entity type (contacts, meetings, tasks, etc.)
         days: Number of days to look back (default 7)
@@ -341,6 +343,27 @@ async def get_sync_history_endpoint(entity: str = None, days: int = 7):
         }
     except Exception as e:
         logger.error(f"Error getting sync history: {e}")
+        return {"status": "error", "error": str(e)}
+
+
+@app.get("/sync/summary")
+async def get_sync_summary():
+    """
+    Comprehensive 24-hour sync summary with:
+    - All sync runs (not just last cycle)
+    - Time breakdown per entity type (explains why sync took 200s)
+    - Current inventory showing Supabase, Notion, AND Google counts
+    - Active records only (excludes soft-deleted)
+    - Recent errors with context
+
+    This is the go-to endpoint for understanding sync health and performance.
+    """
+    try:
+        summary = await run_in_threadpool(generate_24h_summary)
+        summary['formatted'] = format_24h_summary_text(summary)
+        return summary
+    except Exception as e:
+        logger.error(f"Error generating sync summary: {e}")
         return {"status": "error", "error": str(e)}
 
 

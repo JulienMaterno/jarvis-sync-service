@@ -442,6 +442,180 @@ def generate_sync_report(run_id: str) -> Dict[str, Any]:
         return {'error': str(e)}
 
 
+def generate_24h_summary() -> Dict[str, Any]:
+    """
+    Generate a comprehensive 24-hour sync summary including:
+    - Sync runs with time breakdown per entity type
+    - Notion and Google counts alongside Supabase (excluding soft-deleted)
+    - Total operations across all runs
+    - Error summary
+    """
+    try:
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+
+        # Get all sync audit records from last 24h
+        result = supabase.table('sync_audit').select('*').gte('created_at', cutoff).order('created_at', desc=True).execute()
+        records = result.data or []
+
+        if not records:
+            return {
+                'status': 'no_data',
+                'message': 'No sync runs in the last 24 hours',
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            }
+
+        # Group by run_id to get sync runs
+        runs = {}
+        for r in records:
+            run_id = r.get('run_id')
+            if run_id not in runs:
+                runs[run_id] = {
+                    'run_id': run_id,
+                    'started_at': r.get('started_at'),
+                    'completed_at': r.get('completed_at'),
+                    'entities': [],
+                    'total_duration_ms': 0,
+                    'errors': 0
+                }
+            runs[run_id]['entities'].append(r)
+            runs[run_id]['total_duration_ms'] += r.get('duration_ms', 0) or 0
+            if r.get('status') == 'failed':
+                runs[run_id]['errors'] += 1
+
+        # Calculate time breakdown per entity type across all runs
+        time_by_entity = {}
+        ops_by_entity = {}
+        for r in records:
+            entity = r.get('entity_type')
+            if entity not in time_by_entity:
+                time_by_entity[entity] = 0
+                ops_by_entity[entity] = {'created': 0, 'updated': 0, 'deleted': 0}
+            time_by_entity[entity] += r.get('duration_ms', 0) or 0
+            ops_by_entity[entity]['created'] += (r.get('created_in_supabase', 0) or 0) + (r.get('created_in_notion', 0) or 0)
+            ops_by_entity[entity]['updated'] += (r.get('updated_in_supabase', 0) or 0) + (r.get('updated_in_notion', 0) or 0)
+            ops_by_entity[entity]['deleted'] += (r.get('deleted_in_supabase', 0) or 0) + (r.get('deleted_in_notion', 0) or 0)
+
+        # Sort entities by time spent (descending)
+        time_breakdown = sorted(
+            [{'entity': k, 'duration_ms': v, 'duration_sec': round(v / 1000, 1)} for k, v in time_by_entity.items()],
+            key=lambda x: x['duration_ms'],
+            reverse=True
+        )
+
+        # Get current inventory with active counts only (excluding soft-deleted)
+        inventory = get_database_inventory()
+
+        # Calculate totals across all runs
+        total_ops = {
+            'created_supabase': sum(r.get('created_in_supabase', 0) or 0 for r in records),
+            'created_notion': sum(r.get('created_in_notion', 0) or 0 for r in records),
+            'updated_supabase': sum(r.get('updated_in_supabase', 0) or 0 for r in records),
+            'updated_notion': sum(r.get('updated_in_notion', 0) or 0 for r in records),
+            'deleted_supabase': sum(r.get('deleted_in_supabase', 0) or 0 for r in records),
+            'deleted_notion': sum(r.get('deleted_in_notion', 0) or 0 for r in records),
+        }
+        total_ops['total'] = sum(total_ops.values())
+
+        # Get errors from sync_logs for richer error context
+        error_result = supabase.table('sync_logs').select('event_type, message, created_at').eq('status', 'error').gte('created_at', cutoff).order('created_at', desc=True).limit(10).execute()
+        recent_errors = error_result.data or []
+
+        return {
+            'status': 'success',
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'period': '24h',
+            'summary': {
+                'sync_runs': len(runs),
+                'total_operations': total_ops['total'],
+                'total_errors': sum(run['errors'] for run in runs.values()),
+                'total_duration_sec': round(sum(run['total_duration_ms'] for run in runs.values()) / 1000, 1)
+            },
+            'operations_24h': total_ops,
+            'time_breakdown': time_breakdown,
+            'operations_by_entity': ops_by_entity,
+            'current_inventory': {
+                entity: {
+                    'supabase': counts.get('supabase', 0),
+                    'notion': counts.get('notion'),
+                    'google': counts.get('google'),
+                    'in_sync': counts.get('is_in_sync'),
+                    'difference': counts.get('difference')
+                }
+                for entity, counts in inventory.items()
+            },
+            'recent_errors': [
+                {'type': e.get('event_type'), 'message': e.get('message', '')[:100], 'time': e.get('created_at')}
+                for e in recent_errors
+            ],
+            'runs': [
+                {
+                    'run_id': run['run_id'][:8],
+                    'started_at': run['started_at'],
+                    'duration_sec': round(run['total_duration_ms'] / 1000, 1),
+                    'entities': len(run['entities']),
+                    'errors': run['errors']
+                }
+                for run in sorted(runs.values(), key=lambda x: x['started_at'] or '', reverse=True)[:10]
+            ]
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to generate 24h summary: {e}")
+        return {'status': 'error', 'error': str(e)}
+
+
+def format_24h_summary_text(summary: Dict[str, Any]) -> str:
+    """Format the 24h summary as a human-readable text report."""
+    if summary.get('status') == 'no_data':
+        return "📊 No sync runs in the last 24 hours"
+
+    if summary.get('status') == 'error':
+        return f"❌ Error generating report: {summary.get('error')}"
+
+    lines = []
+    lines.append("📊 **Sync Summary (Last 24h)**")
+    lines.append("")
+
+    # Summary stats
+    s = summary.get('summary', {})
+    lines.append(f"**Runs:** {s.get('sync_runs', 0)} | **Operations:** {s.get('total_operations', 0)} | **Errors:** {s.get('total_errors', 0)} | **Duration:** {s.get('total_duration_sec', 0)}s")
+    lines.append("")
+
+    # Time breakdown by entity
+    lines.append("**Time Breakdown:**")
+    for tb in summary.get('time_breakdown', [])[:8]:
+        ops = summary.get('operations_by_entity', {}).get(tb['entity'], {})
+        ops_str = f"+{ops.get('created', 0)}/-{ops.get('deleted', 0)}/~{ops.get('updated', 0)}"
+        lines.append(f"  {tb['entity']}: {tb['duration_sec']}s ({ops_str})")
+    lines.append("")
+
+    # Current inventory
+    lines.append("**Current Counts (active only):**")
+    inv = summary.get('current_inventory', {})
+    for entity in ['contacts', 'meetings', 'tasks', 'reflections', 'journals']:
+        if entity in inv:
+            e = inv[entity]
+            sb = e.get('supabase', 0)
+            n = e.get('notion', '-')
+            g = e.get('google')
+            sync_icon = "✅" if e.get('in_sync') else "⚠️"
+            counts = f"SB:{sb} N:{n}"
+            if g is not None:
+                counts += f" G:{g}"
+            lines.append(f"  {sync_icon} {entity}: {counts}")
+
+    # Recent errors
+    errors = summary.get('recent_errors', [])
+    if errors:
+        lines.append("")
+        lines.append("**Recent Errors:**")
+        for err in errors[:3]:
+            lines.append(f"  - {err.get('type')}: {err.get('message', '')[:60]}...")
+
+    return "\n".join(lines)
+
+
 # Export for easy importing
 __all__ = [
     'SyncStats',
@@ -450,6 +624,8 @@ __all__ = [
     'record_sync_audit',
     'get_sync_history',
     'generate_sync_report',
+    'generate_24h_summary',
+    'format_24h_summary_text',
     'get_supabase_count',
     'get_notion_count'
 ]

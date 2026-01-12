@@ -39,10 +39,13 @@ from lib.sync_base import (
     TwoWaySyncService,
     NotionPropertyExtractor,
     NotionPropertyBuilder,
+    ContentBlockBuilder,
     SyncResult,
     SyncStats,
+    SyncMetrics,
     create_cli_parser,
-    setup_logger
+    setup_logger,
+    format_exception
 )
 
 # ============================================================================
@@ -261,11 +264,13 @@ class LinkedInPostsSyncService(TwoWaySyncService):
     def _sync_supabase_to_notion(self, full_sync: bool, since_hours: int, metrics=None) -> SyncResult:
         """
         Override to handle content block creation.
-        Supabase → Notion
+        Supabase → Notion with page content (post text)
         """
         stats = SyncStats()
         start_time = __import__('time').time()
-        
+        if metrics is None:
+            metrics = SyncMetrics()
+
         try:
             # Get Supabase records that need syncing
             if full_sync:
@@ -274,118 +279,88 @@ class LinkedInPostsSyncService(TwoWaySyncService):
                 cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
                 all_records = self.supabase.select_updated_since(cutoff)
                 supabase_records = [r for r in all_records if not r.get('deleted_at')]
-            
-            if metrics:
-                metrics.supabase_api_calls += 1
-            
+
+            metrics.supabase_api_calls += 1
+
             # Filter to records that need syncing to Notion
-            # A record needs syncing if:
-            # 1. It has no notion_page_id (new record), OR
-            # 2. last_sync_source is 'supabase' (explicitly marked), OR
-            # 3. updated_at > notion_updated_at (updated locally since last sync)
-            records_to_sync = []
-            for r in supabase_records:
-                needs_sync = False
-                
-                if not r.get('notion_page_id'):
-                    needs_sync = True
-                elif r.get('last_sync_source') == 'supabase':
-                    needs_sync = True
-                else:
-                    comparison = self.compare_timestamps(
-                        r.get('updated_at'),
-                        r.get('notion_updated_at')
-                    )
-                    if comparison > 0:
-                        needs_sync = True
-                        self.logger.info(f"LinkedIn post '{r.get('title')}' has local changes")
-                
-                if needs_sync:
-                    records_to_sync.append(r)
-            
+            records_to_sync = self.filter_records_needing_notion_sync(supabase_records, name_field='title')
             self.logger.info(f"Found {len(records_to_sync)} posts to sync to Notion")
-            
+
             for record in records_to_sync:
                 try:
                     notion_page_id = record.get('notion_page_id')
                     notion_props = self.convert_to_source(record)
-                    
+                    blocks = self._build_content_blocks(record)
+
                     if notion_page_id:
-                        # Update existing page
+                        # Update existing page properties
                         updated_page = self.notion.update_page(notion_page_id, notion_props)
-                        
+                        metrics.notion_api_calls += 1
+
+                        # Update content blocks if we have content
+                        if blocks:
+                            try:
+                                # Delete existing blocks and append new ones
+                                existing_blocks = self.notion.get_all_blocks(notion_page_id)
+                                for block in existing_blocks:
+                                    try:
+                                        self.notion.delete_block(block['id'])
+                                    except Exception:
+                                        pass
+                                self.notion.append_blocks(notion_page_id, blocks)
+                                metrics.notion_api_calls += 2
+                            except Exception as e:
+                                self.logger.warning(f"Failed to update content blocks: {format_exception(e)}")
+
                         # Update Supabase with new timestamp
                         self.supabase.update(record['id'], {
                             'notion_updated_at': updated_page.get('last_edited_time'),
                             'last_sync_source': 'notion'
                         })
-                        
+                        metrics.supabase_api_calls += 1
                         stats.updated += 1
                     else:
                         # Create new page with content blocks
-                        blocks = self._build_content_blocks(record)
                         new_page = self.notion.create_page(
                             self.notion_database_id,
                             notion_props,
-                            children=blocks if blocks else None
+                            children=blocks
                         )
-                        
+                        metrics.notion_api_calls += 1
+
                         # Update Supabase with new Notion ID
                         self.supabase.update(record['id'], {
                             'notion_page_id': new_page['id'],
                             'notion_updated_at': new_page.get('last_edited_time'),
                             'last_sync_source': 'notion'
                         })
+                        metrics.supabase_api_calls += 1
                         stats.created += 1
-                    
+
                 except Exception as e:
-                    self.logger.error(f"Error syncing post to Notion: {e}")
+                    self.logger.error(f"Error syncing post to Notion: {format_exception(e)}")
                     stats.errors += 1
-            
+
             return SyncResult(
                 success=True,
                 direction="supabase_to_notion",
                 stats=stats,
                 elapsed_seconds=__import__('time').time() - start_time
             )
-            
+
         except Exception as e:
-            return SyncResult(success=False, direction="supabase_to_notion", error_message=str(e))
-    
+            return SyncResult(success=False, direction="supabase_to_notion", error_message=format_exception(e))
+
     def _build_content_blocks(self, record: Dict) -> List[Dict]:
-        """Build Notion blocks from post content."""
-        blocks = []
+        """Build Notion blocks from post content using ContentBlockBuilder."""
+        builder = ContentBlockBuilder()
         content = record.get('content', '')
-        
+
         if not content:
-            return blocks
-        
-        # Split content into paragraphs
-        paragraphs = content.split('\n\n')
-        
-        for para in paragraphs:
-            para = para.strip()
-            if not para:
-                continue
-            
-            # Handle single line breaks as soft breaks within a paragraph
-            lines = para.split('\n')
-            
-            for line in lines:
-                line = line.strip()
-                if line:
-                    blocks.append({
-                        "object": "block",
-                        "type": "paragraph",
-                        "paragraph": {
-                            "rich_text": [{
-                                "type": "text",
-                                "text": {"content": line[:2000]}  # Notion limit
-                            }]
-                        }
-                    })
-        
-        return blocks
+            return []
+
+        # Use the chunked_paragraphs helper for consistent formatting
+        return builder.chunked_paragraphs(content)
 
 
 # ============================================================================
