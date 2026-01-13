@@ -212,6 +212,33 @@ def get_database_inventory() -> Dict[str, Dict[str, int]]:
             inventory[entity]['difference'] = n_count - sb_count
             inventory[entity]['is_in_sync'] = (n_count == sb_count)
     
+    # Additional bidirectional entities (Notion ↔ Supabase)
+    extra_bidirectional = {
+        'applications': os.environ.get('NOTION_APPLICATIONS_DB_ID', ''),
+        'documents': os.environ.get('NOTION_DOCUMENTS_DB_ID', ''),
+        'linkedin_posts': os.environ.get('NOTION_LINKEDIN_POSTS_DB_ID', '')
+    }
+    
+    for entity, db_id in extra_bidirectional.items():
+        sb_count = get_supabase_count(entity)
+        n_count = -1
+        if db_id:
+            try:
+                pages = list(notion.query_database_all(db_id))
+                n_count = len(pages)
+            except Exception as e:
+                logger.warning(f"Error counting {entity} in Notion: {e}")
+        
+        inventory[entity] = {
+            'supabase': sb_count,
+            'notion': n_count if n_count >= 0 else None
+        }
+        
+        # Calculate sync health if both counts available
+        if sb_count >= 0 and n_count >= 0:
+            inventory[entity]['difference'] = n_count - sb_count
+            inventory[entity]['is_in_sync'] = (n_count == sb_count)
+    
     return inventory
 
 
@@ -593,6 +620,8 @@ def format_24h_summary_text(summary: Dict[str, Any]) -> str:
     # Current inventory
     lines.append("**Current Counts (active only):**")
     inv = summary.get('current_inventory', {})
+    
+    # Core bidirectional entities
     for entity in ['contacts', 'meetings', 'tasks', 'reflections', 'journals']:
         if entity in inv:
             e = inv[entity]
@@ -604,6 +633,15 @@ def format_24h_summary_text(summary: Dict[str, Any]) -> str:
             if g is not None:
                 counts += f" G:{g}"
             lines.append(f"  {sync_icon} {entity}: {counts}")
+    
+    # Additional bidirectional entities (applications, documents, linkedin_posts)
+    for entity in ['applications', 'documents', 'linkedin_posts']:
+        if entity in inv:
+            e = inv[entity]
+            sb = e.get('supabase', 0)
+            n = e.get('notion', '-')
+            sync_icon = "✅" if e.get('in_sync') else "⚠️"
+            lines.append(f"  {sync_icon} {entity}: SB:{sb} N:{n}")
 
     # Recent errors
     errors = summary.get('recent_errors', [])

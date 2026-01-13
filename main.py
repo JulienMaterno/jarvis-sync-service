@@ -34,6 +34,9 @@ from sync_highlights import run_sync as run_highlights_sync
 from syncs.applications_sync import run_sync as run_applications_sync
 from syncs.linkedin_posts_sync import run_sync as run_linkedin_posts_sync
 
+# Import documents sync
+from syncs.documents_sync import run_sync as run_documents_sync
+
 # Import ActivityWatch sync
 from sync_activitywatch import run_activitywatch_sync, ActivityWatchSync, format_activity_summary_for_journal
 
@@ -523,6 +526,9 @@ async def sync_everything(background_tasks: BackgroundTasks):
         
         # === LINKEDIN POSTS SYNC (bidirectional) ===
         await run_step("linkedin_posts_sync", run_linkedin_posts_sync, full_sync=False, since_hours=24)
+        
+        # === DOCUMENTS SYNC (bidirectional) ===
+        await run_step("documents_sync", run_documents_sync, full_sync=False, since_hours=24)
         
         # === BEEPER SYNC (WhatsApp/Telegram/LinkedIn messages) ===
         # This gracefully handles offline laptop - just skips and catches up next run
@@ -1607,6 +1613,27 @@ async def sync_linkedin_posts(full: bool = False, hours: int = 24):
         return result
     except Exception as e:
         logger.error(f"LinkedIn posts sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Documents Sync ---
+
+@app.post("/sync/documents")
+async def sync_documents(full: bool = False, hours: int = 24):
+    """
+    Sync documents (CVs, applications, notes) bidirectionally.
+    Source: Notion Documents database
+    
+    Args:
+        full: If True, sync all documents. If False, only recently updated.
+        hours: For incremental sync, how many hours to look back.
+    """
+    try:
+        logger.info(f"Starting documents sync via API (full={full}, hours={hours})")
+        result = await run_in_threadpool(run_documents_sync, full_sync=full, since_hours=hours)
+        return result
+    except Exception as e:
+        logger.error(f"Documents sync failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
