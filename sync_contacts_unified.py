@@ -341,8 +341,8 @@ class ContactsSyncService(TwoWaySyncService):
         type_prop = props.get('Type', {}).get('select')
         contact_type = type_prop.get('name') if type_prop else None
         
-        # Phone is a phone_number property in Notion
-        phone = Extract.phone(props, 'Phone') if hasattr(Extract, 'phone') else props.get('Phone', {}).get('phone_number')
+        # Phone is a phone_number property in Notion (property name: "Phone Number")
+        phone = Extract.phone(props, 'Phone Number') if hasattr(Extract, 'phone') else props.get('Phone Number', {}).get('phone_number')
         
         return {
             'first_name': first_name,
@@ -371,7 +371,7 @@ class ContactsSyncService(TwoWaySyncService):
             props['Mail'] = Build.email(supabase_record['email'])
         
         if supabase_record.get('phone'):
-            props['Phone'] = {'phone_number': supabase_record['phone']}
+            props['Phone Number'] = Build.phone(supabase_record['phone'])
         
         if supabase_record.get('company'):
             props['Company'] = Build.rich_text(supabase_record['company'])
@@ -399,7 +399,7 @@ class ContactsSyncService(TwoWaySyncService):
         
         return props
     
-    def _sync_notion_to_supabase(self, full_sync: bool, since_hours: int) -> SyncResult:
+    def _sync_notion_to_supabase(self, full_sync: bool, since_hours: int, metrics=None) -> SyncResult:
         """
         OVERRIDE: Sync from Notion to Supabase WITH DEDUPLICATION.
         
@@ -508,7 +508,7 @@ class ContactsSyncService(TwoWaySyncService):
             self.logger.error(f"Notion to Supabase sync failed: {e}")
             return SyncResult(success=False, direction="notion_to_supabase", error_message=str(e))
     
-    def _sync_supabase_to_notion(self, full_sync: bool, since_hours: int) -> SyncResult:
+    def _sync_supabase_to_notion(self, full_sync: bool, since_hours: int, metrics=None) -> SyncResult:
         """
         OVERRIDE: Sync from Supabase to Notion WITH DEDUPLICATION.
         
