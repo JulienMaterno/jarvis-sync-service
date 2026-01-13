@@ -791,15 +791,32 @@ class ContentBlockBuilder:
         }
     
     @staticmethod
-    def numbered_list_item(text: str) -> Dict:
-        """Create a numbered list item block."""
-        return {
+    def numbered_list_item(text: str, children: List[Dict] = None) -> Dict:
+        """Create a numbered list item block with optional nested children."""
+        block = {
             "object": "block",
             "type": "numbered_list_item",
             "numbered_list_item": {
                 "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
             }
         }
+        if children:
+            block["numbered_list_item"]["children"] = children
+        return block
+    
+    @staticmethod
+    def bulleted_list_item_with_children(text: str, children: List[Dict] = None) -> Dict:
+        """Create a bulleted list item block with optional nested children."""
+        block = {
+            "object": "block",
+            "type": "bulleted_list_item",
+            "bulleted_list_item": {
+                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
+            }
+        }
+        if children:
+            block["bulleted_list_item"]["children"] = children
+        return block
     
     @staticmethod
     def to_do(text: str, checked: bool = False) -> Dict:

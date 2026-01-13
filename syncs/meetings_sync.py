@@ -435,6 +435,12 @@ class MeetingsSyncService(TwoWaySyncService):
         """
         Build Notion content blocks from meeting data.
         Handles complex JSONB structures (topics_discussed, follow_up_items, key_points).
+        
+        Format:
+        - Summary as paragraph(s)
+        - Topics as numbered list (1. Topic Name) with bullet children for details
+        - Follow-ups as to-do items
+        - Key points as bullets
         """
         blocks = []
         builder = ContentBlockBuilder()
@@ -443,7 +449,7 @@ class MeetingsSyncService(TwoWaySyncService):
         if meeting.get('summary'):
             blocks.extend(builder.chunked_paragraphs(meeting['summary']))
         
-        # Topics discussed - handle complex JSON structures
+        # Topics discussed - use NUMBERED list with NESTED bullet children for details
         topics = meeting.get('topics_discussed', [])
         if topics:
             blocks.append(builder.heading_3('Topics Discussed'))
@@ -452,13 +458,19 @@ class MeetingsSyncService(TwoWaySyncService):
                     topic_text = topic.get('topic', '')
                     details = topic.get('details', [])
                     if topic_text:
-                        blocks.append(builder.bulleted_list_item(topic_text[:2000]))
-                    # Add details as indented paragraphs
-                    for detail in details[:5]:
-                        if detail:
-                            blocks.append(builder.paragraph(f"  • {detail[:2000]}"))
+                        # Create bullet children for details
+                        detail_children = []
+                        for detail in details[:7]:  # Max 7 details per topic
+                            if detail:
+                                detail_children.append(builder.bulleted_list_item(detail[:2000]))
+                        
+                        # Create numbered item with nested bullet children
+                        blocks.append(builder.numbered_list_item(
+                            topic_text[:2000], 
+                            children=detail_children if detail_children else None
+                        ))
                 elif isinstance(topic, str) and topic:
-                    blocks.append(builder.bulleted_list_item(topic[:2000]))
+                    blocks.append(builder.numbered_list_item(topic[:2000]))
         
         # Follow-up items
         follow_ups = meeting.get('follow_up_items', [])
