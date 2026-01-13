@@ -337,16 +337,24 @@ class ContactsSyncService(TwoWaySyncService):
         location_prop = props.get('Location', {}).get('select')
         location = location_prop.get('name') if location_prop else None
         
+        # Type/Category is a select in Notion (Friends, Family, Business, Other)
+        type_prop = props.get('Type', {}).get('select')
+        contact_type = type_prop.get('name') if type_prop else None
+        
+        # Phone is a phone_number property in Notion
+        phone = Extract.phone(props, 'Phone') if hasattr(Extract, 'phone') else props.get('Phone', {}).get('phone_number')
+        
         return {
             'first_name': first_name,
             'last_name': last_name,
             'email': Extract.email(props, 'Mail'),  # Notion uses "Mail" not "Email"
-            # Phone doesn't exist in Notion schema
+            'phone': phone,  # Now syncing phone from Notion
             'company': Extract.rich_text(props, 'Company'),
             'job_title': Extract.rich_text(props, 'Position'),  # Notion uses "Position"
             'birthday': Extract.date(props, 'Birthday'),
             'linkedin_url': Extract.url(props, 'LinkedIn URL'),  # Notion uses "LinkedIn URL"
             'location': location,
+            'contact_type': contact_type,  # Friends, Family, Business, Other
             'subscribed': props.get('Subscribed?', {}).get('checkbox', False),  # Notion uses "Subscribed?"
         }
     
@@ -361,6 +369,9 @@ class ContactsSyncService(TwoWaySyncService):
         # Only add non-empty fields (using correct Notion property names)
         if supabase_record.get('email'):
             props['Mail'] = Build.email(supabase_record['email'])
+        
+        if supabase_record.get('phone'):
+            props['Phone'] = {'phone_number': supabase_record['phone']}
         
         if supabase_record.get('company'):
             props['Company'] = Build.rich_text(supabase_record['company'])
@@ -377,6 +388,10 @@ class ContactsSyncService(TwoWaySyncService):
         # Location is a SELECT in Notion, not rich_text
         if supabase_record.get('location'):
             props['Location'] = {'select': {'name': supabase_record['location']}}
+        
+        # Type/Category is a SELECT in Notion (Friends, Family, Business, Other)
+        if supabase_record.get('contact_type'):
+            props['Type'] = {'select': {'name': supabase_record['contact_type']}}
         
         # Subscribed checkbox
         if supabase_record.get('subscribed') is not None:
