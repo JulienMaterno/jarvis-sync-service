@@ -396,6 +396,51 @@ class DocumentsSyncService(TwoWaySyncService):
 # CLI INTERFACE
 # ============================================================================
 
+def run_sync(full_sync: bool = False, since_hours: int = 24) -> Dict:
+    """
+    Run documents sync and return results.
+    
+    This is the function that main.py imports and calls.
+    
+    Args:
+        full_sync: If True, sync all records regardless of timestamps
+        since_hours: Only sync records updated in the last N hours
+    
+    Returns:
+        Dict with sync results
+    """
+    service = DocumentsSyncService()
+    result = service.sync(full_sync=full_sync, since_hours=since_hours)
+    
+    # Convert SyncResult to dict for consistency
+    if isinstance(result, SyncResult):
+        return {
+            "success": result.success,
+            "created": result.stats.created if result.stats else 0,
+            "updated": result.stats.updated if result.stats else 0,
+            "skipped": result.stats.skipped if result.stats else 0,
+            "errors": result.stats.errors if result.stats else 0,
+            "error_message": result.error_message
+        }
+    elif isinstance(result, dict):
+        # Already a dict, summarize
+        total_created = 0
+        total_updated = 0
+        total_errors = 0
+        for direction, sync_result in result.items():
+            if isinstance(sync_result, SyncResult) and sync_result.stats:
+                total_created += sync_result.stats.created
+                total_updated += sync_result.stats.updated
+                total_errors += sync_result.stats.errors
+        return {
+            "success": all(sr.success for sr in result.values() if isinstance(sr, SyncResult)),
+            "created": total_created,
+            "updated": total_updated,
+            "errors": total_errors
+        }
+    return result
+
+
 def main():
     """Run documents sync from command line."""
     parser = create_cli_parser("Documents Sync - Notion ↔ Supabase")
