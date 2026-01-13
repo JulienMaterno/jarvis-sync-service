@@ -1098,7 +1098,9 @@ class NotionPropertyBuilder:
     def rich_text(value: Optional[str]) -> Dict:
         if not value:
             return {"rich_text": []}
-        return {"rich_text": [{"text": {"content": value[:2000]}}]}  # Notion limit
+        # Notion limit is 2000 chars, but Unicode chars (emojis) may count differently
+        # Use 1990 to be safe with multi-byte characters
+        return {"rich_text": [{"text": {"content": value[:1990]}}]}
     
     @staticmethod
     def number(value: Optional[float]) -> Dict:

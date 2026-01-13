@@ -65,6 +65,14 @@ class NotionClient:
             body["children"] = children
             
         response = self.client.post(url, json=body)
+        if not response.is_success:
+            # Log detailed error message from Notion
+            try:
+                error_body = response.json()
+                import logging
+                logging.getLogger(__name__).error(f"Notion API error: {error_body}")
+            except Exception:
+                pass
         response.raise_for_status()
         return response.json()
 

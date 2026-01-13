@@ -61,11 +61,19 @@ NOTION_APPLICATIONS_DB_ID = os.environ.get(
     'bfb77dff-9721-47b6-9bab-0cd0b315a298'
 )
 
-# Valid application types
-APPLICATION_TYPES = ['Grant', 'Fellowship', 'Program', 'Accelerator', 'Residency']
+# Valid application types (Notion will auto-create new select options if needed)
+APPLICATION_TYPES = [
+    'Grant', 'Fellowship', 'Program', 'Accelerator', 'Residency',
+    'Prize/Fellowship',  # Composite types
+    'Competition', 'Award', 'Prize'  # Additional types
+]
 
-# Valid statuses
-APPLICATION_STATUSES = ['Not Started', 'Researching', 'In Progress', 'Applied', 'Accepted']
+# Valid statuses (Notion will auto-create new select options if needed)
+APPLICATION_STATUSES = [
+    'Not Started', 'Researching', 'In Progress', 'Applied', 'Accepted',
+    'Deadline Likely Passed', 'Deadline Passed', 'Rejected', 'Withdrawn',  # Terminal states
+    'Interview', 'Shortlisted', 'Waitlisted'  # Intermediate states
+]
 
 # Common locations (for reference - not enforced, any value accepted)
 APPLICATION_LOCATIONS = ['Remote', 'Singapore', 'USA', 'Europe', 'UK', 'Global', 'Asia', 'Other']
@@ -400,7 +408,8 @@ class ApplicationsSyncService(TwoWaySyncService):
                         stats.created += 1
 
                 except Exception as e:
-                    self.logger.error(f"Error syncing application to Notion: {format_exception(e)}")
+                    self.logger.error(f"Error syncing application '{record.get('name')}' to Notion: {format_exception(e)}")
+                    self.logger.error(f"  Properties sent: {notion_props}")
                     stats.errors += 1
 
             return SyncResult(
