@@ -126,19 +126,18 @@ class DocumentsSyncService(TwoWaySyncService):
         if not title:
             title = 'Untitled Document'
         
-        # Extract type (select)
-        doc_type = NotionPropertyExtractor.select(props, 'Type')
+        # Extract type (select) - Notion property is "Document Type"
+        doc_type = NotionPropertyExtractor.select(props, 'Document Type') or 'other'
         
-        # Extract tags (multi_select)
-        tags = NotionPropertyExtractor.multi_select(props, 'Tags')
+        # Note: Notion has Description but Supabase doesn't have that column
+        # We skip it in the conversion
         
-        # Extract file URL if present
-        file_url = NotionPropertyExtractor.url(props, 'File URL')
+        # Extract file URL if present - Notion property is "link"
+        file_url = NotionPropertyExtractor.url(props, 'link')
         
         return {
             'title': title,
             'type': doc_type,
-            'tags': tags if tags else None,
             'file_url': file_url,
         }
     
@@ -153,20 +152,18 @@ class DocumentsSyncService(TwoWaySyncService):
         title = supabase_record.get('title', 'Untitled Document')
         properties['Name'] = NotionPropertyBuilder.title(title[:100])  # Notion title limit
         
-        # Type (select)
+        # Type (select) - Notion property is "Document Type"
         doc_type = supabase_record.get('type')
         if doc_type:
-            properties['Type'] = NotionPropertyBuilder.select(doc_type)
+            properties['Document Type'] = NotionPropertyBuilder.select(doc_type)
         
-        # Tags (multi_select)
-        tags = supabase_record.get('tags')
-        if tags:
-            properties['Tags'] = NotionPropertyBuilder.multi_select(tags)
+        # Note: Supabase doesn't have a description column, Notion does
+        # We leave Description empty when syncing from Supabase
         
-        # File URL
+        # File URL - Notion property is "link"
         file_url = supabase_record.get('file_url')
         if file_url:
-            properties['File URL'] = NotionPropertyBuilder.url(file_url)
+            properties['link'] = NotionPropertyBuilder.url(file_url)
         
         return properties
     
@@ -350,11 +347,9 @@ class DocumentsSyncService(TwoWaySyncService):
                         self.notion.update_page(notion_page_id, notion_props)
                         metrics.notion_api_calls += 1
                         
-                        # Update page content (clear and rebuild)
-                        if blocks:
-                            self.notion.clear_page_content(notion_page_id)
-                            self.notion.append_blocks(notion_page_id, blocks)
-                            metrics.notion_api_calls += 2
+                        # Note: Content update requires clearing page first, which is complex
+                        # For now, we only update properties on existing pages
+                        # Content changes will need to be made directly in Notion
                         
                         stats.updated += 1
                     else:
