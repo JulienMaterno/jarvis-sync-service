@@ -6,3 +6,4 @@ httpx
 notion-client
 gunicorn
 pytz
+google-cloud-storage
