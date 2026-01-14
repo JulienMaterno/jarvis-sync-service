@@ -159,14 +159,14 @@ class ApplicationsSyncService(TwoWaySyncService):
             'Name': NotionPropertyBuilder.title(name[:100]),  # Notion title limit
         }
         
-        # Type (select)
+        # Type (select) - accept ANY value, Notion auto-creates options
         app_type = supabase_record.get('application_type')
-        if app_type and app_type in APPLICATION_TYPES:
+        if app_type:
             properties['Type'] = NotionPropertyBuilder.select(app_type)
         
-        # Status (select)
+        # Status (select) - accept ANY value, Notion auto-creates options
         status = supabase_record.get('status')
-        if status and status in APPLICATION_STATUSES:
+        if status:
             properties['Status'] = NotionPropertyBuilder.select(status)
         
         # Institution (rich_text)
