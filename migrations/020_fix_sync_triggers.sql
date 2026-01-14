@@ -25,8 +25,6 @@ DROP TRIGGER IF EXISTS journals_auto_sync_source ON journals;
 DROP TRIGGER IF EXISTS journals_auto_sync_source_insert ON journals;
 DROP TRIGGER IF EXISTS contacts_auto_sync_source ON contacts;
 DROP TRIGGER IF EXISTS contacts_auto_sync_source_insert ON contacts;
-DROP TRIGGER IF EXISTS documents_auto_sync_source ON documents;
-DROP TRIGGER IF EXISTS documents_auto_sync_source_insert ON documents;
 
 -- Drop old function
 DROP FUNCTION IF EXISTS trigger_set_sync_source_supabase();
@@ -111,12 +109,6 @@ CREATE TRIGGER journals_auto_sync
 -- CONTACTS
 CREATE TRIGGER contacts_auto_sync
     BEFORE INSERT OR UPDATE ON contacts
-    FOR EACH ROW
-    EXECUTE FUNCTION trigger_set_sync_source_supabase();
-
--- DOCUMENTS
-CREATE TRIGGER documents_auto_sync
-    BEFORE INSERT OR UPDATE ON documents
     FOR EACH ROW
     EXECUTE FUNCTION trigger_set_sync_source_supabase();
 
