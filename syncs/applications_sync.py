@@ -70,7 +70,8 @@ APPLICATION_TYPES = [
 
 # Valid statuses (Notion will auto-create new select options if needed)
 APPLICATION_STATUSES = [
-    'Not Started', 'Researching', 'In Progress', 'Applied', 'Accepted',
+    'TO_APPLY', 'RESEARCHING', 'INACTIVE', 'NOT_ELIGIBLE', 'OTHER',  # New standardized statuses
+    'Not Started', 'Researching', 'In Progress', 'Applied', 'Accepted',  # Legacy
     'Deadline Likely Passed', 'Deadline Passed', 'Rejected', 'Withdrawn',  # Terminal states
     'Interview', 'Shortlisted', 'Waitlisted'  # Intermediate states
 ]
@@ -210,16 +211,94 @@ class ApplicationsSyncService(TwoWaySyncService):
         """
         Build Notion content blocks from application data.
         The 'content' field contains Q&A and detailed notes that should appear
-        as page content, not just as properties.
+        as page content with proper formatting.
+        
+        Parsing rules:
+        - Lines ending with ? are treated as questions (heading_3)
+        - Lines starting with * or - are bullet points
+        - Lines starting with numbers (1. 2.) are numbered items
+        - [Answer here] or [Your answer] placeholders shown as callouts
+        - Double newlines separate sections
         """
         blocks = []
         builder = ContentBlockBuilder()
 
-        # Content field contains the main Q&A / application content
         content = application.get('content')
-        if content:
-            # Split content into paragraphs and create blocks
-            blocks.extend(builder.chunked_paragraphs(content))
+        if not content:
+            return blocks
+        
+        # Split into lines for parsing
+        lines = content.split('\n')
+        current_paragraph = []
+        
+        for line in lines:
+            stripped = line.strip()
+            
+            if not stripped:
+                # Empty line - flush current paragraph
+                if current_paragraph:
+                    para_text = '\n'.join(current_paragraph)
+                    blocks.extend(builder.chunked_paragraphs(para_text))
+                    current_paragraph = []
+                continue
+            
+            # Question detection (lines ending with ?)
+            if stripped.endswith('?'):
+                # Flush any pending paragraph first
+                if current_paragraph:
+                    para_text = '\n'.join(current_paragraph)
+                    blocks.extend(builder.chunked_paragraphs(para_text))
+                    current_paragraph = []
+                # Add as heading
+                blocks.append(builder.heading_3(stripped))
+                continue
+            
+            # Section headers (all caps, short)
+            if stripped.isupper() and len(stripped) < 80:
+                if current_paragraph:
+                    para_text = '\n'.join(current_paragraph)
+                    blocks.extend(builder.chunked_paragraphs(para_text))
+                    current_paragraph = []
+                blocks.append(builder.heading_2(stripped))
+                continue
+            
+            # Placeholder detection
+            if '[' in stripped and ']' in stripped and ('answer' in stripped.lower() or 'here' in stripped.lower()):
+                if current_paragraph:
+                    para_text = '\n'.join(current_paragraph)
+                    blocks.extend(builder.chunked_paragraphs(para_text))
+                    current_paragraph = []
+                blocks.append(builder.callout(stripped, "✏️"))
+                continue
+            
+            # Bullet points
+            if stripped.startswith(('* ', '- ', '• ')):
+                if current_paragraph:
+                    para_text = '\n'.join(current_paragraph)
+                    blocks.extend(builder.chunked_paragraphs(para_text))
+                    current_paragraph = []
+                blocks.append(builder.bulleted_list_item(stripped[2:]))
+                continue
+            
+            # Numbered items (1. 2. 3. etc)
+            import re
+            if re.match(r'^\d+\.\s', stripped):
+                if current_paragraph:
+                    para_text = '\n'.join(current_paragraph)
+                    blocks.extend(builder.chunked_paragraphs(para_text))
+                    current_paragraph = []
+                # Remove the number prefix
+                text = re.sub(r'^\d+\.\s*', '', stripped)
+                blocks.append(builder.numbered_list_item(text))
+                continue
+            
+            # Regular line - add to current paragraph
+            current_paragraph.append(stripped)
+        
+        # Flush any remaining paragraph
+        if current_paragraph:
+            para_text = '\n'.join(current_paragraph)
+            blocks.extend(builder.chunked_paragraphs(para_text))
 
         return blocks
 
