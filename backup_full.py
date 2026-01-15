@@ -60,6 +60,17 @@ IMPORTANT_TABLES = [
     "beeper_messages",    # Chat history
 ]
 
+KNOWLEDGE_TABLES = [
+    "documents",          # RAG documents
+    "knowledge_chunks",   # RAG embeddings/chunks
+    "chat_messages",      # Chat history with AI
+]
+
+SYSTEM_TABLES = [
+    "sync_logs",          # Sync operation logs
+    "pipeline_logs",      # Audio pipeline logs
+]
+
 OPTIONAL_TABLES = [
     "books",              # Reading list
     "highlights",         # Book highlights
@@ -67,7 +78,7 @@ OPTIONAL_TABLES = [
     "linkedin_posts",     # LinkedIn content
 ]
 
-ALL_TABLES = CRITICAL_TABLES + IMPORTANT_TABLES + OPTIONAL_TABLES
+ALL_TABLES = CRITICAL_TABLES + IMPORTANT_TABLES + KNOWLEDGE_TABLES + SYSTEM_TABLES + OPTIONAL_TABLES
 
 # Supabase Storage bucket for backups
 SUPABASE_BUCKET = "backups"
