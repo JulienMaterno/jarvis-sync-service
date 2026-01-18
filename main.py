@@ -467,14 +467,18 @@ async def sync_everything(background_tasks: BackgroundTasks):
                 results[name] = {"status": "success", "data": res}
                 # Reset failure counter on success
                 reset_failure_count(name)
-                
+
                 # Update sync cursor on success
                 if entity_name:
                     await run_in_threadpool(update_cursor_after_sync, supabase, entity_name, datetime.now(timezone.utc))
-                    
+
             except Exception as e:
                 logger.error(f"{name} failed: {e}")
                 results[name] = {"status": "error", "error": str(e)}
+            finally:
+                # Log step duration for performance monitoring
+                elapsed_ms = (datetime.now(timezone.utc) - step_start).total_seconds() * 1000
+                logger.info(f"⏱️ {name} completed in {elapsed_ms:.0f}ms")
 
         # =====================================================================
         # PHASE 2: Run syncs only for entities with changes
@@ -537,225 +541,233 @@ async def sync_everything(background_tasks: BackgroundTasks):
         # Track sync completion
         _last_sync_end = datetime.now(timezone.utc)
         _last_sync_results = results
-        
+
         # Count successes, skips, and errors for summary
         success_count = sum(1 for r in results.values() if r.get("status") == "success")
         skipped_count = sum(1 for r in results.values() if r.get("status") == "skipped")
         error_count = sum(1 for r in results.values() if r.get("status") == "error")
-        
-        # Record audit for this sync cycle - ALL entities
-        try:
-            inventory = get_database_inventory()
-            
-            # Helper to extract counts from sync results - handles various formats
-            def extract_counts(result_data):
-                if not isinstance(result_data, dict):
-                    return 0, 0, 0
-                # Check for nested 'stats' object first (books, highlights, reflections)
-                stats = result_data.get('stats', result_data)
-                created = stats.get('created', 0) or 0
-                updated = stats.get('updated', 0) or 0
-                deleted = stats.get('deleted', 0) or 0
-                return created, updated, deleted
-            
-            # Core Notion↔Supabase entities with inventory counts
-            for entity in ['contacts', 'meetings', 'tasks', 'reflections', 'journals']:
-                if entity in inventory:
-                    # Extract operation counts from sync results
-                    created, updated, deleted = 0, 0, 0
-                    for sync_key in results:
-                        if entity in sync_key:
-                            c, u, d = extract_counts(results[sync_key].get('data'))
-                            created += c
-                            updated += u
-                            deleted += d
-                    
-                    stats = SyncStats(
-                        entity_type=entity,
-                        supabase_count=inventory[entity].get('supabase', 0),
-                        notion_count=inventory[entity].get('notion', 0),
-                        google_count=inventory[entity].get('google'),
-                        created_in_supabase=created,
-                        updated_in_supabase=updated,
-                        deleted_in_supabase=deleted
+
+        # Log completion immediately (don't wait for audit)
+        sync_duration = (_last_sync_end - _last_sync_start).total_seconds()
+        logger.info(f"LEAN sync complete: {success_count} synced, {skipped_count} skipped (no changes), {error_count} errors in {sync_duration:.1f}s")
+
+        # Define background audit task - runs after response is returned
+        def record_audit_in_background():
+            """Record comprehensive audit for sync run (runs in background to not block response)."""
+            try:
+                audit_start = datetime.now(timezone.utc)
+                logger.info(f"Starting background audit for run {run_id[:8]}...")
+                inventory = get_database_inventory()
+                inventory_duration = (datetime.now(timezone.utc) - audit_start).total_seconds()
+                logger.info(f"⏱️ Inventory collection completed in {inventory_duration:.1f}s")
+
+                # Helper to extract counts from sync results - handles various formats
+                def extract_counts(result_data):
+                    if not isinstance(result_data, dict):
+                        return 0, 0, 0
+                    # Check for nested 'stats' object first (books, highlights, reflections)
+                    stats = result_data.get('stats', result_data)
+                    created = stats.get('created', 0) or 0
+                    updated = stats.get('updated', 0) or 0
+                    deleted = stats.get('deleted', 0) or 0
+                    return created, updated, deleted
+
+                # Core Notion↔Supabase entities with inventory counts
+                for entity in ['contacts', 'meetings', 'tasks', 'reflections', 'journals']:
+                    if entity in inventory:
+                        # Extract operation counts from sync results
+                        created, updated, deleted = 0, 0, 0
+                        for sync_key in results:
+                            if entity in sync_key:
+                                c, u, d = extract_counts(results[sync_key].get('data'))
+                                created += c
+                                updated += u
+                                deleted += d
+
+                        audit_stats = SyncStats(
+                            entity_type=entity,
+                            supabase_count=inventory[entity].get('supabase', 0),
+                            notion_count=inventory[entity].get('notion', 0),
+                            google_count=inventory[entity].get('google'),
+                            created_in_supabase=created,
+                            updated_in_supabase=updated,
+                            deleted_in_supabase=deleted
+                        )
+                        record_sync_audit(
+                            run_id=run_id,
+                            sync_type='scheduled',
+                            entity_type=entity,
+                            stats=audit_stats,
+                            triggered_by='api',
+                            started_at=_last_sync_start,
+                            completed_at=_last_sync_end,
+                            status='success' if results.get(f'{entity}_sync', {}).get('status') == 'success' else 'partial',
+                            details={'sync_results': results.get(f'{entity}_sync')}
+                        )
+
+                # Calendar events (Google → Supabase only)
+                if 'calendar_sync' in results:
+                    cal_data = results['calendar_sync'].get('data', {})
+                    events_created = cal_data.get('events_created', 0) or cal_data.get('created', 0) or 0
+                    events_updated = cal_data.get('events_updated', 0) or cal_data.get('updated', 0) or 0
+                    audit_stats = SyncStats(
+                        entity_type='calendar_events',
+                        supabase_count=inventory.get('calendar_events', {}).get('supabase', 0),
+                        created_in_supabase=events_created,
+                        updated_in_supabase=events_updated
                     )
                     record_sync_audit(
                         run_id=run_id,
                         sync_type='scheduled',
-                        entity_type=entity,
-                        stats=stats,
+                        entity_type='calendar_events',
+                        stats=audit_stats,
                         triggered_by='api',
                         started_at=_last_sync_start,
                         completed_at=_last_sync_end,
-                        status='success' if results.get(f'{entity}_sync', {}).get('status') == 'success' else 'partial',
-                        details={'sync_results': results.get(f'{entity}_sync')}
+                        status=results['calendar_sync'].get('status', 'success'),
+                        details={'sync_results': results['calendar_sync']}
                     )
-            
-            # Calendar events (Google → Supabase only)
-            # Note: Calendar does full upsert each time, so we only track actual DB count
-            # The "count" returned by sync_calendar is "events processed", not "events changed"
-            if 'calendar_sync' in results:
-                cal_data = results['calendar_sync'].get('data', {})
-                # Get actual created/updated from sync result if available
-                events_created = cal_data.get('events_created', 0) or cal_data.get('created', 0) or 0
-                events_updated = cal_data.get('events_updated', 0) or cal_data.get('updated', 0) or 0
-                stats = SyncStats(
-                    entity_type='calendar_events',
-                    supabase_count=inventory.get('calendar_events', {}).get('supabase', 0),
-                    created_in_supabase=events_created,
-                    updated_in_supabase=events_updated
-                )
-                record_sync_audit(
-                    run_id=run_id,
-                    sync_type='scheduled',
-                    entity_type='calendar_events',
-                    stats=stats,
-                    triggered_by='api',
-                    started_at=_last_sync_start,
-                    completed_at=_last_sync_end,
-                    status=results['calendar_sync'].get('status', 'success'),
-                    details={'sync_results': results['calendar_sync']}
-                )
-            
-            # Gmail (Google → Supabase only)
-            if 'gmail_sync' in results:
-                gmail_data = results['gmail_sync'].get('data', {})
-                emails_created = gmail_data.get('emails_created', 0) or gmail_data.get('new_emails', 0) or gmail_data.get('created', 0) or 0
-                emails_updated = gmail_data.get('emails_updated', 0) or gmail_data.get('updated', 0) or 0
-                stats = SyncStats(
-                    entity_type='emails',
-                    supabase_count=inventory.get('emails', {}).get('supabase', 0),
-                    created_in_supabase=emails_created,
-                    updated_in_supabase=emails_updated
-                )
-                record_sync_audit(
-                    run_id=run_id,
-                    sync_type='scheduled',
-                    entity_type='emails',
-                    stats=stats,
-                    triggered_by='api',
-                    started_at=_last_sync_start,
-                    completed_at=_last_sync_end,
-                    status=results['gmail_sync'].get('status', 'success'),
-                    details={'sync_results': results['gmail_sync']}
-                )
-            
-            # Beeper (Beeper Bridge → Supabase) - Cloud tracks this separately
-            if 'beeper_sync' in results:
-                beeper_data = results['beeper_sync'].get('data', {})
-                chats_created = beeper_data.get('chats_created', 0) or 0
-                chats_updated = beeper_data.get('chats_updated', 0) or 0
-                messages_new = beeper_data.get('messages_new', 0) or 0
-                
-                # Record beeper_chats audit
-                stats_chats = SyncStats(
-                    entity_type='beeper_chats',
-                    supabase_count=inventory.get('beeper_chats', {}).get('supabase', 0),
-                    created_in_supabase=chats_created,
-                    updated_in_supabase=chats_updated
-                )
-                record_sync_audit(
-                    run_id=run_id,
-                    sync_type='scheduled',
-                    entity_type='beeper_chats',
-                    stats=stats_chats,
-                    triggered_by='api',
-                    started_at=_last_sync_start,
-                    completed_at=_last_sync_end,
-                    status=results['beeper_sync'].get('status', 'success'),
-                    details={'sync_results': results['beeper_sync']}
-                )
-                
-                # Record beeper_messages audit
-                stats = SyncStats(
-                    entity_type='beeper_messages',
-                    supabase_count=inventory.get('beeper_messages', {}).get('supabase', 0),
-                    created_in_supabase=messages_new,
-                    updated_in_supabase=0
-                )
-                record_sync_audit(
-                    run_id=run_id,
-                    sync_type='scheduled',
-                    entity_type='beeper_messages',
-                    stats=stats,
-                    triggered_by='api',
-                    started_at=_last_sync_start,
-                    completed_at=_last_sync_end,
-                    status=results['beeper_sync'].get('status', 'success'),
-                    details={'sync_results': results['beeper_sync']}
-                )
-            
-            # Books (Notion → Supabase only)
-            if 'books_sync' in results:
-                created, updated, _ = extract_counts(results['books_sync'].get('data', {}))
-                stats = SyncStats(
-                    entity_type='books',
-                    supabase_count=inventory.get('books', {}).get('supabase', 0),
-                    notion_count=inventory.get('books', {}).get('notion') or 0,
-                    created_in_supabase=created,
-                    updated_in_supabase=updated
-                )
-                record_sync_audit(
-                    run_id=run_id,
-                    sync_type='scheduled',
-                    entity_type='books',
-                    stats=stats,
-                    triggered_by='api',
-                    started_at=_last_sync_start,
-                    completed_at=_last_sync_end,
-                    status=results['books_sync'].get('status', 'success'),
-                    details={'sync_results': results['books_sync']}
-                )
-            
-            # Highlights (Notion → Supabase only)
-            if 'highlights_sync' in results:
-                created, updated, _ = extract_counts(results['highlights_sync'].get('data', {}))
-                stats = SyncStats(
-                    entity_type='highlights',
-                    supabase_count=inventory.get('highlights', {}).get('supabase', 0),
-                    notion_count=inventory.get('highlights', {}).get('notion') or 0,
-                    created_in_supabase=created,
-                    updated_in_supabase=updated
-                )
-                record_sync_audit(
-                    run_id=run_id,
-                    sync_type='scheduled',
-                    entity_type='highlights',
-                    stats=stats,
-                    triggered_by='api',
-                    started_at=_last_sync_start,
-                    completed_at=_last_sync_end,
-                    status=results['highlights_sync'].get('status', 'success'),
-                    details={'sync_results': results['highlights_sync']}
-                )
-            
-            # Build consolidated summary of changes
-            changes_summary = []
-            for entity in ['contacts', 'meetings', 'tasks', 'reflections', 'journals', 'calendar_events', 'emails', 'books', 'highlights', 'beeper_chats', 'beeper_messages']:
-                sync_key = f'{entity}_sync' if entity not in ['contacts', 'calendar_events', 'emails', 'beeper_chats', 'beeper_messages'] else entity.replace('_', ' ')
-                # Find the right key in results
-                for key in results:
-                    if entity.replace('_', '') in key.replace('_', '').lower():
-                        data = results[key].get('data', {})
-                        if isinstance(data, dict):
-                            stats = data.get('stats', data)
-                            c = stats.get('created', 0) or 0
-                            u = stats.get('updated', 0) or 0
-                            d = stats.get('deleted', 0) or 0
-                            if c or u or d:
-                                changes_summary.append(f"{entity}:{c}c/{u}u/{d}d")
-                        break
-            
-            if changes_summary:
-                logger.info(f"📊 SYNC CHANGES: {', '.join(changes_summary)}")
-            else:
-                logger.info("📊 SYNC CHANGES: No changes detected")
-            
-            logger.info(f"Recorded comprehensive audit for sync run {run_id[:8]}")
-        except Exception as e:
-            logger.error(f"Failed to record sync audit: {e}", exc_info=True)
-        
-        logger.info(f"LEAN sync complete: {success_count} synced, {skipped_count} skipped (no changes), {error_count} errors")
+
+                # Gmail (Google → Supabase only)
+                if 'gmail_sync' in results:
+                    gmail_data = results['gmail_sync'].get('data', {})
+                    emails_created = gmail_data.get('emails_created', 0) or gmail_data.get('new_emails', 0) or gmail_data.get('created', 0) or 0
+                    emails_updated = gmail_data.get('emails_updated', 0) or gmail_data.get('updated', 0) or 0
+                    audit_stats = SyncStats(
+                        entity_type='emails',
+                        supabase_count=inventory.get('emails', {}).get('supabase', 0),
+                        created_in_supabase=emails_created,
+                        updated_in_supabase=emails_updated
+                    )
+                    record_sync_audit(
+                        run_id=run_id,
+                        sync_type='scheduled',
+                        entity_type='emails',
+                        stats=audit_stats,
+                        triggered_by='api',
+                        started_at=_last_sync_start,
+                        completed_at=_last_sync_end,
+                        status=results['gmail_sync'].get('status', 'success'),
+                        details={'sync_results': results['gmail_sync']}
+                    )
+
+                # Beeper (Beeper Bridge → Supabase)
+                if 'beeper_sync' in results:
+                    beeper_data = results['beeper_sync'].get('data', {})
+                    chats_created = beeper_data.get('chats_created', 0) or 0
+                    chats_updated = beeper_data.get('chats_updated', 0) or 0
+                    messages_new = beeper_data.get('messages_new', 0) or 0
+
+                    # Record beeper_chats audit
+                    stats_chats = SyncStats(
+                        entity_type='beeper_chats',
+                        supabase_count=inventory.get('beeper_chats', {}).get('supabase', 0),
+                        created_in_supabase=chats_created,
+                        updated_in_supabase=chats_updated
+                    )
+                    record_sync_audit(
+                        run_id=run_id,
+                        sync_type='scheduled',
+                        entity_type='beeper_chats',
+                        stats=stats_chats,
+                        triggered_by='api',
+                        started_at=_last_sync_start,
+                        completed_at=_last_sync_end,
+                        status=results['beeper_sync'].get('status', 'success'),
+                        details={'sync_results': results['beeper_sync']}
+                    )
+
+                    # Record beeper_messages audit
+                    stats_msgs = SyncStats(
+                        entity_type='beeper_messages',
+                        supabase_count=inventory.get('beeper_messages', {}).get('supabase', 0),
+                        created_in_supabase=messages_new,
+                        updated_in_supabase=0
+                    )
+                    record_sync_audit(
+                        run_id=run_id,
+                        sync_type='scheduled',
+                        entity_type='beeper_messages',
+                        stats=stats_msgs,
+                        triggered_by='api',
+                        started_at=_last_sync_start,
+                        completed_at=_last_sync_end,
+                        status=results['beeper_sync'].get('status', 'success'),
+                        details={'sync_results': results['beeper_sync']}
+                    )
+
+                # Books (Notion → Supabase only)
+                if 'books_sync' in results:
+                    created, updated, _ = extract_counts(results['books_sync'].get('data', {}))
+                    audit_stats = SyncStats(
+                        entity_type='books',
+                        supabase_count=inventory.get('books', {}).get('supabase', 0),
+                        notion_count=inventory.get('books', {}).get('notion') or 0,
+                        created_in_supabase=created,
+                        updated_in_supabase=updated
+                    )
+                    record_sync_audit(
+                        run_id=run_id,
+                        sync_type='scheduled',
+                        entity_type='books',
+                        stats=audit_stats,
+                        triggered_by='api',
+                        started_at=_last_sync_start,
+                        completed_at=_last_sync_end,
+                        status=results['books_sync'].get('status', 'success'),
+                        details={'sync_results': results['books_sync']}
+                    )
+
+                # Highlights (Notion → Supabase only)
+                if 'highlights_sync' in results:
+                    created, updated, _ = extract_counts(results['highlights_sync'].get('data', {}))
+                    audit_stats = SyncStats(
+                        entity_type='highlights',
+                        supabase_count=inventory.get('highlights', {}).get('supabase', 0),
+                        notion_count=inventory.get('highlights', {}).get('notion') or 0,
+                        created_in_supabase=created,
+                        updated_in_supabase=updated
+                    )
+                    record_sync_audit(
+                        run_id=run_id,
+                        sync_type='scheduled',
+                        entity_type='highlights',
+                        stats=audit_stats,
+                        triggered_by='api',
+                        started_at=_last_sync_start,
+                        completed_at=_last_sync_end,
+                        status=results['highlights_sync'].get('status', 'success'),
+                        details={'sync_results': results['highlights_sync']}
+                    )
+
+                # Build consolidated summary of changes
+                changes_summary = []
+                for entity in ['contacts', 'meetings', 'tasks', 'reflections', 'journals', 'calendar_events', 'emails', 'books', 'highlights', 'beeper_chats', 'beeper_messages']:
+                    for key in results:
+                        if entity.replace('_', '') in key.replace('_', '').lower():
+                            data = results[key].get('data', {})
+                            if isinstance(data, dict):
+                                s = data.get('stats', data)
+                                c = s.get('created', 0) or 0
+                                u = s.get('updated', 0) or 0
+                                d = s.get('deleted', 0) or 0
+                                if c or u or d:
+                                    changes_summary.append(f"{entity}:{c}c/{u}u/{d}d")
+                            break
+
+                if changes_summary:
+                    logger.info(f"📊 SYNC CHANGES: {', '.join(changes_summary)}")
+                else:
+                    logger.info("📊 SYNC CHANGES: No changes detected")
+
+                audit_duration = (datetime.now(timezone.utc) - audit_start).total_seconds()
+                logger.info(f"✅ Background audit completed for run {run_id[:8]} in {audit_duration:.1f}s")
+
+            except Exception as e:
+                logger.error(f"Failed to record sync audit: {e}", exc_info=True)
+
+        # Schedule audit to run in background (doesn't block response)
+        background_tasks.add_task(record_audit_in_background)
         
         return {
             "status": "completed",
