@@ -34,6 +34,7 @@ NOTION_DB_IDS = {
     'tasks': os.environ.get('NOTION_TASK_DB_ID', '1f7cd3f1-eb28-80ec-85b9-dc9f5e3e50ac'),
     'reflections': os.environ.get('NOTION_REFLECTIONS_DB_ID', '1f7cd3f1-eb28-8062-8bf6-de95f57f39ef'),
     'journals': os.environ.get('NOTION_JOURNALS_DB_ID', '1f7cd3f1-eb28-8032-9a5c-f91afab45c6b'),
+    'contacts': os.environ.get('NOTION_CRM_DATABASE_ID', '2d1068b5-e624-81e8-9c1c-f1d45c33e420'),
 }
 
 

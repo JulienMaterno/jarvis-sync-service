@@ -484,10 +484,13 @@ async def sync_everything(background_tasks: BackgroundTasks):
         # PHASE 2: Run syncs only for entities with changes
         # =====================================================================
         
-        # === CONTACTS SYNC (always run - has Google component) ===
-        await run_step("notion_to_supabase", sync_notion_to_supabase)
-        await run_step("google_sync", sync_contacts)
-        await run_step("supabase_to_notion", sync_supabase_to_notion)
+        # === CONTACTS SYNC (conditional - checks Notion CRM + Supabase changes) ===
+        if 'contacts' in synced_entities:
+            await run_step("notion_to_supabase", sync_notion_to_supabase, entity_name='contacts')
+            await run_step("google_sync", sync_contacts)
+            await run_step("supabase_to_notion", sync_supabase_to_notion)
+        else:
+            results["contacts_sync"] = {"status": "skipped", "reason": "no_changes"}
         
         # === MEETINGS SYNC (conditional) ===
         if 'meetings' in synced_entities:
