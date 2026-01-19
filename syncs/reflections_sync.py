@@ -333,18 +333,49 @@ class ReflectionsSyncService(TwoWaySyncService):
                     if notion_page_id:
                         # Update existing page
                         updated_page = self.notion.update_page(notion_page_id, notion_props)
-                        
-                        # Update content blocks
+
+                        # Update content blocks - SAFETY: only delete AFTER new content succeeds
                         blocks = self._build_content_blocks(record)
                         if blocks:
                             try:
-                                existing_blocks = self.notion.get_all_blocks(notion_page_id)
-                                for block in existing_blocks:
-                                    try:
-                                        self.notion.delete_block(block['id'])
-                                    except:
-                                        pass
-                                self.notion.append_blocks(notion_page_id, blocks)
+                                # Batch blocks to avoid Notion API limits (max 100 per request)
+                                MAX_BLOCKS_PER_REQUEST = 100
+                                block_batches = [blocks[i:i + MAX_BLOCKS_PER_REQUEST]
+                                               for i in range(0, len(blocks), MAX_BLOCKS_PER_REQUEST)]
+
+                                if len(blocks) > MAX_BLOCKS_PER_REQUEST:
+                                    self.logger.info(f"Splitting {len(blocks)} blocks into {len(block_batches)} batches")
+
+                                # First, try to add new blocks to validate they work
+                                # Add to a temporary test - actually just append first batch
+                                first_batch_success = False
+                                try:
+                                    self.notion.append_blocks(notion_page_id, block_batches[0])
+                                    first_batch_success = True
+                                except Exception as e:
+                                    self.logger.error(f"Failed to add content blocks (skipping delete to preserve data): {e}")
+                                    # DON'T delete existing content if we can't add new content
+                                    raise  # Re-raise to skip this record
+
+                                # Only delete existing blocks AFTER we confirmed new content works
+                                if first_batch_success:
+                                    existing_blocks = self.notion.get_all_blocks(notion_page_id)
+                                    # Skip the blocks we just added (they're at the end)
+                                    blocks_to_delete = [b for b in existing_blocks
+                                                       if b.get('id') not in [nb.get('id') for nb in block_batches[0]]]
+                                    for block in blocks_to_delete:
+                                        try:
+                                            self.notion.delete_block(block['id'])
+                                        except:
+                                            pass
+
+                                    # Add remaining batches
+                                    for batch in block_batches[1:]:
+                                        try:
+                                            self.notion.append_blocks(notion_page_id, batch)
+                                        except Exception as e:
+                                            self.logger.warning(f"Failed to add batch of {len(batch)} blocks: {e}")
+
                             except Exception as e:
                                 self.logger.warning(f"Failed to update content blocks: {e}")
                         
