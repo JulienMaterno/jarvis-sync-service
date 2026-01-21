@@ -43,6 +43,9 @@ from sync_activitywatch import run_activitywatch_sync, ActivityWatchSync, format
 # Import Beeper sync
 from sync_beeper import run_beeper_sync, run_beeper_relink
 
+# Import Anki sync
+from syncs.anki_sync import run_anki_sync
+
 # Import Supabase client for Beeper sync
 from lib.supabase_client import supabase
 
@@ -540,7 +543,25 @@ async def sync_everything(background_tasks: BackgroundTasks):
         # === BEEPER SYNC (WhatsApp/Telegram/LinkedIn messages) ===
         # This gracefully handles offline laptop - just skips and catches up next run
         await run_step("beeper_sync", run_beeper_sync, supabase, full_sync=False)
-        
+
+        # === ANKI SYNC (Supabase ↔ Anki Desktop) - Daily at 3 AM ===
+        # Only runs once per day at 3 AM (requires local Anki Desktop with AnkiConnect)
+        if os.getenv("ANKI_SYNC_ENABLED", "false").lower() == "true":
+            current_hour = datetime.now(timezone.utc).hour
+            daily_hour = int(os.getenv("ANKI_SYNC_DAILY_HOUR", "3"))
+
+            if current_hour == daily_hour:
+                logger.info(f"Running daily Anki sync (hour={current_hour})")
+                await run_step("anki_sync", run_anki_sync, supabase)
+            else:
+                results["anki_sync"] = {
+                    "status": "skipped",
+                    "reason": f"scheduled_for_hour_{daily_hour}_utc",
+                    "current_hour": current_hour
+                }
+        else:
+            results["anki_sync"] = {"status": "disabled", "reason": "ANKI_SYNC_ENABLED not set"}
+
         # Track sync completion
         _last_sync_end = datetime.now(timezone.utc)
         _last_sync_results = results
@@ -1669,6 +1690,51 @@ async def sync_documents(full: bool = False, hours: int = 24):
     except Exception as e:
         logger.error(f"Documents sync failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Anki Sync ---
+
+@app.post("/sync/anki/manual")
+async def sync_anki_manual(test_mode: bool = False):
+    """
+    Manual trigger for Anki sync (Supabase ↔ Anki Desktop via AnkiConnect).
+
+    Requires:
+    - Anki Desktop running with AnkiConnect add-on installed
+    - ANKI_SYNC_ENABLED=true in environment
+
+    Performs:
+    - Initial import of all existing Anki decks (first run only)
+    - Bidirectional sync (Supabase → Anki → Supabase)
+    - Review history sync
+
+    Args:
+        test_mode: If True, limits import to 2 decks with 10 cards each (for testing large DBs)
+
+    Returns:
+        Sync result with import/cards/reviews statistics
+    """
+    if os.getenv("ANKI_SYNC_ENABLED", "false").lower() != "true":
+        return {
+            "status": "disabled",
+            "message": "Anki sync not enabled. Set ANKI_SYNC_ENABLED=true in .env"
+        }
+
+    try:
+        if test_mode:
+            logger.info("Starting manual Anki sync in TEST MODE (limited import)...")
+        else:
+            logger.info("Starting manual Anki sync...")
+        result = await run_anki_sync(supabase, test_mode=test_mode)
+        logger.info(f"Anki sync completed: {result.get('status')}")
+        return result
+    except Exception as e:
+        logger.error(f"Anki sync failed: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "message": str(e),
+            "hint": "Make sure Anki Desktop is running with AnkiConnect add-on installed"
+        }
 
 
 # --- ActivityWatch Sync ---
