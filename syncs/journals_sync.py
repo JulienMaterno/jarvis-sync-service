@@ -432,20 +432,20 @@ class JournalsSyncService(TwoWaySyncService):
                                                for i in range(0, len(blocks), MAX_BLOCKS_PER_REQUEST)]
 
                                 # SAFETY: Try to add first batch BEFORE deleting anything
-                                first_batch_success = False
+                                newly_added_ids = []
                                 try:
-                                    self.notion.append_blocks(notion_page_id, block_batches[0])
-                                    first_batch_success = True
+                                    added_blocks = self.notion.append_blocks(notion_page_id, block_batches[0])
+                                    newly_added_ids = [b.get('id') for b in added_blocks if b.get('id')]
                                 except Exception as e:
                                     self.logger.error(f"Failed to add content blocks (skipping delete to preserve data): {e}")
                                     raise  # Don't delete if we can't add
 
                                 # Only delete existing blocks AFTER we confirmed new content works
-                                if first_batch_success:
+                                if newly_added_ids:
                                     existing_blocks = self.notion.get_all_blocks(notion_page_id)
-                                    # Skip the blocks we just added (they're at the end)
+                                    # Skip the blocks we just added (filter by their IDs)
                                     blocks_to_delete = [b for b in existing_blocks
-                                                       if b.get('id') not in [nb.get('id') for nb in block_batches[0]]]
+                                                       if b.get('id') not in newly_added_ids]
                                     for block in blocks_to_delete:
                                         try:
                                             self.notion.delete_block(block['id'])
