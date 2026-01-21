@@ -924,6 +924,25 @@ async def sync_reflections(full: bool = False, hours: int = 24):
         logger.error(f"Reflection sync failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# --- Journal Sync ---
+
+@app.post("/sync/journals")
+async def sync_journals(full: bool = False, hours: int = 24):
+    """
+    Bidirectional sync between Notion and Supabase for journals (daily entries).
+
+    Args:
+        full: If True, performs full sync. If False, incremental sync.
+        hours: For incremental sync, how many hours to look back (default 24).
+    """
+    try:
+        logger.info(f"Starting journal sync via API (full={full}, hours={hours})")
+        result = await run_in_threadpool(run_journal_sync, full_sync=full, since_hours=hours)
+        return result
+    except Exception as e:
+        logger.error(f"Journal sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # --- Calendar Sync ---
 
 @app.post("/sync/calendar")
