@@ -169,16 +169,37 @@ class DocumentsSyncService(TwoWaySyncService):
     
     def _build_content_blocks(self, document: Dict) -> List[Dict]:
         """
-        Build Notion content blocks from document content.
+        Build Notion content blocks from document data.
+
+        Priority:
+        1. Use 'sections' field (JSONB) if present - structured format
+        2. Fallback to 'content' field if no sections
+
+        Sections format: [{heading: str, content: str}]
         """
         blocks = []
         builder = ContentBlockBuilder()
-        
+
+        # PRIORITY: Use sections if present
+        sections = document.get('sections', [])
+        if sections:
+            for section in sections:
+                heading = section.get('heading', '')
+                content = section.get('content', '')
+
+                if heading:
+                    blocks.append(builder.heading_2(heading))
+
+                if content:
+                    blocks.extend(builder.chunked_paragraphs(content))
+
+            return blocks
+
+        # FALLBACK: Use content field
         content = document.get('content', '')
         if content:
-            # Split content into manageable blocks
             blocks.extend(builder.chunked_paragraphs(content))
-        
+
         return blocks
     
     def _calculate_content_metrics(self, content: str) -> Dict[str, int]:
