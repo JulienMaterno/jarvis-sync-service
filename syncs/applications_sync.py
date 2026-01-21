@@ -210,24 +210,38 @@ class ApplicationsSyncService(TwoWaySyncService):
     def _build_content_blocks(self, application: Dict) -> List[Dict]:
         """
         Build Notion content blocks from application data.
-        The 'content' field contains Q&A and detailed notes in markdown format.
 
-        Parses basic markdown syntax:
-        - # Heading 1, ## Heading 2, ### Heading 3
-        - - or * for bullet points
-        - 1. 2. 3. for numbered lists
-        - Regular text as paragraphs
+        Priority:
+        1. Use 'sections' field (JSONB) if present - structured format
+        2. Fallback to 'content' field (markdown) if no sections
 
-        This allows the LLM to write natural markdown which displays properly in Notion.
+        Sections format: [{heading: str, content: str}]
+        This provides clean structure and enables reliable appending.
         """
-        import re
+        blocks = []
         builder = ContentBlockBuilder()
 
+        # PRIORITY: Use sections if present
+        sections = application.get('sections', [])
+        if sections:
+            for section in sections:
+                heading = section.get('heading', '')
+                content = section.get('content', '')
+
+                if heading:
+                    blocks.append(builder.heading_2(heading))
+
+                if content:
+                    blocks.extend(builder.chunked_paragraphs(content))
+
+            return blocks
+
+        # FALLBACK: Parse markdown content field
         content = application.get('content')
         if not content:
             return []
 
-        blocks = []
+        import re
         lines = content.split('\n')
         current_paragraph = []
 
@@ -425,20 +439,47 @@ class ApplicationsSyncService(TwoWaySyncService):
                         updated_page = self.notion.update_page(notion_page_id, notion_props)
                         metrics.notion_api_calls += 1
 
-                        # Update content blocks if we have content
+                        # Update content blocks if we have content (SAFE PATTERN)
                         if blocks:
                             try:
-                                # Delete existing blocks and append new ones
-                                existing_blocks = self.notion.get_all_blocks(notion_page_id)
-                                for block in existing_blocks:
-                                    try:
-                                        self.notion.delete_block(block['id'])
-                                    except Exception:
-                                        pass
-                                self.notion.append_blocks(notion_page_id, blocks)
-                                metrics.notion_api_calls += 2
+                                # Batch blocks to avoid Notion API limits
+                                MAX_BLOCKS_PER_REQUEST = 100
+                                block_batches = [blocks[i:i + MAX_BLOCKS_PER_REQUEST]
+                                               for i in range(0, len(blocks), MAX_BLOCKS_PER_REQUEST)]
+
+                                # SAFETY: Try to add first batch BEFORE deleting anything
+                                first_batch_success = False
+                                try:
+                                    self.notion.append_blocks(notion_page_id, block_batches[0])
+                                    first_batch_success = True
+                                    metrics.notion_api_calls += 1
+                                except Exception as e:
+                                    self.logger.error(f"Failed to add content blocks (skipping delete to preserve data): {e}")
+                                    raise  # Don't delete if we can't add
+
+                                # Only delete existing blocks AFTER we confirmed new content works
+                                if first_batch_success:
+                                    existing_blocks = self.notion.get_all_blocks(notion_page_id)
+                                    # Skip the blocks we just added (they're at the end)
+                                    blocks_to_delete = [b for b in existing_blocks
+                                                       if b.get('id') not in [nb.get('id') for nb in block_batches[0]]]
+                                    for block in blocks_to_delete:
+                                        try:
+                                            self.notion.delete_block(block['id'])
+                                        except:
+                                            pass
+                                    metrics.notion_api_calls += 1
+
+                                    # Add remaining batches
+                                    for batch in block_batches[1:]:
+                                        try:
+                                            self.notion.append_blocks(notion_page_id, batch)
+                                            metrics.notion_api_calls += 1
+                                        except Exception as e:
+                                            self.logger.warning(f"Failed to add batch of {len(batch)} blocks: {e}")
+
                             except Exception as e:
-                                self.logger.warning(f"Failed to update content blocks: {format_exception(e)}")
+                                self.logger.warning(f"Failed to update content blocks: {e}")
 
                         # Update Supabase with new timestamp
                         self.supabase.update(record['id'], {

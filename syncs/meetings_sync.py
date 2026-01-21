@@ -434,21 +434,37 @@ class MeetingsSyncService(TwoWaySyncService):
     def _build_meeting_content_blocks(self, meeting: Dict) -> List[Dict]:
         """
         Build Notion content blocks from meeting data.
-        Handles complex JSONB structures (topics_discussed, follow_up_items, key_points).
-        
-        Format:
-        - Summary as paragraph(s)
-        - Topics as numbered list (1. Topic Name) with bullet children for details
-        - Follow-ups as to-do items
-        - Key points as bullets
+
+        Priority:
+        1. Use 'sections' field (JSONB) if present - structured format [{heading, content}]
+        2. Fallback to complex JSONB structures (topics_discussed, follow_up_items, key_points)
+        3. Fallback to 'summary' field if nothing else
+
+        Sections format provides clean structure and enables reliable appending.
         """
         blocks = []
         builder = ContentBlockBuilder()
-        
+
+        # PRIORITY: Use sections if present
+        sections = meeting.get('sections', [])
+        if sections:
+            for section in sections:
+                heading = section.get('heading', '')
+                content = section.get('content', '')
+
+                if heading:
+                    blocks.append(builder.heading_2(heading))
+
+                if content:
+                    blocks.extend(builder.chunked_paragraphs(content))
+
+            return blocks
+
+        # FALLBACK: Use summary and structured fields
         # Summary
         if meeting.get('summary'):
             blocks.extend(builder.chunked_paragraphs(meeting['summary']))
-        
+
         # Topics discussed - use NUMBERED list with NESTED bullet children for details
         topics = meeting.get('topics_discussed', [])
         if topics:
@@ -463,15 +479,15 @@ class MeetingsSyncService(TwoWaySyncService):
                         for detail in details[:7]:  # Max 7 details per topic
                             if detail:
                                 detail_children.append(builder.bulleted_list_item(detail[:2000]))
-                        
+
                         # Create numbered item with nested bullet children
                         blocks.append(builder.numbered_list_item(
-                            topic_text[:2000], 
+                            topic_text[:2000],
                             children=detail_children if detail_children else None
                         ))
                 elif isinstance(topic, str) and topic:
                     blocks.append(builder.numbered_list_item(topic[:2000]))
-        
+
         # Follow-up items
         follow_ups = meeting.get('follow_up_items', [])
         if follow_ups:
@@ -485,7 +501,7 @@ class MeetingsSyncService(TwoWaySyncService):
                         blocks.append(builder.to_do(item_text[:2000]))
                 elif isinstance(item, str) and item:
                     blocks.append(builder.to_do(item[:2000]))
-        
+
         # Key points
         key_points = meeting.get('key_points', [])
         if key_points:
@@ -495,10 +511,10 @@ class MeetingsSyncService(TwoWaySyncService):
                     point_text = point.get('point', point.get('text', str(point)))
                 else:
                     point_text = str(point) if point else ''
-                
+
                 if point_text:
                     blocks.append(builder.bulleted_list_item(point_text[:2000]))
-        
+
         return blocks
     
     def _sync_notion_deletions(self) -> int:
