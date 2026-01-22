@@ -355,11 +355,20 @@ class NotionClient:
         }
         if children:
             body["children"] = children
-        
+
         response = self.client.post(
             'https://api.notion.com/v1/pages',
             json=body
         )
+
+        # Log full error response for debugging
+        if not response.is_success:
+            try:
+                error_data = response.json()
+                logger.error(f"Notion API error creating page: {error_data}")
+            except:
+                logger.error(f"Notion API error creating page (no JSON): {response.text}")
+
         response.raise_for_status()
         return response.json()
     
