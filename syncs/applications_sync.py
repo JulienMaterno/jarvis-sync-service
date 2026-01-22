@@ -147,7 +147,7 @@ class ApplicationsSyncService(TwoWaySyncService):
             'website': NotionPropertyExtractor.url(props, 'Website'),
             'grant_amount': NotionPropertyExtractor.rich_text(props, 'Grant Amount'),
             'deadline': NotionPropertyExtractor.date(props, 'Deadline'),
-            'location': NotionPropertyExtractor.select(props, 'Location'),  # New field
+            'location': NotionPropertyExtractor.rich_text(props, 'Location'),
             'context': NotionPropertyExtractor.rich_text(props, 'Context'),
             'notes': NotionPropertyExtractor.rich_text(props, 'Notes'),
         }
@@ -197,11 +197,11 @@ class ApplicationsSyncService(TwoWaySyncService):
         deadline = supabase_record.get('deadline')
         if deadline:
             properties['Deadline'] = NotionPropertyBuilder.date(deadline)
-        
-        # Location (select) - any value, Notion handles select options
+
+        # Location (rich_text) - using rich_text instead of select to allow commas
         location = supabase_record.get('location')
         if location:
-            properties['Location'] = NotionPropertyBuilder.select(location)
+            properties['Location'] = NotionPropertyBuilder.rich_text(location)
         
         # Context (rich_text)
         context = supabase_record.get('context')
