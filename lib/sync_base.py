@@ -365,9 +365,9 @@ class NotionClient:
         if not response.is_success:
             try:
                 error_data = response.json()
-                logger.error(f"Notion API error creating page: {error_data}")
+                self.logger.error(f"Notion API error creating page: {error_data}")
             except:
-                logger.error(f"Notion API error creating page (no JSON): {response.text}")
+                self.logger.error(f"Notion API error creating page (no JSON): {response.text}")
 
         response.raise_for_status()
         return response.json()
