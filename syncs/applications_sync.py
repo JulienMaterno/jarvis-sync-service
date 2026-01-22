@@ -442,37 +442,30 @@ class ApplicationsSyncService(TwoWaySyncService):
                         # Update content blocks if we have content (SAFE PATTERN)
                         if blocks:
                             try:
-                                # Batch blocks to avoid Notion API limits
-                                MAX_BLOCKS_PER_REQUEST = 100
-                                block_batches = [blocks[i:i + MAX_BLOCKS_PER_REQUEST]
-                                               for i in range(0, len(blocks), MAX_BLOCKS_PER_REQUEST)]
+                                # Get existing blocks first
+                                existing_blocks = self.notion.get_all_blocks(notion_page_id)
+                                metrics.notion_api_calls += 1
 
-                                # SAFETY: Try to add first batch BEFORE deleting anything
-                                newly_added_ids = []
-                                try:
-                                    added_blocks = self.notion.append_blocks(notion_page_id, block_batches[0])
-                                    newly_added_ids = [b.get('id') for b in added_blocks if b.get('id')]
-                                    metrics.notion_api_calls += 1
-                                except Exception as e:
-                                    self.logger.error(f"Failed to add content blocks (skipping delete to preserve data): {e}")
-                                    raise  # Don't delete if we can't add
-
-                                # Only delete existing blocks AFTER we confirmed new content works
-                                if newly_added_ids:
-                                    existing_blocks = self.notion.get_all_blocks(notion_page_id)
-                                    metrics.notion_api_calls += 1
-                                    # Skip the blocks we just added (filter by their IDs)
-                                    blocks_to_delete = [b for b in existing_blocks
-                                                       if b.get('id') not in newly_added_ids]
-                                    for block in blocks_to_delete:
+                                # Only update if content changed (compare block count as simple heuristic)
+                                # This prevents unnecessary deletions when content is identical
+                                if len(existing_blocks) == len(blocks):
+                                    self.logger.debug(f"Skipping block update for '{record.get('name')}' - same block count")
+                                else:
+                                    # Delete ALL existing blocks first
+                                    for block in existing_blocks:
                                         try:
                                             self.notion.delete_block(block['id'])
                                             metrics.notion_api_calls += 1
                                         except:
                                             pass
 
-                                    # Add remaining batches
-                                    for batch in block_batches[1:]:
+                                    # Batch blocks to avoid Notion API limits
+                                    MAX_BLOCKS_PER_REQUEST = 100
+                                    block_batches = [blocks[i:i + MAX_BLOCKS_PER_REQUEST]
+                                                   for i in range(0, len(blocks), MAX_BLOCKS_PER_REQUEST)]
+
+                                    # Add all batches
+                                    for batch in block_batches:
                                         try:
                                             self.notion.append_blocks(notion_page_id, batch)
                                             metrics.notion_api_calls += 1
