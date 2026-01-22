@@ -198,13 +198,11 @@ class ApplicationsSyncService(TwoWaySyncService):
         if deadline:
             properties['Deadline'] = NotionPropertyBuilder.date(deadline)
 
-        # Location - TEMPORARILY DISABLED
-        # Notion database has Location as Select (doesn't allow commas)
-        # Need to manually change it to Rich Text in Notion first
-        # location = supabase_record.get('location')
-        # if location:
-        #     properties['Location'] = NotionPropertyBuilder.rich_text(location)
-        
+        # Location (rich_text) - standardized to country names or "Remote"
+        location = supabase_record.get('location')
+        if location:
+            properties['Location'] = NotionPropertyBuilder.rich_text(location)
+
         # Context (rich_text)
         context = supabase_record.get('context')
         if context:
