@@ -134,10 +134,15 @@ class ApplicationsSyncService(TwoWaySyncService):
         if not name:
             name = 'Untitled Application'
         
+        # Extract status and convert from Notion format to database enum
+        # "In Progress" -> "IN_PROGRESS", "Not Started" -> "NOT_STARTED"
+        status_notion = NotionPropertyExtractor.select(props, 'Status') or 'Not Started'
+        status_enum = status_notion.upper().replace(' ', '_')
+
         result = {
             'name': name,
             'application_type': NotionPropertyExtractor.select(props, 'Type'),
-            'status': NotionPropertyExtractor.select(props, 'Status') or 'Not Started',
+            'status': status_enum,
             'institution': NotionPropertyExtractor.rich_text(props, 'Institution'),
             'website': NotionPropertyExtractor.url(props, 'Website'),
             'grant_amount': NotionPropertyExtractor.rich_text(props, 'Grant Amount'),
@@ -164,11 +169,14 @@ class ApplicationsSyncService(TwoWaySyncService):
         app_type = supabase_record.get('application_type')
         if app_type:
             properties['Type'] = NotionPropertyBuilder.select(app_type)
-        
-        # Status (select) - accept ANY value, Notion auto-creates options
+
+        # Status (select) - convert database enum to human-readable format
         status = supabase_record.get('status')
         if status:
-            properties['Status'] = NotionPropertyBuilder.select(status)
+            # Convert underscore-separated enum to Title Case for Notion
+            # IN_PROGRESS -> In Progress, NOT_INTERESTING -> Not Interesting
+            formatted_status = status.replace('_', ' ').title()
+            properties['Status'] = NotionPropertyBuilder.select(formatted_status)
         
         # Institution (rich_text)
         institution = supabase_record.get('institution')
