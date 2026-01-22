@@ -241,7 +241,16 @@ class ReflectionsSyncService(TwoWaySyncService):
                     except Exception as e:
                         self.logger.warning(f"Failed to extract content: {e}")
                         data['content'] = ''
-                    
+
+                    # Extract structured sections (heading_2 + content)
+                    try:
+                        sections = self.notion.extract_page_sections(notion_id)
+                        if sections:
+                            data['sections'] = sections
+                            self.logger.info(f"Extracted {len(sections)} sections from reflection '{data.get('title', 'Untitled')}'")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to extract sections: {e}")
+
                     # Add sync metadata
                     data['notion_page_id'] = notion_id
                     data['notion_updated_at'] = notion_record.get('last_edited_time')

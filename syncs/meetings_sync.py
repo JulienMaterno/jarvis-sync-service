@@ -658,6 +658,15 @@ class MeetingsSyncService(TwoWaySyncService):
                         data['summary'] = content[:2000] if content else None
                     except Exception as e:
                         self.logger.warning(f"Failed to extract content: {e}")
+
+                    # Extract structured sections (heading_2 + content)
+                    try:
+                        sections = self.notion.extract_page_sections(notion_id)
+                        if sections:
+                            data['sections'] = sections
+                            self.logger.info(f"Extracted {len(sections)} sections from meeting '{data.get('title', 'Untitled')}'")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to extract sections: {e}")
                     
                     # Add sync metadata
                     data['notion_page_id'] = notion_id
