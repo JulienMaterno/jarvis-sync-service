@@ -553,7 +553,57 @@ class NotionClient:
             'toggle': '▶ ',
         }
         return prefixes.get(block_type, '')
-    
+
+    def extract_page_sections(self, page_id: str) -> List[Dict[str, str]]:
+        """
+        Extract structured sections from a Notion page.
+
+        A section is defined as:
+        - A heading_2 block followed by its content (paragraphs, lists, etc.)
+        - Content continues until the next heading_2 or end of page
+
+        Returns:
+            List of dicts with 'heading' and 'content' keys
+            Example: [{'heading': 'Overview', 'content': 'This is the overview text...'}]
+        """
+        blocks = self.get_all_blocks(page_id)
+        sections = []
+        current_heading = None
+        current_content = []
+
+        for block in blocks:
+            block_type = block.get('type')
+
+            # New section starts with heading_2
+            if block_type == 'heading_2':
+                # Save previous section if exists
+                if current_heading:
+                    sections.append({
+                        'heading': current_heading,
+                        'content': '\n'.join(current_content).strip()
+                    })
+
+                # Start new section
+                rich_text = block.get('heading_2', {}).get('rich_text', [])
+                current_heading = ''.join([t.get('plain_text', '') for t in rich_text])
+                current_content = []
+
+            # Accumulate content for current section
+            elif current_heading:
+                text = self._get_block_text(block)
+                if text:
+                    prefix = self._get_block_prefix(block_type)
+                    current_content.append(f"{prefix}{text}")
+
+        # Save last section
+        if current_heading:
+            sections.append({
+                'heading': current_heading,
+                'content': '\n'.join(current_content).strip()
+            })
+
+        return sections
+
     def get_database_schema(self, database_id: str) -> Dict:
         """Get database schema to understand available properties."""
         response = self.client.get(f'https://api.notion.com/v1/databases/{database_id}')

@@ -126,14 +126,17 @@ class ApplicationsSyncService(TwoWaySyncService):
         """
         Convert Notion application to Supabase format.
         Notion → Supabase
+
+        Extracts both properties AND page content (sections).
         """
         props = notion_record.get('properties', {})
-        
+        page_id = notion_record.get('id')
+
         # Extract all properties
         name = NotionPropertyExtractor.title(props, 'Name')
         if not name:
             name = 'Untitled Application'
-        
+
         # Extract status and convert from Notion format to database enum
         # "In Progress" -> "IN_PROGRESS", "Not Started" -> "NOT_STARTED"
         status_notion = NotionPropertyExtractor.select(props, 'Status') or 'Not Started'
@@ -151,7 +154,17 @@ class ApplicationsSyncService(TwoWaySyncService):
             'context': NotionPropertyExtractor.rich_text(props, 'Context'),
             'notes': NotionPropertyExtractor.rich_text(props, 'Notes'),
         }
-        
+
+        # Extract page content sections (heading_2 + content)
+        try:
+            sections = self.notion.extract_page_sections(page_id)
+            if sections:
+                result['sections'] = sections
+                self.logger.info(f"Extracted {len(sections)} sections from '{name}'")
+        except Exception as e:
+            self.logger.warning(f"Failed to extract sections from '{name}': {e}")
+            # Don't fail the entire sync if section extraction fails
+
         return result
     
     def convert_to_source(self, supabase_record: Dict) -> Dict[str, Any]:
