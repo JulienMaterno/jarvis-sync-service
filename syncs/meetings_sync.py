@@ -246,13 +246,15 @@ class MeetingsNotionClient(BaseNotionClient):
 
 class MeetingsSupabaseClient(BaseSupabaseClient):
     """Extended Supabase client with contact lookup for meetings."""
-    
+
     def __init__(self, url: str, key: str):
         super().__init__(url, key, "meetings")
         self._contact_cache: Dict[str, Dict] = {}  # id -> contact
-    
+        self._contact_by_name: Dict[str, Dict] = {}  # lowercase full name -> contact
+        self._contact_by_first_name: Dict[str, List[Dict]] = {}  # lowercase first name -> contacts
+
     def cache_contacts(self):
-        """Pre-cache all contacts for faster lookup."""
+        """Pre-cache all contacts for faster lookup (by id, name, and first name)."""
         response = self.client.get(
             f'{self.base_url}/contacts',
             params={
@@ -263,6 +265,20 @@ class MeetingsSupabaseClient(BaseSupabaseClient):
         response.raise_for_status()
         for contact in response.json():
             self._contact_cache[contact['id']] = contact
+
+            # Build name-based lookups
+            first_name = (contact.get('first_name') or '').strip()
+            last_name = (contact.get('last_name') or '').strip()
+
+            if first_name:
+                full_name = f"{first_name} {last_name}".strip().lower()
+                self._contact_by_name[full_name] = contact
+
+                # Also index by first name only for partial matches
+                first_lower = first_name.lower()
+                if first_lower not in self._contact_by_first_name:
+                    self._contact_by_first_name[first_lower] = []
+                self._contact_by_first_name[first_lower].append(contact)
     
     def get_contact(self, contact_id: str) -> Optional[Dict]:
         """Get contact by ID."""
@@ -285,22 +301,49 @@ class MeetingsSupabaseClient(BaseSupabaseClient):
         return None
     
     def find_contact_by_name(self, name: str) -> Optional[Dict]:
-        """Find contact by name."""
+        """
+        Find contact by name, using cache first.
+
+        Lookup order:
+        1. Exact full name match from cache
+        2. First name only match from cache (if unique)
+        3. Fallback to API query (only if cache is empty or didn't match)
+        """
         if not name:
             return None
-        
-        parts = name.strip().split()
+
+        name_lower = name.strip().lower()
+        parts = name_lower.split()
         first_name = parts[0]
-        last_name = parts[-1] if len(parts) > 1 else None
-        
-        # Try exact match
-        if last_name:
+
+        # Strategy 1: Exact full name match from cache
+        if name_lower in self._contact_by_name:
+            return self._contact_by_name[name_lower]
+
+        # Strategy 2: First name only from cache (return if unique match)
+        if first_name in self._contact_by_first_name:
+            matches = self._contact_by_first_name[first_name]
+            if len(matches) == 1:
+                return matches[0]
+            # Multiple matches - try to find best match with last name
+            if len(parts) > 1:
+                last_name = parts[-1]
+                for contact in matches:
+                    contact_last = (contact.get('last_name') or '').lower()
+                    if contact_last == last_name:
+                        return contact
+
+        # Strategy 3: Fallback to API query only if cache didn't help
+        # This handles contacts added after cache was built
+        last_name_str = parts[-1] if len(parts) > 1 else None
+
+        if last_name_str:
             response = self.client.get(
                 f'{self.base_url}/contacts',
                 params={
                     'select': 'id,first_name,last_name,email,notion_page_id',
                     'first_name': f'ilike.{first_name}',
-                    'last_name': f'ilike.{last_name}',
+                    'last_name': f'ilike.{last_name_str}',
                     'deleted_at': 'is.null',
                     'limit': '1'
                 }
@@ -309,8 +352,8 @@ class MeetingsSupabaseClient(BaseSupabaseClient):
             results = response.json()
             if results:
                 return results[0]
-        
-        # Fallback to first name only
+
+        # Last resort: first name only API query
         response = self.client.get(
             f'{self.base_url}/contacts',
             params={
@@ -322,10 +365,10 @@ class MeetingsSupabaseClient(BaseSupabaseClient):
         )
         response.raise_for_status()
         results = response.json()
-        
+
         if len(results) == 1:
             return results[0]
-        
+
         return None
 
 
