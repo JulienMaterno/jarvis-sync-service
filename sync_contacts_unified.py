@@ -762,6 +762,8 @@ class ContactsSyncService(TwoWaySyncService):
                             'location': parsed.get('location') or existing_record.get('location'),
                             'birthday': parsed.get('birthday') or existing_record.get('birthday'),
                             'linkedin_url': parsed.get('linkedin_url') or existing_record.get('linkedin_url'),
+                            'notes': parsed.get('notes') or existing_record.get('notes'),
+                            'profile_content': parsed.get('profile_content') or existing_record.get('profile_content'),  # Sync Google notes
                             'google_contact_id': google_id,
                             'last_sync_source': 'google',
                             'updated_at': datetime.now(timezone.utc).isoformat()
