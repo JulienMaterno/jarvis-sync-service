@@ -769,12 +769,15 @@ class ContactsSyncService(TwoWaySyncService):
                         self.supabase.update(existing_record['id'], merged)
                         stats.updated += 1
                     else:
-                        # Create new
+                        # Create new contact from Google
+                        # Auto-set Type to "New" so user can categorize manually later
+                        parsed['contact_type'] = 'New'
                         parsed['last_sync_source'] = 'google'
                         parsed['created_at'] = datetime.now(timezone.utc).isoformat()
                         parsed['updated_at'] = datetime.now(timezone.utc).isoformat()
                         self.supabase.insert(parsed)
                         stats.created += 1
+                        self.logger.info(f"Created new contact from Google: {parsed.get('first_name')} {parsed.get('last_name')} (Type: New)")
                 
                 except Exception as e:
                     self.logger.error(f"Error processing Google contact: {e}")
