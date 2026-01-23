@@ -42,12 +42,14 @@ from lib.sync_base import (
     ContentBlockBuilder,
     SyncResult,
     SyncStats,
+    SyncMetrics,
     create_cli_parser,
     setup_logger,
     retry_on_error,
     NOTION_API_TOKEN,
     SUPABASE_URL,
-    SUPABASE_KEY
+    SUPABASE_KEY,
+    MAX_BLOCKS_PER_REQUEST
 )
 
 # ============================================================================

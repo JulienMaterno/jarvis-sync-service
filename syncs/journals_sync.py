@@ -45,11 +45,13 @@ from lib.sync_base import (
     ContentBlockBuilder,
     SyncResult,
     SyncStats,
+    SyncMetrics,
     create_cli_parser,
     setup_logger,
     NOTION_API_TOKEN,
     SUPABASE_URL,
-    SUPABASE_KEY
+    SUPABASE_KEY,
+    MAX_BLOCKS_PER_REQUEST
 )
 
 # ============================================================================
@@ -436,7 +438,6 @@ class JournalsSyncService(TwoWaySyncService):
                         if blocks:
                             try:
                                 # Batch blocks to avoid Notion API limits
-                                MAX_BLOCKS_PER_REQUEST = 100
                                 block_batches = [blocks[i:i + MAX_BLOCKS_PER_REQUEST]
                                                for i in range(0, len(blocks), MAX_BLOCKS_PER_REQUEST)]
 
@@ -458,8 +459,8 @@ class JournalsSyncService(TwoWaySyncService):
                                     for block in blocks_to_delete:
                                         try:
                                             self.notion.delete_block(block['id'])
-                                        except:
-                                            pass
+                                        except Exception as del_e:
+                                            self.logger.warning(f"Failed to delete block {block.get('id')}: {del_e}")
 
                                     # Add remaining batches
                                     for batch in block_batches[1:]:

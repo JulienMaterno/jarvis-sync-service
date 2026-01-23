@@ -52,6 +52,9 @@ SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
 SAFETY_VALVE_THRESHOLD = 0.1
 SAFETY_VALVE_MIN_RECORDS = 10  # Only apply safety valve if destination has > this many
 
+# Notion API limits
+MAX_BLOCKS_PER_REQUEST = 100  # Notion allows max 100 blocks per append request
+
 
 # ============================================================================
 # LOGGING SETUP

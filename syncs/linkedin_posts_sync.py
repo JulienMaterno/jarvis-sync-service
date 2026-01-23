@@ -326,8 +326,8 @@ class LinkedInPostsSyncService(TwoWaySyncService):
                                         try:
                                             self.notion.delete_block(block['id'])
                                             metrics.notion_api_calls += 1
-                                        except:
-                                            pass
+                                        except Exception as del_e:
+                                            self.logger.warning(f"Failed to delete block {block.get('id')}: {del_e}")
                                     metrics.notion_api_calls += 1
 
                                     # Add remaining batches

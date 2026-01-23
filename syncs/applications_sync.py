@@ -49,7 +49,8 @@ from lib.sync_base import (
     SyncMetrics,
     create_cli_parser,
     setup_logger,
-    format_exception
+    format_exception,
+    MAX_BLOCKS_PER_REQUEST
 )
 
 # ============================================================================
@@ -460,7 +461,7 @@ class ApplicationsSyncService(TwoWaySyncService):
                         updated_page = self.notion.update_page(notion_page_id, notion_props)
                         metrics.notion_api_calls += 1
 
-                        # Update content blocks if we have content (SAFE PATTERN)
+                        # Update content blocks if we have content (SAFE PATTERN: add-first-then-delete)
                         if blocks:
                             try:
                                 # Get existing blocks first
@@ -472,26 +473,38 @@ class ApplicationsSyncService(TwoWaySyncService):
                                 if len(existing_blocks) == len(blocks):
                                     self.logger.debug(f"Skipping block update for '{record.get('name')}' - same block count")
                                 else:
-                                    # Delete ALL existing blocks first
-                                    for block in existing_blocks:
-                                        try:
-                                            self.notion.delete_block(block['id'])
-                                            metrics.notion_api_calls += 1
-                                        except:
-                                            pass
-
                                     # Batch blocks to avoid Notion API limits
-                                    MAX_BLOCKS_PER_REQUEST = 100
                                     block_batches = [blocks[i:i + MAX_BLOCKS_PER_REQUEST]
                                                    for i in range(0, len(blocks), MAX_BLOCKS_PER_REQUEST)]
 
-                                    # Add all batches
-                                    for batch in block_batches:
-                                        try:
-                                            self.notion.append_blocks(notion_page_id, batch)
-                                            metrics.notion_api_calls += 1
-                                        except Exception as e:
-                                            self.logger.warning(f"Failed to add batch of {len(batch)} blocks: {e}")
+                                    # SAFETY: Try to add first batch BEFORE deleting anything
+                                    # This ensures we don't lose content if the add fails
+                                    newly_added_ids = []
+                                    try:
+                                        added_blocks = self.notion.append_blocks(notion_page_id, block_batches[0])
+                                        metrics.notion_api_calls += 1
+                                        newly_added_ids = [b.get('id') for b in added_blocks if b.get('id')]
+                                    except Exception as e:
+                                        self.logger.error(f"Failed to add content blocks (skipping delete to preserve data): {e}")
+                                        raise  # Don't delete if we can't add
+
+                                    # Only delete existing blocks AFTER we confirmed new content works
+                                    if newly_added_ids:
+                                        for block in existing_blocks:
+                                            if block.get('id') not in newly_added_ids:
+                                                try:
+                                                    self.notion.delete_block(block['id'])
+                                                    metrics.notion_api_calls += 1
+                                                except Exception as del_e:
+                                                    self.logger.warning(f"Failed to delete block {block.get('id')}: {del_e}")
+
+                                        # Add remaining batches
+                                        for batch in block_batches[1:]:
+                                            try:
+                                                self.notion.append_blocks(notion_page_id, batch)
+                                                metrics.notion_api_calls += 1
+                                            except Exception as e:
+                                                self.logger.warning(f"Failed to add batch of {len(batch)} blocks: {e}")
 
                             except Exception as e:
                                 self.logger.warning(f"Failed to update content blocks: {e}")
