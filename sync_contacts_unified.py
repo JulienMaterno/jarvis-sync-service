@@ -447,17 +447,45 @@ class ContactsSyncService(TwoWaySyncService):
                     data['notion_updated_at'] = notion_record.get('last_edited_time')
                     data['last_sync_source'] = 'notion'
                     data['updated_at'] = datetime.now(timezone.utc).isoformat()
-                    
+
+                    # Extract content from Notion page body (personal details, notes, etc.)
+                    try:
+                        content_text, has_unsupported = self.notion.extract_page_content(notion_id)
+                        data['profile_content'] = content_text
+                        if has_unsupported:
+                            self.logger.debug(f"Contact '{data.get('first_name')} {data.get('last_name')}' has unsupported Notion blocks")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to extract content for contact '{data.get('first_name')} {data.get('last_name')}': {e}")
+                        data['profile_content'] = ''
+
+                    # Extract structured sections (optional, for rich content)
+                    try:
+                        sections = self.notion.extract_page_sections(notion_id)
+                        if sections:
+                            data['sections'] = sections
+                            self.logger.debug(f"Extracted {len(sections)} sections from contact '{data.get('first_name')} {data.get('last_name')}'")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to extract sections: {e}")
+
                     # Check if already linked by notion_page_id
                     existing_record = existing_by_notion_id.get(notion_id)
-                    
+
                     if existing_record:
+                        # CRITICAL: Preserve existing fields not synced from Notion
+                        # This prevents data loss on update (Google-synced fields, user-editable fields)
+                        preserved_fields = ['notes']  # Google Contacts notes (only if not overwritten by profile_content)
+                        for field in preserved_fields:
+                            if field in existing_record and existing_record[field] is not None:
+                                # Only preserve if we're not updating it from Notion content
+                                if field not in data or not data[field]:
+                                    data[field] = existing_record[field]
+
                         # Skip if Supabase has local changes pending sync to Notion
                         if existing_record.get('last_sync_source') == 'supabase':
                             self.logger.info(f"Skipping contact '{data.get('first_name')} {data.get('last_name')}' - has local changes pending")
                             stats.skipped += 1
                             continue
-                        
+
                         # Already linked - check if update needed
                         comparison = self.compare_timestamps(
                             notion_record.get('last_edited_time'),
@@ -590,14 +618,39 @@ class ContactsSyncService(TwoWaySyncService):
                         # Update existing Notion page
                         try:
                             updated_page = self.notion.update_page(notion_page_id, notion_props)
-                            
+
+                            # Sync page body content (bidirectional: Supabase → Notion)
+                            # This enables: Google Contacts notes → Supabase profile_content → Notion page body
+                            profile_content = record.get('profile_content')
+                            if profile_content:
+                                try:
+                                    # Build blocks from profile_content
+                                    from lib.sync_base import ContentBlockBuilder
+
+                                    # Get existing blocks to delete them
+                                    existing_blocks = self.notion.get_all_blocks(notion_page_id)
+
+                                    # Delete all existing blocks first (to replace, not append)
+                                    for block in existing_blocks:
+                                        try:
+                                            self.notion.delete_block(block['id'])
+                                        except Exception as e:
+                                            self.logger.debug(f"Failed to delete block {block['id']}: {e}")
+
+                                    # Add new content
+                                    blocks = ContentBlockBuilder.chunked_paragraphs(profile_content)
+                                    self.notion.append_blocks(notion_page_id, blocks)
+                                    self.logger.debug(f"Updated Notion page body for '{full_name}' ({len(blocks)} blocks)")
+                                except Exception as e:
+                                    self.logger.warning(f"Failed to update Notion page body for '{full_name}': {e}")
+
                             # Update Supabase with new Notion timestamp to prevent re-sync loops
                             # This is CRITICAL: without this, future Notion edits would be skipped!
                             self.supabase.update(record['id'], {
                                 'notion_updated_at': updated_page.get('last_edited_time'),
                                 'last_sync_source': 'notion'
                             })
-                            
+
                             stats.updated += 1
                         except Exception as e:
                             if "404" in str(e) or "archived" in str(e).lower():
@@ -626,7 +679,18 @@ class ContactsSyncService(TwoWaySyncService):
                             # Create new Notion page
                             self.logger.info(f"Creating new Notion page for '{full_name}'")
                             new_page = self.notion.create_page(self.notion_database_id, notion_props)
-                            
+
+                            # Add page body content if available
+                            profile_content = record.get('profile_content')
+                            if profile_content:
+                                try:
+                                    from lib.sync_base import ContentBlockBuilder
+                                    blocks = ContentBlockBuilder.chunked_paragraphs(profile_content)
+                                    self.notion.append_blocks(new_page['id'], blocks)
+                                    self.logger.debug(f"Added page body to new contact '{full_name}' ({len(blocks)} blocks)")
+                                except Exception as e:
+                                    self.logger.warning(f"Failed to add page body for '{full_name}': {e}")
+
                             # Update Supabase with new Notion ID
                             self.supabase.update(record['id'], {
                                 'notion_page_id': new_page['id'],
@@ -634,7 +698,7 @@ class ContactsSyncService(TwoWaySyncService):
                                 'last_sync_source': 'notion'
                             })
                             stats.created += 1
-                            
+
                             # Add to our tracking dict
                             notion_by_name[name_key] = new_page
                     

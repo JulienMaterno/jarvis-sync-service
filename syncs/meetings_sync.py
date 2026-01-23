@@ -683,7 +683,16 @@ class MeetingsSyncService(TwoWaySyncService):
                     
                     # Convert properties
                     data = self.convert_from_source(notion_record)
-                    
+
+                    # CRITICAL: Preserve existing fields not synced from Notion
+                    # This prevents data loss on upsert (merge-duplicates replaces entire row)
+                    if existing_record:
+                        # Preserve fields that are NOT managed by Notion sync
+                        preserved_fields = ['notes']  # User-editable field in Supabase
+                        for field in preserved_fields:
+                            if field in existing_record and existing_record[field] is not None:
+                                data[field] = existing_record[field]
+
                     # Handle CRM contact linking
                     props = notion_record.get('properties', {})
                     person_ids = props.get('People', {}).get('relation', [])
@@ -697,12 +706,16 @@ class MeetingsSyncService(TwoWaySyncService):
                             if sb_contact:
                                 data['contact_id'] = sb_contact.get('id')
                     
-                    # Extract content from page blocks
+                    # Extract content from page blocks (unified with other entities)
                     try:
-                        content, has_unsupported = self.notion.extract_meeting_content(notion_id)
-                        data['summary'] = content[:2000] if content else None
+                        content_text, has_unsupported = self.notion.extract_page_content(notion_id)
+                        data['content'] = content_text  # Store full content in 'content' field
+                        data['summary'] = content_text[:2000] if content_text else None  # Keep summary for backwards compatibility
+                        if has_unsupported:
+                            self.logger.debug(f"Meeting '{data.get('title')}' has unsupported Notion blocks (e.g. AI meeting notes)")
                     except Exception as e:
                         self.logger.warning(f"Failed to extract content: {e}")
+                        data['content'] = ''
 
                     # Extract structured sections (heading_2 + content)
                     try:

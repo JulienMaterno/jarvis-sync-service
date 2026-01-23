@@ -190,9 +190,11 @@ def transform_contact(google_contact: Dict[str, Any], group_mapping: Dict[str, s
             linkedin_url = u.get("value")
             break
             
-    # Biographies
+    # Biographies (Google notes field)
+    # Map to both 'notes' and 'profile_content' for compatibility
     bios = google_contact.get("biographies", [])
     notes = bios[0].get("value") if bios else None
+    profile_content = notes  # Sync Google notes to profile_content field
     
     # Memberships -> Subscribed & Location
     memberships = google_contact.get("memberships", [])
@@ -239,6 +241,7 @@ def transform_contact(google_contact: Dict[str, Any], group_mapping: Dict[str, s
         "job_title": job_title,
         "linkedin_url": linkedin_url,
         "notes": notes,
+        "profile_content": profile_content,  # Sync Google notes to profile_content
         "subscribed": subscribed,
         "location": location,
         "_etag": etag,
@@ -275,9 +278,10 @@ def transform_to_google_body(data: Dict[str, Any]) -> Dict[str, Any]:
             "title": data.get("job_title", "")
         }]
         
-    # Bio/Notes
-    if data.get("notes"):
-        body["biographies"] = [{"value": data["notes"]}]
+    # Bio/Notes - prioritize profile_content (from Notion), fallback to notes field
+    notes_content = data.get("profile_content") or data.get("notes")
+    if notes_content:
+        body["biographies"] = [{"value": notes_content}]
         
     # Birthday
     if data.get("birthday"):
