@@ -151,7 +151,7 @@ class ApplicationsSyncService(TwoWaySyncService):
             'website': NotionPropertyExtractor.url(props, 'Website'),
             'grant_amount': NotionPropertyExtractor.rich_text(props, 'Grant Amount'),
             'deadline': NotionPropertyExtractor.date(props, 'Deadline'),
-            'location': NotionPropertyExtractor.rich_text(props, 'Location'),
+            'location': NotionPropertyExtractor.select(props, 'Location'),
             'context': NotionPropertyExtractor.rich_text(props, 'Context'),
             'notes': NotionPropertyExtractor.rich_text(props, 'Notes'),
         }
@@ -212,10 +212,10 @@ class ApplicationsSyncService(TwoWaySyncService):
         if deadline:
             properties['Deadline'] = NotionPropertyBuilder.date(deadline)
 
-        # Location (rich_text) - standardized to country names or "Remote"
+        # Location (select) - standardized to country names or "Remote"
         location = supabase_record.get('location')
         if location:
-            properties['Location'] = NotionPropertyBuilder.rich_text(location)
+            properties['Location'] = NotionPropertyBuilder.select(location)
 
         # Context (rich_text)
         context = supabase_record.get('context')
