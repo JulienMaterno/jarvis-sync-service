@@ -765,7 +765,9 @@ class ContactsSyncService(TwoWaySyncService):
                             'notes': parsed.get('notes') or existing_record.get('notes'),
                             'profile_content': parsed.get('profile_content') or existing_record.get('profile_content'),  # Sync Google notes
                             'google_contact_id': google_id,
-                            'last_sync_source': 'google',
+                            # Set last_sync_source='supabase' to trigger Supabase→Notion sync
+                            # This ensures profile_content updates flow to Notion page body
+                            'last_sync_source': 'supabase',
                             'updated_at': datetime.now(timezone.utc).isoformat()
                         }
                         self.supabase.update(existing_record['id'], merged)
