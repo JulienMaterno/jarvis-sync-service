@@ -526,20 +526,33 @@ class NotionClient:
         
         return '\n'.join(filter(None, text_parts)), has_unsupported
     
-    def _get_block_text(self, block: Dict) -> Optional[str]:
-        """Extract plain text from a single block."""
+    def _get_block_text(self, block: Dict, preserve_formatting: bool = True) -> Optional[str]:
+        """
+        Extract text from a single block.
+
+        Args:
+            block: Notion block object
+            preserve_formatting: If True, converts rich text to markdown (bold, italic, etc.)
+                               If False, returns plain text only
+
+        Returns:
+            Text content with optional markdown formatting
+        """
         block_type = block.get('type')
-        
+
         text_block_types = [
             'paragraph', 'heading_1', 'heading_2', 'heading_3',
             'bulleted_list_item', 'numbered_list_item', 'to_do',
             'toggle', 'quote', 'callout'
         ]
-        
+
         if block_type in text_block_types:
             rich_text = block.get(block_type, {}).get('rich_text', [])
-            return ''.join([t.get('plain_text', '') for t in rich_text])
-        
+            if preserve_formatting:
+                return rich_text_to_markdown(rich_text)
+            else:
+                return ''.join([t.get('plain_text', '') for t in rich_text])
+
         return None
     
     def _get_block_prefix(self, block_type: str) -> str:
@@ -789,145 +802,305 @@ class SupabaseClient:
 
 
 # ============================================================================
+# MARKDOWN <-> NOTION RICH TEXT CONVERSION
+# ============================================================================
+
+import re
+
+
+def rich_text_to_markdown(rich_text_array: List[Dict]) -> str:
+    """
+    Convert Notion rich_text array back to markdown text.
+
+    This preserves formatting when syncing Notion → Supabase, so that
+    bold/italic/etc. in Notion becomes **bold**/*italic*/etc. in the database.
+
+    Args:
+        rich_text_array: List of Notion rich_text objects
+
+    Returns:
+        Markdown-formatted string
+    """
+    if not rich_text_array:
+        return ""
+
+    parts = []
+    for rt in rich_text_array:
+        text = rt.get("text", {}).get("content", "") or rt.get("plain_text", "")
+        if not text:
+            continue
+
+        annotations = rt.get("annotations", {})
+        link = rt.get("text", {}).get("link")
+
+        # Apply formatting in order: code > bold+italic > bold > italic > strikethrough > link
+        if annotations.get("code"):
+            text = f"`{text}`"
+        else:
+            # Bold and italic can combine
+            if annotations.get("bold") and annotations.get("italic"):
+                text = f"***{text}***"
+            elif annotations.get("bold"):
+                text = f"**{text}**"
+            elif annotations.get("italic"):
+                text = f"*{text}*"
+
+            if annotations.get("strikethrough"):
+                text = f"~~{text}~~"
+
+        # Links
+        if link and link.get("url"):
+            text = f"[{text}]({link['url']})"
+
+        parts.append(text)
+
+    return "".join(parts)
+
+
+def parse_markdown_to_rich_text(text: str) -> List[Dict]:
+    """
+    Parse markdown inline formatting to Notion rich_text array.
+
+    Supports:
+    - **bold** or __bold__
+    - *italic* or _italic_
+    - ~~strikethrough~~
+    - `code`
+    - [link text](url)
+    - Combined: **_bold italic_**
+
+    Args:
+        text: Text with optional markdown formatting
+
+    Returns:
+        List of Notion rich_text objects with appropriate annotations
+    """
+    if not text:
+        return []
+
+    rich_text = []
+
+    # Pattern to match markdown inline formatting
+    # Order matters: check multi-char patterns first
+    patterns = [
+        # Bold + italic combined: ***text*** or ___text___
+        (r'\*\*\*(.+?)\*\*\*', {'bold': True, 'italic': True}),
+        (r'___(.+?)___', {'bold': True, 'italic': True}),
+        # Bold: **text** or __text__
+        (r'\*\*(.+?)\*\*', {'bold': True}),
+        (r'__(.+?)__', {'bold': True}),
+        # Italic: *text* or _text_ (but not inside words for underscore)
+        (r'\*(.+?)\*', {'italic': True}),
+        (r'(?<![a-zA-Z])_(.+?)_(?![a-zA-Z])', {'italic': True}),
+        # Strikethrough: ~~text~~
+        (r'~~(.+?)~~', {'strikethrough': True}),
+        # Code: `text`
+        (r'`([^`]+)`', {'code': True}),
+        # Links: [text](url)
+        (r'\[([^\]]+)\]\(([^)]+)\)', 'link'),
+    ]
+
+    # Build a combined pattern to find all markdown segments
+    combined_pattern = '|'.join([
+        r'(\*\*\*.+?\*\*\*)',      # bold+italic ***
+        r'(___.+?___)',            # bold+italic ___
+        r'(\*\*.+?\*\*)',          # bold **
+        r'(__.+?__)',              # bold __
+        r'(\*.+?\*)',              # italic *
+        r'((?<![a-zA-Z])_.+?_(?![a-zA-Z]))',  # italic _
+        r'(~~.+?~~)',              # strikethrough
+        r'(`[^`]+`)',              # code
+        r'(\[[^\]]+\]\([^)]+\))',  # link
+    ])
+
+    # Split text into segments (formatted and plain)
+    pos = 0
+    for match in re.finditer(combined_pattern, text):
+        # Add plain text before this match
+        if match.start() > pos:
+            plain_text = text[pos:match.start()]
+            if plain_text:
+                rich_text.append({
+                    "type": "text",
+                    "text": {"content": plain_text}
+                })
+
+        matched_text = match.group()
+
+        # Determine which pattern matched and extract content
+        annotations = {}
+        content = matched_text
+        link_url = None
+
+        # Bold + italic
+        if matched_text.startswith('***') and matched_text.endswith('***'):
+            content = matched_text[3:-3]
+            annotations = {'bold': True, 'italic': True}
+        elif matched_text.startswith('___') and matched_text.endswith('___'):
+            content = matched_text[3:-3]
+            annotations = {'bold': True, 'italic': True}
+        # Bold
+        elif matched_text.startswith('**') and matched_text.endswith('**'):
+            content = matched_text[2:-2]
+            annotations = {'bold': True}
+        elif matched_text.startswith('__') and matched_text.endswith('__'):
+            content = matched_text[2:-2]
+            annotations = {'bold': True}
+        # Strikethrough
+        elif matched_text.startswith('~~') and matched_text.endswith('~~'):
+            content = matched_text[2:-2]
+            annotations = {'strikethrough': True}
+        # Code
+        elif matched_text.startswith('`') and matched_text.endswith('`'):
+            content = matched_text[1:-1]
+            annotations = {'code': True}
+        # Link
+        elif matched_text.startswith('['):
+            link_match = re.match(r'\[([^\]]+)\]\(([^)]+)\)', matched_text)
+            if link_match:
+                content = link_match.group(1)
+                link_url = link_match.group(2)
+        # Italic (must check after bold since * is substring of **)
+        elif matched_text.startswith('*') and matched_text.endswith('*'):
+            content = matched_text[1:-1]
+            annotations = {'italic': True}
+        elif matched_text.startswith('_') and matched_text.endswith('_'):
+            content = matched_text[1:-1]
+            annotations = {'italic': True}
+
+        # Build the rich_text element
+        rt_element = {
+            "type": "text",
+            "text": {"content": content}
+        }
+
+        if link_url:
+            rt_element["text"]["link"] = {"url": link_url}
+
+        if annotations:
+            rt_element["annotations"] = annotations
+
+        rich_text.append(rt_element)
+        pos = match.end()
+
+    # Add remaining plain text after last match
+    if pos < len(text):
+        remaining = text[pos:]
+        if remaining:
+            rich_text.append({
+                "type": "text",
+                "text": {"content": remaining}
+            })
+
+    # If no formatting was found, return simple text
+    if not rich_text:
+        rich_text = [{"type": "text", "text": {"content": text}}]
+
+    return rich_text
+
+
+def _build_rich_text_block(block_type: str, text: str, extra_props: Dict = None) -> Dict:
+    """
+    Build a Notion block with parsed rich text.
+
+    Args:
+        block_type: Notion block type (paragraph, heading_1, etc.)
+        text: Text with optional markdown formatting
+        extra_props: Additional properties for the block type
+
+    Returns:
+        Notion block dictionary
+    """
+    # Truncate to Notion's limit
+    text = text[:2000] if text else ""
+    rich_text = parse_markdown_to_rich_text(text)
+
+    block = {
+        "object": "block",
+        "type": block_type,
+        block_type: {
+            "rich_text": rich_text
+        }
+    }
+
+    if extra_props:
+        block[block_type].update(extra_props)
+
+    return block
+
+
+# ============================================================================
 # CONTENT BLOCK BUILDERS
 # ============================================================================
 
 class ContentBlockBuilder:
-    """Helper class to build Notion content blocks from text."""
-    
+    """Helper class to build Notion content blocks from text with markdown support."""
+
     NOTION_BLOCK_LIMIT = 2000  # Notion's character limit per block
     
     @staticmethod
     def paragraph(text: str) -> Dict:
-        """Create a paragraph block."""
-        return {
-            "object": "block",
-            "type": "paragraph",
-            "paragraph": {
-                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
-            }
-        }
-    
+        """Create a paragraph block with markdown support."""
+        return _build_rich_text_block("paragraph", text)
+
     @staticmethod
     def heading_1(text: str) -> Dict:
-        """Create a heading 1 block."""
-        return {
-            "object": "block",
-            "type": "heading_1",
-            "heading_1": {
-                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
-            }
-        }
-    
+        """Create a heading 1 block with markdown support."""
+        return _build_rich_text_block("heading_1", text)
+
     @staticmethod
     def heading_2(text: str) -> Dict:
-        """Create a heading 2 block."""
-        return {
-            "object": "block",
-            "type": "heading_2",
-            "heading_2": {
-                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
-            }
-        }
-    
+        """Create a heading 2 block with markdown support."""
+        return _build_rich_text_block("heading_2", text)
+
     @staticmethod
     def heading_3(text: str) -> Dict:
-        """Create a heading 3 block."""
-        return {
-            "object": "block",
-            "type": "heading_3",
-            "heading_3": {
-                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
-            }
-        }
-    
+        """Create a heading 3 block with markdown support."""
+        return _build_rich_text_block("heading_3", text)
+
     @staticmethod
     def bulleted_list_item(text: str) -> Dict:
-        """Create a bulleted list item block."""
-        return {
-            "object": "block",
-            "type": "bulleted_list_item",
-            "bulleted_list_item": {
-                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
-            }
-        }
-    
+        """Create a bulleted list item block with markdown support."""
+        return _build_rich_text_block("bulleted_list_item", text)
+
     @staticmethod
     def numbered_list_item(text: str, children: List[Dict] = None) -> Dict:
-        """Create a numbered list item block with optional nested children."""
-        block = {
-            "object": "block",
-            "type": "numbered_list_item",
-            "numbered_list_item": {
-                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
-            }
-        }
+        """Create a numbered list item block with optional nested children and markdown support."""
+        block = _build_rich_text_block("numbered_list_item", text)
         if children:
             block["numbered_list_item"]["children"] = children
         return block
-    
+
     @staticmethod
     def bulleted_list_item_with_children(text: str, children: List[Dict] = None) -> Dict:
-        """Create a bulleted list item block with optional nested children."""
-        block = {
-            "object": "block",
-            "type": "bulleted_list_item",
-            "bulleted_list_item": {
-                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
-            }
-        }
+        """Create a bulleted list item block with optional nested children and markdown support."""
+        block = _build_rich_text_block("bulleted_list_item", text)
         if children:
             block["bulleted_list_item"]["children"] = children
         return block
-    
+
     @staticmethod
     def to_do(text: str, checked: bool = False) -> Dict:
-        """Create a to-do block."""
-        return {
-            "object": "block",
-            "type": "to_do",
-            "to_do": {
-                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}],
-                "checked": checked
-            }
-        }
-    
+        """Create a to-do block with markdown support."""
+        return _build_rich_text_block("to_do", text, {"checked": checked})
+
     @staticmethod
     def toggle(text: str, children: List[Dict] = None) -> Dict:
-        """Create a toggle block."""
-        block = {
-            "object": "block",
-            "type": "toggle",
-            "toggle": {
-                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
-            }
-        }
+        """Create a toggle block with markdown support."""
+        block = _build_rich_text_block("toggle", text)
         if children:
             block["toggle"]["children"] = children
         return block
     
     @staticmethod
     def quote(text: str) -> Dict:
-        """Create a quote block."""
-        return {
-            "object": "block",
-            "type": "quote",
-            "quote": {
-                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
-            }
-        }
-    
+        """Create a quote block with markdown support."""
+        return _build_rich_text_block("quote", text)
+
     @staticmethod
     def callout(text: str, icon: str = "💡") -> Dict:
-        """Create a callout block."""
-        return {
-            "object": "block",
-            "type": "callout",
-            "callout": {
-                "rich_text": [{"type": "text", "text": {"content": text[:2000]}}],
-                "icon": {"type": "emoji", "emoji": icon}
-            }
-        }
+        """Create a callout block with markdown support."""
+        return _build_rich_text_block("callout", text, {"icon": {"type": "emoji", "emoji": icon}})
     
     @staticmethod
     def divider() -> Dict:
