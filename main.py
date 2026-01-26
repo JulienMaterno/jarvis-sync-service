@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from lib.sync_service import sync_contacts
 from lib.notion_sync import sync_notion_to_supabase, sync_supabase_to_notion
@@ -73,6 +74,17 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Jarvis Backend")
+
+# ============================================================================
+# CORS MIDDLEWARE - Allow Chrome extension and other clients
+# ============================================================================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins for Chrome extension
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ============================================================================
 # SYNC LOCKING - Prevent overlapping syncs
