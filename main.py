@@ -882,9 +882,175 @@ async def trigger_full_backup(background_tasks: BackgroundTasks):
     
     background_tasks.add_task(run_backup)
     return {
-        "status": "queued", 
+        "status": "queued",
         "message": "Full backup started in background",
         "warning": "Supabase FREE tier has no automatic backups - this is your only backup!"
+    }
+
+
+# --- Weekly Maintenance (bundle of weekly jobs) ---
+
+@app.post("/weekly-maintenance")
+async def weekly_maintenance(background_tasks: BackgroundTasks):
+    """
+    Weekly maintenance endpoint that runs multiple weekly tasks in parallel.
+
+    This is designed to be called by Cloud Scheduler once per week (e.g., Sunday 2am).
+
+    Runs in parallel:
+    1. Full backup (Supabase → GCS)
+    2. Anki card generation (new highlights → cards, chapter/book summaries)
+
+    Returns immediately, tasks run in background.
+    """
+    from backup_full import run_full_backup
+    from generate_anki_cards import AnkiCardGenerator
+
+    results = {
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "tasks": ["backup", "anki_cards"],
+        "status": "queued"
+    }
+
+    async def run_all_weekly_tasks():
+        task_results = {}
+
+        # Run backup
+        try:
+            logger.info("Weekly maintenance: Starting full backup...")
+            backup_result = await run_full_backup()
+            task_results["backup"] = {"status": "success", "result": backup_result}
+            logger.info("Weekly maintenance: Backup completed")
+        except Exception as e:
+            logger.error(f"Weekly maintenance: Backup failed: {e}", exc_info=True)
+            task_results["backup"] = {"status": "error", "error": str(e)}
+
+        # Run Anki card generation
+        try:
+            logger.info("Weekly maintenance: Starting Anki card generation...")
+            generator = AnkiCardGenerator()
+
+            # 1. Generate cards for new highlights
+            new_highlights = generator.get_highlights_without_cards(limit=50)
+            cards_created = 0
+            if new_highlights:
+                for highlight in new_highlights:
+                    cards = generator.generate_cards(highlight, preview=False)
+                    cards_created += len(cards)
+
+            # 2. Process chapter/book completions
+            completions = generator.process_completions(preview=False)
+
+            task_results["anki_cards"] = {
+                "status": "success",
+                "new_highlight_cards": cards_created,
+                "chapter_summaries": completions.get("chapters_processed", 0),
+                "book_summaries": completions.get("books_processed", 0),
+                "total_cards_created": completions.get("total_cards_created", 0) + cards_created
+            }
+            logger.info(f"Weekly maintenance: Anki cards completed - {cards_created} highlight cards, {completions.get('total_cards_created', 0)} summary cards")
+        except Exception as e:
+            logger.error(f"Weekly maintenance: Anki card generation failed: {e}", exc_info=True)
+            task_results["anki_cards"] = {"status": "error", "error": str(e)}
+
+        logger.info(f"Weekly maintenance completed: {task_results}")
+
+    background_tasks.add_task(run_all_weekly_tasks)
+    return results
+
+
+@app.post("/generate/anki-cards")
+async def generate_anki_cards_endpoint(
+    background_tasks: BackgroundTasks,
+    book_title: str = None,
+    days: int = None,
+    check_completions: bool = True,
+    preview: bool = False
+):
+    """
+    Generate Anki flashcards from book highlights.
+
+    This endpoint creates varied card types from highlights:
+    - Q&A cards from concepts
+    - Cloze cards (fill-in-the-blank)
+    - Reflection prompts
+    - Chapter summaries (when a chapter is completed)
+    - Book summaries (when a book is finished)
+
+    Args:
+        book_title: Optional - limit to specific book
+        days: Optional - only process highlights from last N days
+        check_completions: Also check for completed chapters/books (default True)
+        preview: If True, returns what would be created without saving
+
+    Returns:
+        Summary of cards created (or preview of cards)
+    """
+    from generate_anki_cards import AnkiCardGenerator
+
+    if preview:
+        # Synchronous preview
+        try:
+            generator = AnkiCardGenerator()
+            result = {
+                "mode": "preview",
+                "new_highlights": [],
+                "completions": {}
+            }
+
+            # Get highlights without cards
+            new_highlights = generator.get_highlights_without_cards(
+                book_title=book_title,
+                days=days,
+                limit=20
+            )
+            result["new_highlights"] = [
+                {"book": h["book_title"], "highlight": h["text"][:100] + "..."}
+                for h in new_highlights
+            ]
+
+            if check_completions:
+                result["completions"] = generator.process_completions(preview=True)
+
+            return result
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # Background execution
+    async def run_card_generation():
+        try:
+            generator = AnkiCardGenerator()
+
+            # Get highlights
+            new_highlights = generator.get_highlights_without_cards(
+                book_title=book_title,
+                days=days,
+                limit=50
+            )
+
+            cards_created = 0
+            for highlight in new_highlights:
+                cards = generator.generate_cards(highlight, preview=False)
+                cards_created += len(cards)
+
+            # Check completions
+            completions = {}
+            if check_completions:
+                completions = generator.process_completions(preview=False)
+
+            logger.info(f"Anki card generation completed: {cards_created} cards from highlights, completions: {completions}")
+        except Exception as e:
+            logger.error(f"Anki card generation failed: {e}", exc_info=True)
+
+    background_tasks.add_task(run_card_generation)
+    return {
+        "status": "queued",
+        "message": "Anki card generation started in background",
+        "params": {
+            "book_title": book_title,
+            "days": days,
+            "check_completions": check_completions
+        }
     }
 
 
@@ -1626,6 +1792,92 @@ async def sync_highlights(full: bool = False, hours: int = 24):
         return result
     except Exception as e:
         logger.error(f"Highlights sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Articles Capture ---
+
+from capture_article import ArticleCaptureService
+
+class ArticleCaptureRequest(BaseModel):
+    url: str
+    tags: list[str] | None = None
+    upload_to_bookfusion: bool = True
+
+
+@app.post("/articles/capture")
+async def capture_article(request: ArticleCaptureRequest):
+    """
+    Capture an online article and upload to Bookfusion.
+
+    Workflow:
+    1. Extract article content (title, text, images)
+    2. Generate EPUB with e-ink optimized formatting
+    3. Upload to Bookfusion (to "Articles" shelf)
+    4. Store article record in Supabase
+
+    The article will appear in Bookfusion app shortly and can be read on Boox.
+    Highlights sync back via existing Bookfusion → Notion → sync_highlights pipeline.
+
+    Args:
+        url: Article URL to capture
+        tags: Optional tags for categorization
+        upload_to_bookfusion: Whether to upload to Bookfusion (default True)
+    """
+    try:
+        logger.info(f"Capturing article: {request.url}")
+        service = ArticleCaptureService()
+        result = await service.capture(
+            url=request.url,
+            upload_to_bookfusion=request.upload_to_bookfusion,
+            tags=request.tags,
+            skip_existing=True,
+            keep_epub=False
+        )
+
+        if result.success:
+            return {
+                "success": True,
+                "article": {
+                    "id": result.article_id,
+                    "title": result.title,
+                    "bookfusion_id": result.bookfusion_id,
+                    "already_exists": result.already_exists
+                }
+            }
+        else:
+            raise HTTPException(status_code=400, detail=result.error)
+
+    except Exception as e:
+        logger.error(f"Article capture failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Articles Link Highlights ---
+
+from link_highlights_to_articles import link_highlights_to_articles
+
+
+@app.post("/articles/link-highlights")
+async def link_article_highlights(dry_run: bool = False):
+    """
+    Link unlinked highlights to their corresponding articles.
+
+    When highlights sync from Bookfusion → Notion → Supabase, they have a book_title
+    but may not be linked to an article. This endpoint matches them by title.
+
+    Args:
+        dry_run: If True, preview without making changes
+    """
+    try:
+        logger.info(f"Linking article highlights (dry_run={dry_run})")
+        stats = await run_in_threadpool(link_highlights_to_articles, None, dry_run)
+        return {
+            "success": True,
+            "stats": stats
+        }
+    except Exception as e:
+        logger.error(f"Article highlight linking failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
