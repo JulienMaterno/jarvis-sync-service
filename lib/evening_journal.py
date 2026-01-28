@@ -50,6 +50,7 @@ TELEGRAM_BOT_URL = os.environ.get(
     "https://jarvis-telegram-bot-776871804948.asia-southeast1.run.app"
 )
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY", "")
 
 
 class DailyActivityCollector:
@@ -396,10 +397,14 @@ class TelegramFeedbackLoop:
                 }
             }
             
+            headers = {}
+            if INTERNAL_API_KEY:
+                headers["X-API-Key"] = INTERNAL_API_KEY
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(
                     f"{self.bot_url}/send_message",
-                    json=payload
+                    json=payload,
+                    headers=headers,
                 )
                 response.raise_for_status()
                 return True
