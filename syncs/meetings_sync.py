@@ -476,6 +476,35 @@ class MeetingsSyncService(TwoWaySyncService):
         
         return properties
     
+    def _find_existing_notion_page(
+        self, title: str, contact_name: str, notion_records: List[Dict]
+    ) -> Optional[Dict]:
+        """
+        Check if a Notion page with matching title already exists.
+
+        Prevents creating duplicate pages when the same meeting was
+        processed multiple times (e.g. during debugging/reprocessing).
+        """
+        if not title:
+            return None
+
+        title_lower = title.strip().lower()
+        for nr in notion_records:
+            props = nr.get("properties", {})
+            # Extract title from Notion page
+            notion_title_parts = props.get("Name", {}).get("title", [])
+            notion_title = "".join(
+                t.get("plain_text", "") for t in notion_title_parts
+            ).strip().lower()
+
+            if notion_title == title_lower:
+                self.logger.debug(
+                    f"Dedup match: '{title}' matches Notion page {nr.get('id', '')[:8]}"
+                )
+                return nr
+
+        return None
+
     def _build_meeting_content_blocks(self, meeting: Dict) -> List[Dict]:
         """
         Build Notion content blocks from meeting data.
@@ -824,10 +853,10 @@ class MeetingsSyncService(TwoWaySyncService):
                         updated_page = self.notion.update_page(notion_page_id, notion_props)
                         if metrics:
                             metrics.notion_api_calls += 1
-                        
+
                         # Note: We don't update content blocks for existing pages to avoid
                         # overwriting AI meeting notes or other manual edits
-                        
+
                         # Update Supabase with new Notion timestamp to prevent re-sync loops
                         # This is CRITICAL: without this, `last_sync_source` stays 'supabase'
                         # and future Notion edits would be skipped!
@@ -835,26 +864,49 @@ class MeetingsSyncService(TwoWaySyncService):
                             'notion_updated_at': updated_page.get('last_edited_time'),
                             'last_sync_source': 'notion'
                         })
-                        
+
                         stats.updated += 1
                     else:
-                        # Create new page with content
-                        blocks = self._build_meeting_content_blocks(record)
-                        new_page = self.notion.create_page(
-                            self.notion_database_id, 
-                            notion_props, 
-                            children=blocks
+                        # Before creating a new Notion page, check if a duplicate
+                        # already exists in Notion (e.g. from reprocessing the same audio).
+                        # Match by title to find existing pages.
+                        existing_notion_page = self._find_existing_notion_page(
+                            record.get('title', ''),
+                            record.get('contact_name', ''),
+                            notion_records,
                         )
-                        if metrics:
-                            metrics.notion_api_calls += 1
-                        
-                        # Update Supabase with new Notion ID
-                        self.supabase.update(record['id'], {
-                            'notion_page_id': new_page['id'],
-                            'notion_updated_at': new_page.get('last_edited_time'),
-                            'last_sync_source': 'notion'
-                        })
-                        stats.created += 1
+
+                        if existing_notion_page:
+                            # Link to existing Notion page instead of creating a duplicate
+                            matched_id = self.get_source_id(existing_notion_page)
+                            self.logger.info(
+                                f"Found existing Notion page for '{record.get('title')}' "
+                                f"- linking instead of creating duplicate"
+                            )
+                            self.supabase.update(record['id'], {
+                                'notion_page_id': matched_id,
+                                'notion_updated_at': existing_notion_page.get('last_edited_time'),
+                                'last_sync_source': 'notion'
+                            })
+                            stats.updated += 1
+                        else:
+                            # Create new page with content
+                            blocks = self._build_meeting_content_blocks(record)
+                            new_page = self.notion.create_page(
+                                self.notion_database_id,
+                                notion_props,
+                                children=blocks
+                            )
+                            if metrics:
+                                metrics.notion_api_calls += 1
+
+                            # Update Supabase with new Notion ID
+                            self.supabase.update(record['id'], {
+                                'notion_page_id': new_page['id'],
+                                'notion_updated_at': new_page.get('last_edited_time'),
+                                'last_sync_source': 'notion'
+                            })
+                            stats.created += 1
                     
                 except Exception as e:
                     self.logger.error(f"Error syncing meeting to Notion: {e}")
