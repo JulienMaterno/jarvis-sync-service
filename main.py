@@ -1,8 +1,11 @@
 import asyncio
+import os
 from datetime import datetime, timezone
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 from lib.sync_service import sync_contacts
 from lib.notion_sync import sync_notion_to_supabase, sync_supabase_to_notion
 from lib.telegram_client import notify_error, reset_failure_count
@@ -73,6 +76,78 @@ from lib.sync_cursor import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Load API key from environment (fail-closed: no key = reject all non-health requests)
+_INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
+if not _INTERNAL_API_KEY:
+    logger.warning(
+        "INTERNAL_API_KEY not set! All non-health requests will be rejected with 503. "
+        "Set INTERNAL_API_KEY environment variable to enable API access."
+    )
+
+
+class APIKeyAuthMiddleware(BaseHTTPMiddleware):
+    """
+    Middleware to enforce API key authentication on all endpoints.
+
+    Security model (fail-closed):
+    - If INTERNAL_API_KEY is set: validates X-API-Key header against it.
+    - If INTERNAL_API_KEY is NOT set: rejects all non-health requests with 503.
+    - Health and root endpoints are always public (for load balancer checks).
+    """
+
+    # Paths that never require authentication
+    PUBLIC_PATHS = {"/", "/health"}
+    # Path prefixes that never require authentication (health sub-routes)
+    PUBLIC_PREFIXES = ("/health/",)
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+
+        # Allow public endpoints without authentication
+        if path in self.PUBLIC_PATHS or path.startswith(self.PUBLIC_PREFIXES):
+            return await call_next(request)
+
+        # Fail-closed: if no API key is configured, reject with 503
+        if not _INTERNAL_API_KEY:
+            auth_logger = logging.getLogger("jarvis.auth")
+            auth_logger.warning(
+                f"Rejecting request to {path} - INTERNAL_API_KEY not configured"
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail": "Service not configured: INTERNAL_API_KEY environment variable is not set. "
+                    "All non-health endpoints are unavailable until authentication is configured."
+                }
+            )
+
+        # Check for API key in request headers
+        api_key = request.headers.get("X-API-Key")
+
+        if not api_key:
+            auth_logger = logging.getLogger("jarvis.auth")
+            auth_logger.warning(
+                f"Missing API key from {request.client.host} for {path}"
+            )
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Missing API key. Include X-API-Key header."}
+            )
+
+        if api_key != _INTERNAL_API_KEY:
+            auth_logger = logging.getLogger("jarvis.auth")
+            auth_logger.warning(
+                f"Invalid API key from {request.client.host} for {path}"
+            )
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid API key"}
+            )
+
+        # Valid API key, proceed
+        return await call_next(request)
+
+
 app = FastAPI(title="Jarvis Backend")
 
 # ============================================================================
@@ -85,6 +160,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ============================================================================
+# API KEY AUTH MIDDLEWARE - Defense-in-depth (fail-closed)
+# ============================================================================
+app.add_middleware(APIKeyAuthMiddleware)
 
 # ============================================================================
 # SYNC LOCKING - Prevent overlapping syncs
@@ -2058,7 +2138,6 @@ async def get_today_activity_summary():
 from sync_beeper import BeeperSyncService, run_beeper_sync
 from lib.supabase_client import supabase
 import httpx
-import os
 
 BEEPER_BRIDGE_URL = os.getenv("BEEPER_BRIDGE_URL", "http://localhost:8377")
 

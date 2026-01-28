@@ -644,6 +644,8 @@ class SupabaseClient:
         supabase.delete(record_id)
     """
     
+    PAGE_SIZE = 1000  # Supabase REST API default limit
+
     def __init__(self, url: str, key: str, table_name: str):
         self.base_url = f"{url}/rest/v1"
         self.table_name = table_name
@@ -659,16 +661,63 @@ class SupabaseClient:
     def __del__(self):
         if hasattr(self, 'client'):
             self.client.close()
-    
+
     @retry_on_error(max_retries=3, base_delay=1.0)
+    def _paginated_get(self, params: Dict[str, Any]) -> List[Dict]:
+        """Fetch all rows matching params using pagination.
+
+        Supabase REST API (PostgREST) silently caps results at ~1000 rows.
+        This helper fetches in pages using the Range header so that no
+        rows are silently dropped.
+
+        Args:
+            params: Query parameters to pass to the GET request.
+
+        Returns:
+            Complete list of matching records across all pages.
+        """
+        all_records: List[Dict] = []
+        page = 0
+        page_size = self.PAGE_SIZE
+
+        while True:
+            start = page * page_size
+            end = start + page_size - 1
+
+            headers = {**self.client.headers, "Range": f"{start}-{end}"}
+            response = self.client.get(
+                f"{self.base_url}/{self.table_name}",
+                params=params,
+                headers=headers,
+            )
+
+            # 200 = all results fit, 206 = partial content (more pages available)
+            if response.status_code not in (200, 206):
+                response.raise_for_status()
+
+            batch = response.json()
+            all_records.extend(batch)
+
+            # If we got fewer rows than the page size, we've reached the end
+            if len(batch) < page_size:
+                break
+
+            page += 1
+
+        if page > 0:
+            self.logger.warning(
+                f"Paginated fetch on '{self.table_name}': retrieved {len(all_records)} "
+                f"rows across {page + 1} pages"
+            )
+
+        return all_records
+
     def select_all(self, columns: str = "*", order_by: str = "created_at.desc") -> List[Dict]:
-        """Select all records from the table."""
-        response = self.client.get(
-            f"{self.base_url}/{self.table_name}",
-            params={"select": columns, "order": order_by}
-        )
-        response.raise_for_status()
-        return response.json()
+        """Select all records from the table.
+
+        Automatically paginates to avoid Supabase's ~1000 row default limit.
+        """
+        return self._paginated_get({"select": columns, "order": order_by})
     
     @retry_on_error(max_retries=3, base_delay=1.0)
     def select_where(self, column: str, value: Any, columns: str = "*") -> List[Dict]:
@@ -764,19 +813,16 @@ class SupabaseClient:
         """Soft-delete a record by setting deleted_at."""
         return self.update(record_id, {"deleted_at": datetime.now(timezone.utc).isoformat()})
     
-    @retry_on_error(max_retries=3, base_delay=1.0)
     def get_deleted_with_notion_id(self) -> List[Dict]:
-        """Get soft-deleted records that still have a notion_page_id (need archiving in Notion)."""
-        response = self.client.get(
-            f"{self.base_url}/{self.table_name}",
-            params={
-                "select": "*",
-                "deleted_at": "not.is.null",
-                "notion_page_id": "not.is.null"
-            }
-        )
-        response.raise_for_status()
-        return response.json()
+        """Get soft-deleted records that still have a notion_page_id (need archiving in Notion).
+
+        Automatically paginates to avoid Supabase's ~1000 row default limit.
+        """
+        return self._paginated_get({
+            "select": "*",
+            "deleted_at": "not.is.null",
+            "notion_page_id": "not.is.null"
+        })
     
     @retry_on_error(max_retries=3, base_delay=1.0)
     def clear_notion_page_id(self, record_id: str) -> Dict:
@@ -786,19 +832,16 @@ class SupabaseClient:
             "notion_updated_at": None
         })
     
-    @retry_on_error(max_retries=3, base_delay=1.0)
     def get_all_active(self) -> List[Dict]:
-        """Get all non-deleted records."""
-        response = self.client.get(
-            f"{self.base_url}/{self.table_name}",
-            params={
-                "select": "*",
-                "deleted_at": "is.null",
-                "order": "created_at.desc"
-            }
-        )
-        response.raise_for_status()
-        return response.json()
+        """Get all non-deleted records.
+
+        Automatically paginates to avoid Supabase's ~1000 row default limit.
+        """
+        return self._paginated_get({
+            "select": "*",
+            "deleted_at": "is.null",
+            "order": "created_at.desc"
+        })
 
 
 # ============================================================================
