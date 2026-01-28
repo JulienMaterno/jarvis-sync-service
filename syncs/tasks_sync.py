@@ -39,16 +39,20 @@ from lib.sync_base import (
 NOTION_TASKS_DB_ID = os.environ.get('NOTION_TASKS_DB_ID', '2b3cd3f1-eb28-8004-a33a-d26b8bb3fa58')
 
 # Status mapping between Supabase and Notion
+# NOTE: Notion Tasks DB must have these statuses configured:
+#   Not started, In progress, Done, Cancelled
 SUPABASE_TO_NOTION_STATUS = {
     'pending': 'Not started',
-    'in_progress': 'Not started',  # Notion only has Not started/Done
+    'in_progress': 'In progress',
     'completed': 'Done',
-    'cancelled': 'Done',
+    'cancelled': 'Cancelled',
 }
 
 NOTION_TO_SUPABASE_STATUS = {
     'Not started': 'pending',
+    'In progress': 'in_progress',
     'Done': 'completed',
+    'Cancelled': 'cancelled',
 }
 
 # Priority mapping between Supabase and Notion

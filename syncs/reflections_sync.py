@@ -160,10 +160,20 @@ class ReflectionsSyncService(TwoWaySyncService):
         return blocks
     
     def _build_supabase_lookup(self) -> Dict[str, Dict]:
-        """Build lookup dict for existing Supabase records by notion_page_id."""
+        """Build lookup dict for existing Supabase records by notion_page_id.
+
+        Includes soft-deleted records to prevent re-creating a record that was
+        intentionally deleted but still has a Notion page.
+        """
         lookup = {}
+        # Include active records
         for r in self.supabase.get_all_active():
             if r.get('notion_page_id'):
+                lookup[r['notion_page_id']] = r
+        # Include soft-deleted records that still have a notion_page_id
+        # to prevent duplicate creation
+        for r in self.supabase.get_deleted_with_notion_id():
+            if r.get('notion_page_id') and r['notion_page_id'] not in lookup:
                 lookup[r['notion_page_id']] = r
         return lookup
     
