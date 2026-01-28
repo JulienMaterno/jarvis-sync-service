@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 TELEGRAM_BOT_SERVICE_URL = os.environ.get("TELEGRAM_BOT_SERVICE_URL")
+INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY", "")
 
 # Notification control - can disable via environment variable
 # Set to "false", "0", "no", or "disabled" to disable
@@ -68,7 +69,7 @@ async def send_telegram_message(text: str, force: bool = False):
         return
 
     if TELEGRAM_BOT_SERVICE_URL:
-        # Use internal bot service
+        # Use internal bot service with API key auth
         url = f"{TELEGRAM_BOT_SERVICE_URL}/send_message"
         payload = {
             "chat_id": int(TELEGRAM_CHAT_ID),
@@ -88,8 +89,11 @@ async def send_telegram_message(text: str, force: bool = False):
         return
 
     try:
+        headers = {}
+        if INTERNAL_API_KEY and TELEGRAM_BOT_SERVICE_URL:
+            headers["X-API-Key"] = INTERNAL_API_KEY
         async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=payload, timeout=10.0)
+            response = await client.post(url, json=payload, headers=headers, timeout=10.0)
             response.raise_for_status()
     except Exception as e:
         logger.error(f"Failed to send Telegram message: {e}")
