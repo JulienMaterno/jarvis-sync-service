@@ -2,9 +2,13 @@ import httpx
 import base64
 from typing import List, Dict, Any, Optional
 from lib.google_auth import get_access_token
-from lib.utils import retry_on_error
+from lib.utils import retry_with_backoff
+from lib.circuit_breaker import get_google_gmail_breaker
 
 GOOGLE_GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
+
+# Get the shared circuit breaker for Gmail API
+_gmail_breaker = get_google_gmail_breaker()
 
 class GmailClient:
     def __init__(self):
@@ -14,7 +18,13 @@ class GmailClient:
         if not self.access_token:
             self.access_token = await get_access_token()
 
-    @retry_on_error()
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        max_delay=30.0,
+        exponential_factor=2.0,
+        circuit_breaker=_gmail_breaker
+    )
     async def list_messages(self, 
                           query: str = None, 
                           max_results: int = 100,
@@ -70,7 +80,13 @@ class GmailClient:
         data = response.json()
         return data.get("messages", [])
 
-    @retry_on_error()
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        max_delay=30.0,
+        exponential_factor=2.0,
+        circuit_breaker=_gmail_breaker
+    )
     async def get_message(self, message_id: str, format: str = 'full', client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
         """
         Get full message details.
@@ -129,7 +145,13 @@ class GmailClient:
         """
         return await self.list_messages(query=query, max_results=max_results)
 
-    @retry_on_error()
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        max_delay=30.0,
+        exponential_factor=2.0,
+        circuit_breaker=_gmail_breaker
+    )
     async def get_profile(self) -> Dict[str, Any]:
         """
         Get user profile (useful for historyId).
@@ -154,7 +176,13 @@ class GmailClient:
             response.raise_for_status()
             return response.json()
 
-    @retry_on_error()
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        max_delay=30.0,
+        exponential_factor=2.0,
+        circuit_breaker=_gmail_breaker
+    )
     async def list_history(self, start_history_id: str, max_results: int = 100) -> Dict[str, Any]:
         """
         List history of changes since start_history_id.
@@ -238,7 +266,13 @@ class GmailClient:
                 return h["value"]
         return ""
 
-    @retry_on_error()
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        max_delay=30.0,
+        exponential_factor=2.0,
+        circuit_breaker=_gmail_breaker
+    )
     async def send_email(
         self,
         to: str,
@@ -370,7 +404,13 @@ class GmailClient:
         
         return base64.urlsafe_b64encode(msg.as_bytes()).decode('utf-8')
 
-    @retry_on_error()
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        max_delay=30.0,
+        exponential_factor=2.0,
+        circuit_breaker=_gmail_breaker
+    )
     async def list_drafts(self, max_results: int = 20) -> List[Dict[str, Any]]:
         """
         List all drafts in the mailbox.
@@ -401,7 +441,13 @@ class GmailClient:
             data = response.json()
             return data.get("drafts", [])
 
-    @retry_on_error()
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        max_delay=30.0,
+        exponential_factor=2.0,
+        circuit_breaker=_gmail_breaker
+    )
     async def get_draft(self, draft_id: str, format: str = 'full') -> Dict[str, Any]:
         """
         Get a specific draft by ID.
@@ -435,7 +481,13 @@ class GmailClient:
             response.raise_for_status()
             return response.json()
 
-    @retry_on_error()
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        max_delay=30.0,
+        exponential_factor=2.0,
+        circuit_breaker=_gmail_breaker
+    )
     async def create_draft(
         self,
         to: str,
@@ -519,7 +571,13 @@ class GmailClient:
             response.raise_for_status()
             return response.json()
 
-    @retry_on_error()
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        max_delay=30.0,
+        exponential_factor=2.0,
+        circuit_breaker=_gmail_breaker
+    )
     async def update_draft(
         self,
         draft_id: str,
@@ -580,7 +638,13 @@ class GmailClient:
             response.raise_for_status()
             return response.json()
 
-    @retry_on_error()
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        max_delay=30.0,
+        exponential_factor=2.0,
+        circuit_breaker=_gmail_breaker
+    )
     async def delete_draft(self, draft_id: str) -> bool:
         """
         Delete a draft permanently.
@@ -611,7 +675,13 @@ class GmailClient:
             response.raise_for_status()
             return True
 
-    @retry_on_error()
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        max_delay=30.0,
+        exponential_factor=2.0,
+        circuit_breaker=_gmail_breaker
+    )
     async def send_draft(self, draft_id: str) -> Dict[str, Any]:
         """
         Send an existing draft.
