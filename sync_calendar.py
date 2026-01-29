@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 from lib.google_calendar import GoogleCalendarClient
-from lib.supabase_client import supabase, find_contact_by_email
+from lib.supabase_client import supabase, find_contact_by_email, find_contact_by_name
 from lib.logging_service import log_sync_event
 
 logger = logging.getLogger("CalendarSync")
@@ -103,15 +103,31 @@ class CalendarSync:
                 start_time = start.get('dateTime') or start.get('date')
                 end_time = end.get('dateTime') or end.get('date')
                 
-                # Find contact from organizer or first attendee
+                # Find contact from organizer or attendees
                 organizer = event.get('organizer', {})
                 attendees = event.get('attendees', [])
+
+                # Strategy 1: Try email matching first
                 contact_id = find_contact_by_email(organizer.get('email'))
                 if not contact_id and attendees:
                     for att in attendees:
+                        if att.get('self'):  # Skip self
+                            continue
                         contact_id = find_contact_by_email(att.get('email'))
                         if contact_id:
                             break
+
+                # Strategy 2: Fall back to name matching if no email match
+                if not contact_id and attendees:
+                    for att in attendees:
+                        if att.get('self'):  # Skip self
+                            continue
+                        display_name = att.get('displayName')
+                        if display_name:
+                            contact_id = find_contact_by_name(display_name)
+                            if contact_id:
+                                logger.info(f"Linked event '{event.get('summary', '')}' to contact via name: {display_name}")
+                                break
                 
                 record = {
                     "google_event_id": event['id'],
