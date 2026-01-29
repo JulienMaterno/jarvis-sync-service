@@ -4,6 +4,8 @@ import asyncio
 import logging
 from typing import Dict, Any, List, Optional
 from lib.google_auth import get_access_token
+from lib.utils import retry_with_backoff
+from lib.circuit_breaker import get_google_contacts_breaker
 
 GOOGLE_PEOPLE_API_BASE = "https://people.googleapis.com/v1"
 
@@ -15,6 +17,9 @@ RETRY_DELAY = 1.0  # seconds
 
 logger = logging.getLogger(__name__)
 
+# Get the shared circuit breaker for Google Contacts API
+_contacts_breaker = get_google_contacts_breaker()
+
 
 def format_exception(e: Exception) -> str:
     """Format exception with type name when str(e) is empty (e.g., timeouts)."""
@@ -25,11 +30,18 @@ def format_exception(e: Exception) -> str:
 
 
 async def retry_async(func, *args, max_retries=MAX_RETRIES, **kwargs):
-    """Retry an async function with exponential backoff for transient errors."""
+    """
+    Retry an async function with exponential backoff for transient errors.
+
+    DEPRECATED: Use retry_with_backoff decorator with circuit_breaker parameter instead.
+    Kept for backwards compatibility.
+    """
     last_error = None
     for attempt in range(max_retries):
         try:
-            return await func(*args, **kwargs)
+            # Use circuit breaker if available
+            async with _contacts_breaker:
+                return await func(*args, **kwargs)
         except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
             last_error = e
             if attempt < max_retries - 1:
@@ -53,6 +65,13 @@ async def retry_async(func, *args, max_retries=MAX_RETRIES, **kwargs):
                 raise
     raise last_error
 
+@retry_with_backoff(
+    max_retries=3,
+    base_delay=1.0,
+    max_delay=30.0,
+    exponential_factor=2.0,
+    circuit_breaker=_contacts_breaker
+)
 async def get_contact_groups(access_token: str) -> Dict[str, str]:
     """
     Fetches contact groups to map resource names to human-readable names.
@@ -83,6 +102,13 @@ async def get_contact_groups(access_token: str) -> Dict[str, str]:
 
     return groups_mapping
 
+@retry_with_backoff(
+    max_retries=3,
+    base_delay=1.0,
+    max_delay=30.0,
+    exponential_factor=2.0,
+    circuit_breaker=_contacts_breaker
+)
 async def get_contact(access_token: str, resource_name: str) -> Dict[str, Any]:
     """
     Fetches a single contact by resource name.
@@ -102,6 +128,7 @@ async def get_contact(access_token: str, resource_name: str) -> Dict[str, Any]:
 async def get_all_contacts(access_token: str) -> List[Dict[str, Any]]:
     """
     Fetches all connections from Google People API.
+    Uses circuit breaker for each page request.
     """
     headers = {"Authorization": f"Bearer {access_token}"}
     contacts = []
@@ -118,13 +145,15 @@ async def get_all_contacts(access_token: str) -> List[Dict[str, Any]]:
             if page_token:
                 params["pageToken"] = page_token
 
-            response = await client.get(
-                f"{GOOGLE_PEOPLE_API_BASE}/people/me/connections",
-                headers=headers,
-                params=params
-            )
-            response.raise_for_status()
-            data = response.json()
+            # Use circuit breaker for each page request
+            async with _contacts_breaker:
+                response = await client.get(
+                    f"{GOOGLE_PEOPLE_API_BASE}/people/me/connections",
+                    headers=headers,
+                    params=params
+                )
+                response.raise_for_status()
+                data = response.json()
 
             connections = data.get("connections", [])
             contacts.extend(connections)
@@ -305,6 +334,13 @@ def transform_to_google_body(data: Dict[str, Any]) -> Dict[str, Any]:
 
     return body
 
+@retry_with_backoff(
+    max_retries=3,
+    base_delay=1.0,
+    max_delay=30.0,
+    exponential_factor=2.0,
+    circuit_breaker=_contacts_breaker
+)
 async def create_contact_group(access_token: str, name: str) -> Dict[str, Any]:
     """
     Creates a new contact group (label).
@@ -383,6 +419,13 @@ def calculate_memberships(
             
     return new_memberships
 
+@retry_with_backoff(
+    max_retries=3,
+    base_delay=1.0,
+    max_delay=30.0,
+    exponential_factor=2.0,
+    circuit_breaker=_contacts_breaker
+)
 async def create_contact(
     access_token: str,
     contact_data: Dict[str, Any],
@@ -413,6 +456,13 @@ async def create_contact(
         response.raise_for_status()
         return response.json()
 
+@retry_with_backoff(
+    max_retries=3,
+    base_delay=1.0,
+    max_delay=30.0,
+    exponential_factor=2.0,
+    circuit_breaker=_contacts_breaker
+)
 async def update_contact(
     access_token: str,
     resource_name: str,
@@ -453,6 +503,13 @@ async def update_contact(
         response.raise_for_status()
         return response.json()
 
+@retry_with_backoff(
+    max_retries=3,
+    base_delay=1.0,
+    max_delay=30.0,
+    exponential_factor=2.0,
+    circuit_breaker=_contacts_breaker
+)
 async def delete_contact(access_token: str, resource_name: str) -> None:
     """
     Deletes a contact from Google Contacts.

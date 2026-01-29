@@ -2,9 +2,13 @@ import httpx
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta, timezone
 from lib.google_auth import get_access_token
-from lib.utils import retry_on_error
+from lib.utils import retry_with_backoff
+from lib.circuit_breaker import get_google_calendar_breaker
 
 GOOGLE_CALENDAR_API_BASE = "https://www.googleapis.com/calendar/v3"
+
+# Get the shared circuit breaker for Google Calendar API
+_calendar_breaker = get_google_calendar_breaker()
 
 
 def format_datetime_local(dt: datetime) -> str:
@@ -41,7 +45,13 @@ class GoogleCalendarClient:
         if not self.access_token:
             self.access_token = await get_access_token()
 
-    @retry_on_error()
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        max_delay=30.0,
+        exponential_factor=2.0,
+        circuit_breaker=_calendar_breaker
+    )
     async def list_events(self, 
                          calendar_id: str = 'primary', 
                          time_min: Optional[datetime] = None, 
@@ -111,7 +121,13 @@ class GoogleCalendarClient:
                 "expired": False
             }
 
-    @retry_on_error()
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        max_delay=30.0,
+        exponential_factor=2.0,
+        circuit_breaker=_calendar_breaker
+    )
     async def get_event(self, calendar_id: str, event_id: str) -> Dict[str, Any]:
         await self._ensure_token()
         headers = {"Authorization": f"Bearer {self.access_token}"}
@@ -124,7 +140,13 @@ class GoogleCalendarClient:
             response.raise_for_status()
             return response.json()
 
-    @retry_on_error()
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        max_delay=30.0,
+        exponential_factor=2.0,
+        circuit_breaker=_calendar_breaker
+    )
     async def create_event(
         self,
         summary: str,
@@ -200,7 +222,13 @@ class GoogleCalendarClient:
             response.raise_for_status()
             return response.json()
 
-    @retry_on_error()
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        max_delay=30.0,
+        exponential_factor=2.0,
+        circuit_breaker=_calendar_breaker
+    )
     async def update_event(self,
                           event_id: str,
                           calendar_id: str = 'primary',
@@ -290,7 +318,13 @@ class GoogleCalendarClient:
             response.raise_for_status()
             return response.json()
 
-    @retry_on_error()
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        max_delay=30.0,
+        exponential_factor=2.0,
+        circuit_breaker=_calendar_breaker
+    )
     async def decline_event(self,
                            event_id: str,
                            calendar_id: str = 'primary',
