@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 # Core fields that map directly to Supabase columns
 CORE_FIELDS = {
-    "Name", "Mail", "Birthday", "Company", "Position", "LinkedIn URL", "Location", "Subscribed?"
+    "Name", "Mail", "Birthday", "Company", "Position", "LinkedIn URL", "Location", "Subscribed?", "Phone Number"
 }
 
 def get_all_notion_contacts(filter_params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -105,7 +105,11 @@ def transform_notion_to_supabase(page: Dict[str, Any]) -> Dict[str, Any]:
     # Subscribed
     subscribed_prop = props.get("Subscribed?", {}).get("checkbox")
     subscribed = subscribed_prop if subscribed_prop is not None else False
-    
+
+    # Phone
+    phone_prop = props.get("Phone Number", {}).get("phone_number")
+    phone = phone_prop if phone_prop else None
+
     # Dynamic Properties (JSONB)
     notion_properties = {}
     for key, prop in props.items():
@@ -119,6 +123,7 @@ def transform_notion_to_supabase(page: Dict[str, Any]) -> Dict[str, Any]:
         "first_name": first_name,
         "last_name": last_name,
         "email": email,
+        "phone": phone,
         "birthday": birthday,
         "company": company,
         "job_title": job_title,
@@ -144,7 +149,11 @@ def transform_supabase_to_notion(contact: Dict[str, Any]) -> Dict[str, Any]:
     # Email
     if contact.get("email"):
         props["Mail"] = {"email": contact["email"]}
-        
+
+    # Phone
+    if contact.get("phone"):
+        props["Phone Number"] = {"phone_number": contact["phone"]}
+
     # Birthday
     if contact.get("birthday"):
         props["Birthday"] = {"date": {"start": contact["birthday"]}}
