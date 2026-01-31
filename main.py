@@ -41,6 +41,9 @@ from syncs.linkedin_posts_sync import run_sync as run_linkedin_posts_sync
 # Import documents sync
 from syncs.documents_sync import run_sync as run_documents_sync
 
+# Import newsletters sync
+from syncs.newsletters_sync import run_sync as run_newsletters_sync
+
 # Import ActivityWatch sync
 from sync_activitywatch import run_activitywatch_sync, ActivityWatchSync, format_activity_summary_for_journal
 
@@ -1194,7 +1197,7 @@ async def sync_tasks(full: bool = False, hours: int = 24):
 async def sync_reflections(full: bool = False, hours: int = 24):
     """
     Bidirectional sync between Notion and Supabase for reflections/thoughts.
-    
+
     Args:
         full: If True, performs full sync. If False, incremental sync.
         hours: For incremental sync, how many hours to look back (default 24).
@@ -1205,6 +1208,25 @@ async def sync_reflections(full: bool = False, hours: int = 24):
         return result
     except Exception as e:
         logger.error(f"Reflection sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Newsletter Sync ---
+
+@app.post("/sync/newsletters")
+async def sync_newsletters(full: bool = False, hours: int = 24):
+    """
+    Bidirectional sync between Notion and Supabase for newsletters.
+
+    Args:
+        full: If True, performs full sync. If False, incremental sync.
+        hours: For incremental sync, how many hours to look back (default 24).
+    """
+    try:
+        logger.info(f"Starting newsletter sync via API (full={full}, hours={hours})")
+        result = await run_newsletters_sync(full=full, hours=hours)
+        return result
+    except Exception as e:
+        logger.error(f"Newsletter sync failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # --- Journal Sync ---
