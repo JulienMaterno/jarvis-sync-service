@@ -235,10 +235,13 @@ class NewslettersSyncService(TwoWaySyncService):
                         new_page_id = new_page['id']
 
                         # Update Supabase with notion_page_id
-                        self.supabase.update_notion_link(
+                        self.supabase.update(
                             record_id=record['id'],
-                            notion_page_id=new_page_id,
-                            last_sync_source='notion'
+                            data={
+                                'notion_page_id': new_page_id,
+                                'last_sync_source': 'notion',
+                                'updated_at': datetime.now(timezone.utc).isoformat()
+                            }
                         )
                         if metrics:
                             metrics.target_writes += 1
