@@ -8,6 +8,7 @@ gunicorn
 pytz
 google-cloud-storage
 aiohttp
+anthropic>=0.40.0
 
 # Article capture dependencies
 trafilatura>=1.6.0
