@@ -243,8 +243,6 @@ class NewslettersSyncService(TwoWaySyncService):
                                 'updated_at': datetime.now(timezone.utc).isoformat()
                             }
                         )
-                        if metrics:
-                            metrics.target_writes += 1
 
                         stats.created += 1
                         self.logger.info(f"Created Notion page: {record.get('name', record.get('id'))}")
