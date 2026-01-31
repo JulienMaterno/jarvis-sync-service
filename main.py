@@ -1223,7 +1223,7 @@ async def sync_newsletters(full: bool = False, hours: int = 24):
     """
     try:
         logger.info(f"Starting newsletter sync via API (full={full}, hours={hours})")
-        result = await run_newsletters_sync(full=full, hours=hours)
+        result = await run_in_threadpool(run_newsletters_sync, full_sync=full, since_hours=hours)
         return result
     except Exception as e:
         logger.error(f"Newsletter sync failed: {e}")

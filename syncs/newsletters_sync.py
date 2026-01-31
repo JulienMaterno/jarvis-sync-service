@@ -171,51 +171,27 @@ class NewslettersSyncService(TwoWaySyncService):
 # CLI ENTRY POINT
 # ============================================================================
 
-async def run_sync(full: bool = False, hours: int = 24) -> SyncResult:
+def run_sync(full_sync: bool = False, since_hours: int = 24) -> Dict[str, Any]:
     """
-    Run newsletter sync.
+    Main entry point for newsletters sync.
 
     Args:
-        full: If True, sync all newsletters. If False, sync recent changes.
-        hours: For incremental sync, how many hours back to check.
+        full_sync: If True, sync all records. If False, only recent changes.
+        since_hours: For incremental sync, how many hours to look back.
 
     Returns:
-        SyncResult with statistics
+        Dict with sync results
     """
-    sync_service = NewslettersSyncService()
-
-    if full:
-        sync_service.logger.info("Starting FULL newsletters sync...")
-        result = await sync_service.sync_full()
-    else:
-        sync_service.logger.info(f"Starting INCREMENTAL newsletters sync (last {hours}h)...")
-        result = await sync_service.sync_incremental(hours=hours)
-
-    return result
+    service = NewslettersSyncService()
+    result = service.sync(full_sync=full_sync, since_hours=since_hours)
+    return result.to_dict()
 
 
 if __name__ == '__main__':
-    import asyncio
-
-    parser = create_cli_parser("Newsletters Sync Service")
+    parser = create_cli_parser("Newsletters bidirectional sync")
     args = parser.parse_args()
 
-    # Run sync
-    result = asyncio.run(run_sync(full=args.full, hours=args.hours))
+    result = run_sync(full_sync=args.full, since_hours=args.hours)
 
     # Print results
-    print("\n" + "="*70)
-    print("NEWSLETTERS SYNC COMPLETED")
-    print("="*70)
-    print(f"Status: {'SUCCESS' if result.success else 'FAILED'}")
-    print(f"Direction: {result.direction}")
-    if result.stats:
-        print(f"Created: {result.stats.created}")
-        print(f"Updated: {result.stats.updated}")
-        print(f"Skipped: {result.stats.skipped}")
-        print(f"Errors: {result.stats.errors}")
-    if result.elapsed_seconds:
-        print(f"Elapsed: {result.elapsed_seconds:.2f}s")
-    if result.error_message:
-        print(f"Error: {result.error_message}")
-    print("="*70)
+    print(f"\nResult: {result}")
