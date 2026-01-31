@@ -166,6 +166,109 @@ class NewslettersSyncService(TwoWaySyncService):
 
         return blocks
 
+    def _sync_supabase_to_notion(self, full_sync: bool, since_hours: int, metrics=None) -> SyncResult:
+        """
+        Override to include content block creation.
+        Supabase → Notion with content
+        """
+        from datetime import datetime, timezone, timedelta
+        import time as time_module
+
+        stats = SyncStats()
+        start_time = time_module.time()
+
+        try:
+            # Get Supabase records to sync
+            if full_sync:
+                supabase_records = self.supabase.get_all_active()
+            else:
+                cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+                supabase_records = self.supabase.get_updated_since(cutoff)
+
+            self.logger.info(f"Found {len(supabase_records)} records to sync to Notion")
+
+            if metrics:
+                metrics.source_total = len(supabase_records)
+                metrics.records_read += len(supabase_records)
+
+            # Build lookup for existing Notion pages
+            notion_records = self.notion.query_database(self.notion_database_id)
+            if metrics:
+                metrics.notion_api_calls += 1
+
+            notion_lookup = {r['id']: r for r in notion_records}
+
+            for record in supabase_records:
+                try:
+                    # Convert to Notion properties format
+                    properties = self.convert_to_source(record)
+
+                    notion_page_id = record.get('notion_page_id')
+
+                    # Determine if create or update
+                    if notion_page_id and notion_page_id in notion_lookup:
+                        # Update existing page
+                        self.notion.update_page(notion_page_id, properties)
+                        if metrics:
+                            metrics.notion_api_calls += 1
+
+                        # Update content blocks
+                        content_blocks = self._build_content_blocks(record)
+                        if content_blocks:
+                            self.notion.replace_page_content(notion_page_id, content_blocks)
+                            if metrics:
+                                metrics.notion_api_calls += 1
+
+                        stats.updated += 1
+                        self.logger.info(f"Updated Notion page: {record.get('name', record.get('id'))}")
+                    else:
+                        # Create new page
+                        content_blocks = self._build_content_blocks(record)
+                        new_page = self.notion.create_page(
+                            database_id=self.notion_database_id,
+                            properties=properties,
+                            children=content_blocks
+                        )
+                        if metrics:
+                            metrics.notion_api_calls += 1
+
+                        new_page_id = new_page['id']
+
+                        # Update Supabase with notion_page_id
+                        self.supabase.update_notion_link(
+                            record_id=record['id'],
+                            notion_page_id=new_page_id,
+                            last_sync_source='notion'
+                        )
+                        if metrics:
+                            metrics.target_writes += 1
+
+                        stats.created += 1
+                        self.logger.info(f"Created Notion page: {record.get('name', record.get('id'))}")
+
+                except Exception as e:
+                    self.logger.error(f"Error syncing to Notion: {e}")
+                    stats.errors += 1
+
+            elapsed = time_module.time() - start_time
+            return SyncResult(
+                success=stats.errors == 0,
+                direction='supabase_to_notion',
+                stats=stats,
+                elapsed_seconds=elapsed
+            )
+
+        except Exception as e:
+            self.logger.error(f"Supabase → Notion sync failed: {e}")
+            elapsed = time_module.time() - start_time
+            return SyncResult(
+                success=False,
+                direction='supabase_to_notion',
+                stats=stats,
+                elapsed_seconds=elapsed,
+                error_message=str(e)
+            )
+
 
 # ============================================================================
 # CLI ENTRY POINT
