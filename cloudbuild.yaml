@@ -20,7 +20,6 @@ steps:
       - 'asia-southeast1'
       - '--platform'
       - 'managed'
-      - '--clear-secrets'
       - '--set-secrets'
       - 'GOOGLE_CLIENT_ID=GOOGLE_CLIENT_ID:latest,GOOGLE_CLIENT_SECRET=GOOGLE_CLIENT_SECRET:latest,GOOGLE_REFRESH_TOKEN=GOOGLE_REFRESH_TOKEN:latest,SUPABASE_KEY=SUPABASE_KEY:latest,INTERNAL_API_KEY=INTERNAL_API_KEY:latest'
       - '--set-env-vars'
