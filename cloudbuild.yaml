@@ -20,8 +20,11 @@ steps:
       - 'asia-southeast1'
       - '--platform'
       - 'managed'
-      # We don't set env vars here; they are managed in the Cloud Run service settings
-      # so they persist and don't need to be in this file.
+      - '--clear-secrets'
+      - '--set-secrets'
+      - 'GOOGLE_CLIENT_ID=GOOGLE_CLIENT_ID:latest,GOOGLE_CLIENT_SECRET=GOOGLE_CLIENT_SECRET:latest,GOOGLE_REFRESH_TOKEN=GOOGLE_REFRESH_TOKEN:latest,SUPABASE_KEY=SUPABASE_KEY:latest,INTERNAL_API_KEY=INTERNAL_API_KEY:latest'
+      - '--set-env-vars'
+      - 'SUPABASE_URL=https://ojnllduebzfxqmiyinhx.supabase.co,NOTION_API_TOKEN=ntn_p1756751396UdfCcJL3tLJ22pAqHPqU5TOJp3xXhky0aLI,NOTION_CRM_DATABASE_ID=2d1068b5-e624-81e8-9c1c-f1d45c33e420,NOTION_TASKS_DB_ID=2d1068b5-e624-81e5-ad71-e58029bd481d,NOTION_REFLECTIONS_DB_ID=2d1068b5-e624-81d9-aefc-fafbe8ec92bd,NOTION_MEETING_DB_ID=2d1068b5-e624-8154-a7b2-e8c349e7a196,NOTION_JOURNAL_DB_ID=2d1068b5-e624-81cc-9553-d2375854d951,NOTION_NEWSLETTERS_DB_ID=2f9068b5-e624-80a8-b6db-e6edad1d4e48,NOTION_DOCUMENTS_DB_ID=2e7068b5e624801a9319c839dc7aafaa'
 
 options:
   logging: CLOUD_LOGGING_ONLY
