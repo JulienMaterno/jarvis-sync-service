@@ -286,7 +286,7 @@ class EPUBLearningEnhancer:
         if len(words) > 3000:
             content = ' '.join(words[:3000]) + '\n\n[...chapter continues...]'
 
-        prompt = f"""{context_section}You are enhancing a book chapter for active learning.
+        prompt = f"""{context_section}You are creating a factual chapter summary to help the reader decide whether to read or skip this chapter.
 
 BOOK: {book_title}
 {f'AUTHOR: {book_author}' if book_author else ''}
@@ -297,11 +297,20 @@ CHAPTER CONTENT:
 
 Generate:
 
-1. PREVIEW SUMMARY (50-100 words)
-   A teaser that hooks the reader without spoilers. Focus on:
-   - The main question or problem this chapter addresses
-   - Why it matters to the reader
-   - What transformation/insight awaits
+1. CHAPTER OVERVIEW (50-100 words)
+   A factual, objective description of what this chapter contains. NOT a teaser or marketing pitch.
+   Help the reader decide: "Should I read this chapter or skip it?"
+
+   Include:
+   - What topics/concepts are covered
+   - Key frameworks, models, or ideas introduced (if any)
+   - What type of content it is (theory, examples, practical exercises, stories, etc.)
+
+   Style: Informative, neutral, like an enhanced table of contents entry.
+   You can use bullet points if it helps clarity.
+
+   BAD example (too salesy): "Discover the shocking truth about time management that will transform your life!"
+   GOOD example: "Introduces the 'energy audit' framework. Covers: identifying energy drains, categorizing tasks by cognitive load, and the 2-hour focus block method. Heavy on practical exercises."
 
 2. LEARNING QUESTIONS (3-5 questions)
    Questions to prime active reading. Include:
@@ -312,7 +321,7 @@ Generate:
 Format your response as JSON:
 ```json
 {{
-  "preview_summary": "Your preview summary here...",
+  "preview_summary": "Your chapter overview here...",
   "learning_questions": [
     "Question 1?",
     "Question 2?",
@@ -478,14 +487,14 @@ Format your response as JSON:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     def _create_preview_html(self, preview: str) -> str:
-        """Create HTML block for chapter preview (at start of chapter)."""
+        """Create HTML block for chapter overview (at start of chapter)."""
         if not preview:
             return ""
 
         return f'''
 <div class="jarvis-preview" style="background: #f8f9fa; padding: 1.2em; margin: 1.5em 0; border-left: 4px solid #6c757d; border-radius: 4px;">
-  <p style="font-weight: bold; margin: 0 0 0.5em 0; color: #495057;">📖 Chapter Preview</p>
-  <p style="margin: 0; font-style: italic; color: #495057; line-height: 1.6;">{preview}</p>
+  <p style="font-weight: bold; margin: 0 0 0.5em 0; color: #495057;">📋 This Chapter Covers</p>
+  <p style="margin: 0; color: #495057; line-height: 1.6;">{preview}</p>
 </div>
 '''
 
