@@ -35,9 +35,11 @@ Environment Variables:
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -50,6 +52,14 @@ from dotenv import load_dotenv
 from supabase import create_client
 
 load_dotenv()
+
+# Configure logging for Cloud Run
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 # Add lib to path
 sys.path.insert(0, os.path.dirname(__file__))
@@ -620,32 +630,36 @@ class BookProcessingPipeline:
             'bookfusion_id': None
         }
 
-        print(f"\n{'='*60}")
-        print("BOOK PROCESSING PIPELINE")
-        print(f"{'='*60}")
-        print(f"Input: {epub_path}")
-        print(f"Mode: {'PREVIEW' if preview else 'FULL PROCESSING'}")
-        print()
+        pipeline_start = time.time()
+
+        logger.info("=" * 60)
+        logger.info("BOOK PROCESSING PIPELINE")
+        logger.info("=" * 60)
+        logger.info(f"Input: {epub_path}")
+        logger.info(f"Mode: {'PREVIEW' if preview else 'FULL PROCESSING'}")
 
         # Step 1: Parse EPUB
-        print("[1/10] Parsing EPUB...")
+        step_start = time.time()
+        logger.info("[1/10] Parsing EPUB...")
         metadata, chapters = parse_epub_file(epub_path)
-        print(f"  Title: {metadata.title}")
-        print(f"  Author: {metadata.author}")
-        print(f"  Chapters: {len(chapters)}")
+        logger.info(f"  Title: {metadata.title}")
+        logger.info(f"  Author: {metadata.author}")
+        logger.info(f"  Chapters: {len(chapters)}")
         total_words = sum(c.word_count for c in chapters)
-        print(f"  Total words: {total_words:,}")
+        logger.info(f"  Total words: {total_words:,}")
+        logger.info(f"  Step 1 completed in {time.time() - step_start:.1f}s")
 
         results['book_title'] = metadata.title
 
         if preview:
-            print("\n--- CHAPTER LIST ---")
+            logger.info("--- CHAPTER LIST ---")
             for ch in chapters:
                 title = ch.title or '(Untitled)'
-                print(f"  {ch.number:2}. {title[:50]:<50} ({ch.word_count:,} words)")
+                logger.info(f"  {ch.number:2}. {title[:50]:<50} ({ch.word_count:,} words)")
 
         # Step 2: Build reader context
-        print("\n[2/10] Building reader context...")
+        step_start = time.time()
+        logger.info("[2/10] Building reader context...")
         reader_context = None
         if self.anthropic_api_key:
             try:
@@ -653,34 +667,38 @@ class BookProcessingPipeline:
                     self.supabase,
                     current_book_title=metadata.title
                 )
-                print(f"  Thinking style: {', '.join(reader_context.thinking_style)}")
-                print(f"  Recent reads: {len(reader_context.recent_books)} books")
+                logger.info(f"  Thinking style: {', '.join(reader_context.thinking_style)}")
+                logger.info(f"  Recent reads: {len(reader_context.recent_books)} books")
             except Exception as e:
-                print(f"  Warning: Could not build context: {e}")
+                logger.warning(f"  Could not build context: {e}")
         else:
-            print("  Skipped (no ANTHROPIC_API_KEY)")
+            logger.info("  Skipped (no ANTHROPIC_API_KEY)")
+        logger.info(f"  Step 2 completed in {time.time() - step_start:.1f}s")
 
         # Step 3: Check/create book in database
-        print("\n[3/10] Checking database...")
+        step_start = time.time()
+        logger.info("[3/10] Checking database...")
         book = self.find_book_by_title(metadata.title or "Unknown")
 
         if preview:
             if book:
-                print(f"  Found existing book: {book['title']} (ID: {book['id']})")
+                logger.info(f"  Found existing book: {book['title']} (ID: {book['id']})")
             else:
-                print(f"  Would create new book: {metadata.title}")
+                logger.info(f"  Would create new book: {metadata.title}")
             results['book_id'] = book['id'] if book else 'NEW'
         else:
             if book:
-                print(f"  Found existing book: {book['title']} (ID: {book['id']})")
+                logger.info(f"  Found existing book: {book['title']} (ID: {book['id']})")
             else:
-                print(f"  Creating new book...")
+                logger.info(f"  Creating new book...")
                 book = self.create_book(metadata)
-                print(f"  Created: {book['title']} (ID: {book['id']})")
+                logger.info(f"  Created: {book['title']} (ID: {book['id']})")
             results['book_id'] = book['id']
+        logger.info(f"  Step 3 completed in {time.time() - step_start:.1f}s")
 
         # Step 4: Generate enhancements
-        print("\n[4/10] Generating enhancements...")
+        step_start = time.time()
+        logger.info("[4/10] Generating enhancements...")
         enhancements: dict[int, dict] = {}
 
         if self.anthropic_api_key:
@@ -692,12 +710,14 @@ class BookProcessingPipeline:
 
             # In preview mode, only process first 2 chapters
             chapters_to_enhance = leaf_chapters[:2] if preview else leaf_chapters
+            logger.info(f"  Enhancing {len(chapters_to_enhance)} chapters (out of {len(leaf_chapters)} leaf chapters)")
 
             enhancer = EPUBLearningEnhancer(self.anthropic_api_key, reader_context)
 
             for i, chapter in enumerate(chapters_to_enhance):
                 title = chapter.title or f'Chapter {chapter.number}'
-                print(f"  [{i+1}/{len(chapters_to_enhance)}] {title[:40]}...")
+                chapter_start = time.time()
+                logger.info(f"  [{i+1}/{len(chapters_to_enhance)}] Enhancing: {title[:40]}...")
 
                 try:
                     enhancement = enhancer.generate_chapter_enhancement(
@@ -707,29 +727,34 @@ class BookProcessingPipeline:
                     )
                     enhancements[chapter.number] = enhancement
                     results['enhancements_generated'] += 1
+                    elapsed = time.time() - chapter_start
+                    logger.info(f"      Done in {elapsed:.1f}s - preview: {enhancement.get('preview_summary', '')[:60]}...")
 
                     if preview:
-                        print(f"      Preview: {enhancement.get('preview_summary', '')[:80]}...")
                         questions = enhancement.get('learning_questions', [])
                         for q in questions[:2]:
-                            print(f"      Q: {q[:60]}...")
+                            logger.info(f"      Q: {q[:60]}...")
 
                 except Exception as e:
-                    print(f"      Error: {e}")
+                    logger.error(f"      Error enhancing chapter: {e}")
         else:
-            print("  Skipped (no ANTHROPIC_API_KEY)")
+            logger.info("  Skipped (no ANTHROPIC_API_KEY)")
+        logger.info(f"  Step 4 completed in {time.time() - step_start:.1f}s - {results['enhancements_generated']} enhancements generated")
 
         # Step 5: Store chapters
-        print("\n[5/10] Storing chapters...")
+        step_start = time.time()
+        logger.info("[5/10] Storing chapters...")
         if preview:
-            print(f"  Would store {len(chapters)} chapters")
+            logger.info(f"  Would store {len(chapters)} chapters")
         else:
             stored = self.store_chapters(book['id'], chapters, enhancements)
-            print(f"  Stored {stored} chapters")
+            logger.info(f"  Stored {stored} chapters")
             results['chapters_processed'] = stored
+        logger.info(f"  Step 5 completed in {time.time() - step_start:.1f}s")
 
         # Step 6: Build enhanced EPUB
-        print("\n[6/10] Building enhanced EPUB...")
+        step_start = time.time()
+        logger.info("[6/10] Building enhanced EPUB...")
         enhanced_path = output_path
         if not preview and enhancements:
             enhancer = EPUBLearningEnhancer(self.anthropic_api_key, reader_context)
@@ -739,93 +764,104 @@ class BookProcessingPipeline:
                 enhancements,
                 output_path
             )
-            print(f"  Created: {enhanced_path}")
+            logger.info(f"  Created: {enhanced_path}")
         elif preview:
             stem = epub_path.stem
             enhanced_path = epub_path.parent / f"{stem}_enhanced.epub"
-            print(f"  Would create: {enhanced_path}")
+            logger.info(f"  Would create: {enhanced_path}")
         else:
-            print("  Skipped (no enhancements)")
+            logger.info("  Skipped (no enhancements)")
             enhanced_path = epub_path  # Use original
+        logger.info(f"  Step 6 completed in {time.time() - step_start:.1f}s")
 
         # Step 7: Upload original to Drive
-        print("\n[7/10] Uploading original to Drive...")
+        step_start = time.time()
+        logger.info("[7/10] Uploading original to Drive...")
         if self.use_drive and self.drive:
             if preview:
-                print(f"  Would upload to Jarvis/books/originals/{epub_path.name}")
+                logger.info(f"  Would upload to Jarvis/books/originals/{epub_path.name}")
             else:
                 try:
                     file_id, url = self.drive.upload_file(epub_path, folder="originals")
-                    print(f"  Uploaded: {url}")
+                    logger.info(f"  Uploaded: {url}")
                     results['original_drive_url'] = url
                     self.update_book_urls(book['id'], original_drive_id=file_id, original_drive_url=url)
                 except Exception as e:
-                    print(f"  Error: {e}")
+                    logger.error(f"  Upload error: {e}")
         else:
-            print("  Skipped (--skip-drive or Drive not configured)")
+            logger.info("  Skipped (--skip-drive or Drive not configured)")
+        logger.info(f"  Step 7 completed in {time.time() - step_start:.1f}s")
 
         # Step 8: Upload enhanced to Drive
-        print("\n[8/10] Uploading enhanced to Drive...")
+        step_start = time.time()
+        logger.info("[8/10] Uploading enhanced to Drive...")
         if self.use_drive and self.drive and enhanced_path:
             if preview:
-                print(f"  Would upload to Jarvis/books/{enhanced_path.name}")
+                logger.info(f"  Would upload to Jarvis/books/{enhanced_path.name}")
             else:
                 try:
                     file_id, url = self.drive.upload_file(enhanced_path, folder="books")
-                    print(f"  Uploaded: {url}")
+                    logger.info(f"  Uploaded: {url}")
                     results['enhanced_drive_url'] = url
                     self.update_book_urls(book['id'], enhanced_drive_id=file_id, enhanced_drive_url=url)
                 except Exception as e:
-                    print(f"  Error: {e}")
+                    logger.error(f"  Upload error: {e}")
         else:
-            print("  Skipped (--skip-drive or Drive not configured)")
+            logger.info("  Skipped (--skip-drive or Drive not configured)")
+        logger.info(f"  Step 8 completed in {time.time() - step_start:.1f}s")
 
         # Step 9: Upload to Bookfusion
-        print("\n[9/10] Uploading to Bookfusion...")
+        step_start = time.time()
+        logger.info("[9/10] Uploading to Bookfusion...")
         if self.use_bookfusion and BOOKFUSION_API_KEY:
             upload_path = enhanced_path if enhanced_path and enhanced_path.exists() else epub_path
             if preview:
-                print(f"  Would upload {upload_path.name} to Bookfusion")
+                logger.info(f"  Would upload {upload_path.name} to Bookfusion")
             else:
                 try:
                     bookfusion_id = asyncio.run(self.upload_to_bookfusion(upload_path, metadata))
                     if bookfusion_id:
-                        print(f"  Uploaded! ID: {bookfusion_id}")
+                        logger.info(f"  Uploaded! ID: {bookfusion_id}")
                         results['bookfusion_id'] = bookfusion_id
                         self.update_book_urls(book['id'], bookfusion_id=bookfusion_id)
                 except Exception as e:
-                    print(f"  Error: {e}")
+                    logger.error(f"  Bookfusion upload error: {e}")
         else:
-            print("  Skipped (--skip-bookfusion or API key not configured)")
+            logger.info("  Skipped (--skip-bookfusion or API key not configured)")
+        logger.info(f"  Step 9 completed in {time.time() - step_start:.1f}s")
 
         # Step 10: Final update
-        print("\n[10/10] Finalizing...")
+        step_start = time.time()
+        logger.info("[10/10] Finalizing...")
         if not preview:
             self.supabase.table('books').update({
                 'processed_at': datetime.now(timezone.utc).isoformat(),
                 'updated_at': datetime.now(timezone.utc).isoformat()
             }).eq('id', book['id']).execute()
-            print("  Database updated")
+            logger.info("  Database updated")
+        logger.info(f"  Step 10 completed in {time.time() - step_start:.1f}s")
 
         results['success'] = True
+        total_time = time.time() - pipeline_start
 
         # Print summary
-        print(f"\n{'='*60}")
-        print("SUMMARY")
-        print(f"{'='*60}")
-        print(f"Book: {results['book_title']}")
-        print(f"Book ID: {results['book_id']}")
-        print(f"Chapters: {len(chapters)}")
-        print(f"Enhancements: {results['enhancements_generated']}")
+        logger.info("=" * 60)
+        logger.info("SUMMARY")
+        logger.info("=" * 60)
+        logger.info(f"Book: {results['book_title']}")
+        logger.info(f"Book ID: {results['book_id']}")
+        logger.info(f"Chapters: {len(chapters)}")
+        logger.info(f"Enhancements: {results['enhancements_generated']}")
+        logger.info(f"Total time: {total_time:.1f}s")
         if results['original_drive_url']:
-            print(f"Original Drive: {results['original_drive_url']}")
+            logger.info(f"Original Drive: {results['original_drive_url']}")
         if results['enhanced_drive_url']:
-            print(f"Enhanced Drive: {results['enhanced_drive_url']}")
+            logger.info(f"Enhanced Drive: {results['enhanced_drive_url']}")
         if results['bookfusion_id']:
-            print(f"Bookfusion ID: {results['bookfusion_id']}")
+            logger.info(f"Bookfusion ID: {results['bookfusion_id']}")
 
         if preview:
-            print("\n[PREVIEW MODE] No changes were saved.")
+            logger.info("[PREVIEW MODE] No changes were saved.")
 
         return results
 
