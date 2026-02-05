@@ -7,6 +7,9 @@ notion-client
 gunicorn
 pytz
 google-cloud-storage
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
 aiohttp
 anthropic>=0.40.0
 
