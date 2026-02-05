@@ -65,8 +65,18 @@ from lib.bookfusion_client import BookfusionClient, BookfusionMetadata, UploadRe
 SUPABASE_URL = os.environ.get('SUPABASE_URL', '').strip()
 SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
-GOOGLE_TOKEN_JSON = os.environ.get('GOOGLE_TOKEN_JSON')
 BOOKFUSION_API_KEY = os.environ.get('BOOKFUSION_API_KEY')
+
+# Google OAuth - supports both formats:
+# 1. GOOGLE_TOKEN_JSON (combined JSON) - for local development
+# 2. GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN - for Cloud Run
+GOOGLE_TOKEN_JSON = os.environ.get('GOOGLE_TOKEN_JSON')
+GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
+GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET')
+GOOGLE_REFRESH_TOKEN = os.environ.get('GOOGLE_REFRESH_TOKEN')
+
+# Check if we have Google credentials (either format)
+HAS_GOOGLE_CREDS = bool(GOOGLE_TOKEN_JSON) or all([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN])
 
 # Drive folder structure
 JARVIS_FOLDER_NAME = "Jarvis"
@@ -85,17 +95,30 @@ class GoogleDriveUploader:
     """Handles Google Drive uploads for EPUBs."""
 
     def __init__(self):
-        if not GOOGLE_TOKEN_JSON:
-            raise ValueError("GOOGLE_TOKEN_JSON required for Drive upload")
-
         from google.oauth2.credentials import Credentials
         from google.auth.transport.requests import Request
         from googleapiclient.discovery import build
 
-        token_data = json.loads(GOOGLE_TOKEN_JSON)
-        creds = Credentials.from_authorized_user_info(token_data)
+        # Try GOOGLE_TOKEN_JSON first (local dev), then individual vars (Cloud Run)
+        if GOOGLE_TOKEN_JSON:
+            token_data = json.loads(GOOGLE_TOKEN_JSON)
+            creds = Credentials.from_authorized_user_info(token_data)
+        elif all([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN]):
+            creds = Credentials(
+                token=None,
+                refresh_token=GOOGLE_REFRESH_TOKEN,
+                client_id=GOOGLE_CLIENT_ID,
+                client_secret=GOOGLE_CLIENT_SECRET,
+                token_uri="https://oauth2.googleapis.com/token"
+            )
+        else:
+            raise ValueError(
+                "Google credentials not configured. Set either GOOGLE_TOKEN_JSON "
+                "or GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET + GOOGLE_REFRESH_TOKEN"
+            )
 
-        if creds and creds.expired and creds.refresh_token:
+        # Refresh if expired or no token yet
+        if creds and (not creds.token or (creds.expired and creds.refresh_token)):
             creds.refresh(Request())
 
         self.drive = build('drive', 'v3', credentials=creds)
@@ -441,7 +464,7 @@ class BookProcessingPipeline:
         self.use_bookfusion = use_bookfusion
 
         self.drive: Optional[GoogleDriveUploader] = None
-        if use_drive and GOOGLE_TOKEN_JSON:
+        if use_drive and HAS_GOOGLE_CREDS:
             try:
                 self.drive = GoogleDriveUploader()
             except Exception as e:
@@ -887,8 +910,8 @@ def main():
     if not ANTHROPIC_API_KEY:
         print("WARNING: ANTHROPIC_API_KEY not set - enhancements will be skipped")
 
-    if not args.skip_drive and not GOOGLE_TOKEN_JSON:
-        print("WARNING: GOOGLE_TOKEN_JSON not set - Drive uploads will be skipped")
+    if not args.skip_drive and not HAS_GOOGLE_CREDS:
+        print("WARNING: Google credentials not configured - Drive uploads will be skipped")
 
     if not args.skip_bookfusion and not BOOKFUSION_API_KEY:
         print("WARNING: BOOKFUSION_API_KEY not set - Bookfusion upload will be skipped")
