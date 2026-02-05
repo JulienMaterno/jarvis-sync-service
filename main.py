@@ -3110,19 +3110,13 @@ async def process_book_inbox(preview: bool = False):
                         False  # not preview
                     )
 
-                    # Move original from input folder to books folder
-                    if result.get('success') and books_folder_id:
+                    # Delete from input folder (pipeline already uploaded to books/)
+                    if result.get('success'):
                         try:
-                            # Move file by updating its parents
-                            drive_sync.drive.files().update(
-                                fileId=file_id,
-                                addParents=books_folder_id,
-                                removeParents=input_folder_id,
-                                fields='id, parents'
-                            ).execute()
-                            logger.info(f"Moved {filename} to books folder")
-                        except Exception as move_error:
-                            logger.warning(f"Could not move {filename}: {move_error}")
+                            drive_sync.drive.files().delete(fileId=file_id).execute()
+                            logger.info(f"Deleted {filename} from input folder (already uploaded by pipeline)")
+                        except Exception as delete_error:
+                            logger.warning(f"Could not delete {filename} from input: {delete_error}")
 
                     processing_results.append({
                         "filename": filename,

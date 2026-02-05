@@ -73,19 +73,32 @@ class BooksSupabaseClient:
     @retry_on_error(max_retries=3, base_delay=1.0)
     def upsert_book(self, book_data: Dict) -> Dict:
         """Upsert a book using Supabase's native upsert."""
-        response = self.client.post(
-            f"{self.base_url}/books?on_conflict=notion_page_id",
-            json=book_data,
-            headers={**self.headers, "Prefer": "resolution=merge-duplicates,return=representation"}
-        )
+        # If we have an ID, update by ID (for linking orphan records)
+        if 'id' in book_data:
+            book_id = book_data.pop('id')
+            response = self.client.patch(
+                f"{self.base_url}/books?id=eq.{book_id}",
+                json=book_data,
+                headers={**self.headers, "Prefer": "return=representation"}
+            )
+        else:
+            # Standard upsert by notion_page_id
+            response = self.client.post(
+                f"{self.base_url}/books?on_conflict=notion_page_id",
+                json=book_data,
+                headers={**self.headers, "Prefer": "resolution=merge-duplicates,return=representation"}
+            )
         response.raise_for_status()
         result = response.json()
         return result[0] if result else {}
-    
+
     @retry_on_error(max_retries=3, base_delay=1.0)
     def get_all_books(self) -> List[Dict]:
-        """Get all books from Supabase."""
-        response = self.client.get(f"{self.base_url}/books?select=notion_page_id&order=created_at.desc")
+        """Get all books from Supabase with fields needed for sync."""
+        response = self.client.get(
+            f"{self.base_url}/books?select=id,title,notion_page_id,summary,drive_url,drive_file_id,"
+            f"original_drive_url,original_drive_file_id,bookfusion_id,processed_at&order=created_at.desc"
+        )
         response.raise_for_status()
         return response.json()
 
@@ -239,21 +252,51 @@ class BookSyncService:
             raise
         
         # Get existing books from Supabase for comparison
-        existing_books = {b['notion_page_id']: b for b in self.supabase.get_all_books()}
-        
+        all_books = self.supabase.get_all_books()
+        existing_by_notion_id = {b['notion_page_id']: b for b in all_books if b.get('notion_page_id')}
+
+        # Also index orphan books (no notion_page_id) by title for linking
+        orphan_books_by_title = {}
+        for b in all_books:
+            if not b.get('notion_page_id') and b.get('title'):
+                # Normalize title for matching
+                title_lower = b['title'].lower().strip()
+                orphan_books_by_title[title_lower] = b
+
+        if orphan_books_by_title:
+            logger.info(f"Found {len(orphan_books_by_title)} orphan books that may be linked")
+
         # Sync each book
         for notion_book in notion_books:
             try:
                 book_data = notion_book_to_supabase(notion_book)
                 notion_id = book_data['notion_page_id']
-                
-                if notion_id in existing_books:
-                    # Update existing
+                title = book_data.get('title', '').lower().strip()
+
+                if notion_id in existing_by_notion_id:
+                    # Update existing by notion_page_id
                     stats['updated'] += 1
+                elif title in orphan_books_by_title:
+                    # Found orphan book with matching title - link it!
+                    orphan = orphan_books_by_title[title]
+                    logger.info(f"Linking orphan book '{orphan['title']}' to Notion page {notion_id}")
+
+                    # Preserve our data (summary, drive URLs, etc) but add notion_page_id
+                    # Only update metadata from Notion, keep our enhanced data
+                    book_data['id'] = orphan['id']  # Use existing ID
+
+                    # Preserve our fields if Notion doesn't have them
+                    for field in ['summary', 'drive_url', 'drive_file_id', 'original_drive_url',
+                                  'original_drive_file_id', 'bookfusion_id', 'processed_at']:
+                        if orphan.get(field) and not book_data.get(field):
+                            book_data[field] = orphan[field]
+
+                    stats['updated'] += 1
+                    del orphan_books_by_title[title]  # Remove from orphan list
                 else:
                     # Create new
                     stats['created'] += 1
-                
+
                 self.supabase.upsert_book(book_data)
                 
             except Exception as e:
