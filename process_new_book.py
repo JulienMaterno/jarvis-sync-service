@@ -12,8 +12,8 @@ Orchestrates the complete pipeline for processing a new EPUB book:
 4. Store chapters in book_chapters table
 5. Generate enhancements (preview summaries + learning questions)
 6. Build enhanced EPUB with injected content
-7. Upload original to Google Drive (Jarvis/books/originals/)
-8. Upload enhanced to Google Drive (Jarvis/books/)
+7. Upload original to Google Drive (Jarvis/books/)
+8. Upload enhanced to Google Drive (Jarvis/books/enhanced/)
 9. Upload enhanced to Bookfusion
 10. Update database with all URLs and metadata
 
@@ -90,9 +90,11 @@ GOOGLE_REFRESH_TOKEN = os.environ.get('GOOGLE_REFRESH_TOKEN')
 HAS_GOOGLE_CREDS = bool(GOOGLE_TOKEN_JSON) or all([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN])
 
 # Drive folder structure
+# Jarvis/books/ → Original EPUBs
+# Jarvis/books/enhanced/ → Enhanced EPUBs with learning aids
 JARVIS_FOLDER_NAME = "Jarvis"
 BOOKS_FOLDER_NAME = "books"
-ORIGINALS_FOLDER_NAME = "originals"
+ENHANCED_FOLDER_NAME = "enhanced"
 
 # Bookfusion shelf for books (different from articles)
 BOOKFUSION_BOOKS_SHELF = "Books"
@@ -134,7 +136,7 @@ class GoogleDriveUploader:
 
         self.drive = build('drive', 'v3', credentials=creds)
         self._books_folder_id: Optional[str] = None
-        self._originals_folder_id: Optional[str] = None
+        self._enhanced_folder_id: Optional[str] = None
 
     def _find_or_create_folder(self, name: str, parent_id: Optional[str] = None) -> str:
         """Find or create a folder in Drive."""
@@ -167,7 +169,7 @@ class GoogleDriveUploader:
         return folder['id']
 
     def _ensure_folders(self) -> None:
-        """Ensure Jarvis/books and Jarvis/books/originals folders exist."""
+        """Ensure Jarvis/books and Jarvis/books/enhanced folders exist."""
         # Find Jarvis folder
         results = self.drive.files().list(
             q=f"name='{JARVIS_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false",
@@ -181,11 +183,11 @@ class GoogleDriveUploader:
 
         jarvis_id = jarvis_folders[0]['id']
 
-        # Find or create books folder
+        # Find or create books folder (for original EPUBs)
         self._books_folder_id = self._find_or_create_folder(BOOKS_FOLDER_NAME, jarvis_id)
 
-        # Find or create originals subfolder
-        self._originals_folder_id = self._find_or_create_folder(ORIGINALS_FOLDER_NAME, self._books_folder_id)
+        # Find or create enhanced subfolder (for enhanced EPUBs)
+        self._enhanced_folder_id = self._find_or_create_folder(ENHANCED_FOLDER_NAME, self._books_folder_id)
 
     def upload_file(self, file_path: Path, folder: str = "books") -> tuple[str, str]:
         """
@@ -193,7 +195,7 @@ class GoogleDriveUploader:
 
         Args:
             file_path: Path to file
-            folder: "books" or "originals"
+            folder: "books" (for originals) or "enhanced" (for enhanced versions)
 
         Returns:
             Tuple of (file_id, web_url)
@@ -203,7 +205,7 @@ class GoogleDriveUploader:
         if self._books_folder_id is None:
             self._ensure_folders()
 
-        parent_id = self._originals_folder_id if folder == "originals" else self._books_folder_id
+        parent_id = self._enhanced_folder_id if folder == "enhanced" else self._books_folder_id
 
         file_metadata = {
             'name': file_path.name,
@@ -843,15 +845,15 @@ class BookProcessingPipeline:
             enhanced_path = epub_path  # Use original
         logger.info(f"  Step 6 completed in {time.time() - step_start:.1f}s")
 
-        # Step 7: Upload original to Drive
+        # Step 7: Upload original to Drive (Jarvis/books/)
         step_start = time.time()
         logger.info("[7/10] Uploading original to Drive...")
         if self.use_drive and self.drive:
             if preview:
-                logger.info(f"  Would upload to Jarvis/books/originals/{epub_path.name}")
+                logger.info(f"  Would upload to Jarvis/books/{epub_path.name}")
             else:
                 try:
-                    file_id, url = self.drive.upload_file(epub_path, folder="originals")
+                    file_id, url = self.drive.upload_file(epub_path, folder="books")
                     logger.info(f"  Uploaded: {url}")
                     results['original_drive_url'] = url
                     self.update_book_urls(book['id'], original_drive_id=file_id, original_drive_url=url)
@@ -861,15 +863,15 @@ class BookProcessingPipeline:
             logger.info("  Skipped (--skip-drive or Drive not configured)")
         logger.info(f"  Step 7 completed in {time.time() - step_start:.1f}s")
 
-        # Step 8: Upload enhanced to Drive
+        # Step 8: Upload enhanced to Drive (Jarvis/books/enhanced/)
         step_start = time.time()
         logger.info("[8/10] Uploading enhanced to Drive...")
         if self.use_drive and self.drive and enhanced_path:
             if preview:
-                logger.info(f"  Would upload to Jarvis/books/{enhanced_path.name}")
+                logger.info(f"  Would upload to Jarvis/books/enhanced/{enhanced_path.name}")
             else:
                 try:
-                    file_id, url = self.drive.upload_file(enhanced_path, folder="books")
+                    file_id, url = self.drive.upload_file(enhanced_path, folder="enhanced")
                     logger.info(f"  Uploaded: {url}")
                     results['enhanced_drive_url'] = url
                     self.update_book_urls(book['id'], enhanced_drive_id=file_id, enhanced_drive_url=url)
