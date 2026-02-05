@@ -373,17 +373,14 @@ Format your response as JSON:
         # Modify the copy
         with zipfile.ZipFile(output_path, 'a') as zf:
             # For each chapter with enhancement, inject content
+            from xml.etree import ElementTree as ET
             parser = EPUBParser(original_epub_path)
             parser._find_opf()
             parser._build_manifest(
-                __import__('xml.etree.ElementTree', fromlist=['ElementTree']).ElementTree.fromstring(
-                    zf.read(parser._opf_path).decode('utf-8')
-                )
+                ET.fromstring(zf.read(parser._opf_path).decode('utf-8'))
             )
             parser._build_spine(
-                __import__('xml.etree.ElementTree', fromlist=['ElementTree']).ElementTree.fromstring(
-                    zf.read(parser._opf_path).decode('utf-8')
-                )
+                ET.fromstring(zf.read(parser._opf_path).decode('utf-8'))
             )
 
             for chapter in chapters:
