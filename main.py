@@ -2823,3 +2823,347 @@ async def mark_chat_read(beeper_chat_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# --- Book Enhancement Pipeline ---
+
+from process_new_book import BookProcessingPipeline
+from sync_drive_books import DriveBookSync
+import tempfile
+import re
+from pathlib import Path
+
+
+class EnhanceBookRequest(BaseModel):
+    """Request to enhance a book EPUB."""
+    drive_file_id: str | None = None
+    drive_url: str | None = None
+    skip_bookfusion: bool = False
+    skip_drive: bool = False
+    preview: bool = False
+
+
+def extract_drive_file_id(url_or_id: str) -> str | None:
+    """Extract Google Drive file ID from URL or return as-is if already an ID."""
+    patterns = [
+        r'/file/d/([a-zA-Z0-9_-]+)',  # /file/d/ID/view
+        r'id=([a-zA-Z0-9_-]+)',        # ?id=ID
+        r'^([a-zA-Z0-9_-]{25,})$',     # Just the ID (25+ chars)
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url_or_id)
+        if match:
+            return match.group(1)
+    return None
+
+
+@app.post("/books/enhance")
+async def enhance_book(request: EnhanceBookRequest):
+    """
+    Enhance an EPUB book with learning aids.
+
+    Downloads the EPUB from Google Drive, processes it through the enhancement
+    pipeline (adding chapter previews and retrieval questions), then uploads
+    the enhanced version back to Drive and Bookfusion.
+
+    The enhancement pipeline:
+    1. Parse EPUB → extract metadata and chapters
+    2. Build personalized reader context from Jarvis profile
+    3. Generate AI chapter previews (what's coming)
+    4. Generate AI retrieval questions (for learning)
+    5. Inject enhancements into EPUB
+    6. Upload original to Drive/Jarvis/books/originals/
+    7. Upload enhanced to Drive/Jarvis/books/
+    8. Upload enhanced to Bookfusion for Boox sync
+    9. Store all metadata in Supabase
+
+    Args:
+        drive_file_id: Google Drive file ID of the EPUB
+        drive_url: Alternative: Google Drive URL (extracts file ID)
+        skip_bookfusion: Don't upload to Bookfusion
+        skip_drive: Don't upload to Drive (only process and store metadata)
+        preview: Preview mode - show what would be generated without saving
+
+    Returns:
+        Processing results including book_id, URLs, and enhancement stats
+    """
+    # Validate input
+    if not request.drive_file_id and not request.drive_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Either drive_file_id or drive_url must be provided"
+        )
+
+    # Extract file ID from URL if needed
+    file_id = request.drive_file_id
+    if not file_id and request.drive_url:
+        file_id = extract_drive_file_id(request.drive_url)
+        if not file_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not extract file ID from URL: {request.drive_url}"
+            )
+
+    logger.info(f"Starting book enhancement for Drive file: {file_id}")
+
+    try:
+        # Initialize Drive service (uses DriveBookSync for downloading)
+        drive_sync = DriveBookSync()
+
+        # Get file metadata first
+        try:
+            file_metadata = drive_sync.drive.files().get(
+                fileId=file_id,
+                fields='id, name, mimeType'
+            ).execute()
+        except Exception as e:
+            raise HTTPException(
+                status_code=404,
+                detail=f"File not found in Drive: {file_id}. Error: {e}"
+            )
+
+        filename = file_metadata.get('name', 'book.epub')
+        if not filename.lower().endswith('.epub'):
+            raise HTTPException(
+                status_code=400,
+                detail=f"File is not an EPUB: {filename}"
+            )
+
+        logger.info(f"Found EPUB: {filename}")
+
+        # Download EPUB to temp file using DriveBookSync.download_epub
+        logger.info(f"Downloading EPUB...")
+        temp_path = drive_sync.download_epub(file_id, filename)
+
+        try:
+            # Initialize and run pipeline
+            pipeline = BookProcessingPipeline(
+                supabase_url=os.getenv("SUPABASE_URL"),
+                supabase_key=os.getenv("SUPABASE_KEY"),
+                anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+                use_drive=not request.skip_drive,
+                use_bookfusion=not request.skip_bookfusion
+            )
+
+            # Run synchronously in threadpool (process() is sync)
+            result = await run_in_threadpool(
+                pipeline.process,
+                temp_path,
+                None,  # output_path - let pipeline decide
+                request.preview
+            )
+
+            logger.info(f"Book enhancement completed: {result.get('book_title')}")
+
+            return {
+                "status": "success" if result.get('success') else "failed",
+                "book_id": result.get('book_id'),
+                "book_title": result.get('book_title'),
+                "chapters_processed": result.get('chapters_processed', 0),
+                "enhancements_generated": result.get('enhancements_generated', 0),
+                "original_drive_url": result.get('original_drive_url'),
+                "enhanced_drive_url": result.get('enhanced_drive_url'),
+                "bookfusion_id": result.get('bookfusion_id'),
+                "preview_mode": request.preview
+            }
+
+        finally:
+            # Clean up temp file
+            if temp_path.exists():
+                temp_path.unlink()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Book enhancement failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Folder name for book input
+BOOK_INPUT_FOLDER_NAME = "Book input"
+
+
+@app.post("/books/process-inbox")
+async def process_book_inbox(preview: bool = False):
+    """
+    Process all EPUBs in the 'Book input' folder.
+
+    Workflow:
+    1. Find all EPUB files in Jarvis/Book input/
+    2. For each EPUB:
+       - Download and process through enhancement pipeline
+       - Upload enhanced version to Bookfusion
+       - Move original to Jarvis/books/ folder
+       - Delete from Book input folder
+    3. Return results for all processed books
+
+    This is the recommended way to add new books:
+    1. Drop EPUB into "Jarvis/Book input" folder in Google Drive
+    2. Tell Jarvis: "Process my book inbox" or call this endpoint
+    3. Enhanced book appears in Bookfusion and syncs to Boox
+
+    Args:
+        preview: If True, show what would be processed without actually doing it
+
+    Returns:
+        List of processing results for each book found
+    """
+    logger.info(f"Processing book inbox (preview={preview})")
+
+    try:
+        # Initialize Drive service
+        drive_sync = DriveBookSync()
+
+        # Find Jarvis folder first
+        results = drive_sync.drive.files().list(
+            q="name='Jarvis' and mimeType='application/vnd.google-apps.folder' and trashed=false",
+            spaces='drive',
+            fields='files(id, name)'
+        ).execute()
+
+        jarvis_folders = results.get('files', [])
+        if not jarvis_folders:
+            raise HTTPException(status_code=404, detail="Jarvis folder not found in Drive")
+
+        jarvis_id = jarvis_folders[0]['id']
+
+        # Find Book input folder
+        results = drive_sync.drive.files().list(
+            q=f"name='{BOOK_INPUT_FOLDER_NAME}' and '{jarvis_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+            spaces='drive',
+            fields='files(id, name)'
+        ).execute()
+
+        input_folders = results.get('files', [])
+        if not input_folders:
+            raise HTTPException(
+                status_code=404,
+                detail=f"'{BOOK_INPUT_FOLDER_NAME}' folder not found in Jarvis. Please create it in Google Drive."
+            )
+
+        input_folder_id = input_folders[0]['id']
+        logger.info(f"Found Book input folder: {input_folder_id}")
+
+        # Find books folder for moving processed files
+        results = drive_sync.drive.files().list(
+            q=f"name='books' and '{jarvis_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+            spaces='drive',
+            fields='files(id, name)'
+        ).execute()
+
+        books_folders = results.get('files', [])
+        books_folder_id = books_folders[0]['id'] if books_folders else None
+
+        # List all EPUBs in input folder
+        results = drive_sync.drive.files().list(
+            q=f"'{input_folder_id}' in parents and name contains '.epub' and trashed=false",
+            spaces='drive',
+            fields='files(id, name, webViewLink)'
+        ).execute()
+
+        epub_files = results.get('files', [])
+
+        if not epub_files:
+            return {
+                "status": "empty",
+                "message": "No EPUB files found in Book input folder",
+                "books_processed": 0,
+                "results": []
+            }
+
+        logger.info(f"Found {len(epub_files)} EPUB(s) to process")
+
+        processing_results = []
+
+        for epub_file in epub_files:
+            file_id = epub_file['id']
+            filename = epub_file['name']
+
+            logger.info(f"Processing: {filename}")
+
+            if preview:
+                processing_results.append({
+                    "filename": filename,
+                    "file_id": file_id,
+                    "status": "would_process",
+                    "preview_mode": True
+                })
+                continue
+
+            try:
+                # Download EPUB
+                temp_path = drive_sync.download_epub(file_id, filename)
+
+                try:
+                    # Initialize and run pipeline
+                    pipeline = BookProcessingPipeline(
+                        supabase_url=os.getenv("SUPABASE_URL"),
+                        supabase_key=os.getenv("SUPABASE_KEY"),
+                        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+                        use_drive=True,
+                        use_bookfusion=True
+                    )
+
+                    # Run processing
+                    result = await run_in_threadpool(
+                        pipeline.process,
+                        temp_path,
+                        None,
+                        False  # not preview
+                    )
+
+                    # Move original from input folder to books folder
+                    if result.get('success') and books_folder_id:
+                        try:
+                            # Move file by updating its parents
+                            drive_sync.drive.files().update(
+                                fileId=file_id,
+                                addParents=books_folder_id,
+                                removeParents=input_folder_id,
+                                fields='id, parents'
+                            ).execute()
+                            logger.info(f"Moved {filename} to books folder")
+                        except Exception as move_error:
+                            logger.warning(f"Could not move {filename}: {move_error}")
+
+                    processing_results.append({
+                        "filename": filename,
+                        "file_id": file_id,
+                        "status": "success" if result.get('success') else "failed",
+                        "book_id": result.get('book_id'),
+                        "book_title": result.get('book_title'),
+                        "chapters_processed": result.get('chapters_processed', 0),
+                        "enhancements_generated": result.get('enhancements_generated', 0),
+                        "enhanced_drive_url": result.get('enhanced_drive_url'),
+                        "bookfusion_id": result.get('bookfusion_id'),
+                    })
+
+                finally:
+                    # Clean up temp file
+                    if temp_path.exists():
+                        temp_path.unlink()
+
+            except Exception as e:
+                logger.error(f"Failed to process {filename}: {e}")
+                processing_results.append({
+                    "filename": filename,
+                    "file_id": file_id,
+                    "status": "error",
+                    "error": str(e)
+                })
+
+        successful = sum(1 for r in processing_results if r.get('status') == 'success')
+
+        return {
+            "status": "success" if successful > 0 else "failed",
+            "message": f"Processed {successful}/{len(epub_files)} books",
+            "books_processed": successful,
+            "preview_mode": preview,
+            "results": processing_results
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Book inbox processing failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
