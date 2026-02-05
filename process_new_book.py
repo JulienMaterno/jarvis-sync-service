@@ -67,6 +67,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from lib.epub_parser import EPUBParser, EPUBMetadata, Chapter, parse_epub_file
 from lib.enhancement_context import build_reader_context_sync, ReaderContext
 from lib.bookfusion_client import BookfusionClient, BookfusionMetadata, UploadResult
+from lib.chapter_filter import filter_content_chapters
 
 # =============================================================================
 # CONFIGURATION
@@ -377,21 +378,29 @@ Format your response as JSON:
             stem = original_epub_path.stem
             output_path = original_epub_path.parent / f"{stem}_enhanced.epub"
 
-        # Copy original EPUB
-        shutil.copy2(original_epub_path, output_path)
+        # We need to rebuild the EPUB since ZipFile doesn't support in-place modification
+        # Strategy: extract to temp dir, modify files, repack
 
-        # Modify the copy
-        with zipfile.ZipFile(output_path, 'a') as zf:
-            # For each chapter with enhancement, inject content
+        temp_dir = Path(tempfile.mkdtemp())
+        try:
+            # Extract original EPUB
+            with zipfile.ZipFile(original_epub_path, 'r') as zf:
+                zf.extractall(temp_dir)
+
+            # Parse EPUB structure
             from xml.etree import ElementTree as ET
             parser = EPUBParser(original_epub_path)
             parser._find_opf()
-            parser._build_manifest(
-                ET.fromstring(zf.read(parser._opf_path).decode('utf-8'))
-            )
-            parser._build_spine(
-                ET.fromstring(zf.read(parser._opf_path).decode('utf-8'))
-            )
+
+            with zipfile.ZipFile(original_epub_path, 'r') as zf:
+                parser._build_manifest(
+                    ET.fromstring(zf.read(parser._opf_path).decode('utf-8'))
+                )
+                parser._build_spine(
+                    ET.fromstring(zf.read(parser._opf_path).decode('utf-8'))
+                )
+
+            enhanced_count = 0
 
             for chapter in chapters:
                 if chapter.number not in enhancements:
@@ -399,56 +408,105 @@ Format your response as JSON:
 
                 enhancement = enhancements[chapter.number]
                 full_path = parser._resolve_path(chapter.epub_href)
+                file_path = temp_dir / full_path
+
+                if not file_path.exists():
+                    logger.warning(f"Chapter file not found: {file_path}")
+                    continue
 
                 try:
-                    content_html = zf.read(full_path).decode('utf-8')
+                    content_html = file_path.read_text(encoding='utf-8')
                     soup = BeautifulSoup(content_html, 'html.parser')
 
-                    # Create enhancement block
-                    enhancement_html = self._create_enhancement_html(
-                        enhancement.get('preview_summary', ''),
+                    # Create preview block (at chapter START)
+                    preview_html = self._create_preview_html(
+                        enhancement.get('preview_summary', '')
+                    )
+
+                    # Create questions block (at chapter END)
+                    questions_html = self._create_questions_html(
                         enhancement.get('learning_questions', [])
                     )
 
-                    # Find body and prepend enhancement
+                    # Find body
                     body = soup.find('body')
                     if body:
-                        enhancement_soup = BeautifulSoup(enhancement_html, 'html.parser')
-                        body.insert(0, enhancement_soup)
+                        # Insert preview at the beginning
+                        if preview_html:
+                            preview_soup = BeautifulSoup(preview_html, 'html.parser')
+                            # Insert after first child (usually heading) or at start
+                            first_heading = body.find(['h1', 'h2', 'h3'])
+                            if first_heading:
+                                first_heading.insert_after(preview_soup)
+                            else:
+                                body.insert(0, preview_soup)
+
+                        # Append questions at the end
+                        if questions_html:
+                            questions_soup = BeautifulSoup(questions_html, 'html.parser')
+                            body.append(questions_soup)
 
                         # Write modified content back
-                        # Note: ZipFile doesn't support overwriting, so we need a workaround
-                        # For now, we'll skip actual injection - full implementation needed
-                        pass
+                        file_path.write_text(str(soup), encoding='utf-8')
+                        enhanced_count += 1
 
                 except Exception as e:
-                    print(f"Warning: Could not enhance {chapter.epub_href}: {e}")
+                    logger.warning(f"Could not enhance {chapter.epub_href}: {e}")
 
             parser.close()
 
-        return output_path
+            logger.info(f"  Injected enhancements into {enhanced_count} chapters")
 
-    def _create_enhancement_html(self, preview: str, questions: list[str]) -> str:
-        """Create HTML block for chapter enhancement."""
-        questions_html = '\n'.join(
-            f'<li>{q}</li>' for q in questions
-        )
+            # Repack EPUB
+            # Important: mimetype must be first and uncompressed
+            with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                # Add mimetype first, uncompressed
+                mimetype_path = temp_dir / 'mimetype'
+                if mimetype_path.exists():
+                    zf.write(mimetype_path, 'mimetype', compress_type=zipfile.ZIP_STORED)
+
+                # Add all other files
+                for file_path in temp_dir.rglob('*'):
+                    if file_path.is_file() and file_path.name != 'mimetype':
+                        arcname = file_path.relative_to(temp_dir)
+                        zf.write(file_path, arcname)
+
+            return output_path
+
+        finally:
+            # Clean up temp directory
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def _create_preview_html(self, preview: str) -> str:
+        """Create HTML block for chapter preview (at start of chapter)."""
+        if not preview:
+            return ""
 
         return f'''
-<div class="jarvis-enhancement" style="background:#f5f5f5; padding:1em; margin-bottom:2em; border-left:3px solid #007bff;">
-  <div class="preview-summary" style="font-style:italic; margin-bottom:1em;">
-    <strong>Chapter Preview:</strong><br/>
-    {preview}
-  </div>
-  <div class="learning-questions">
-    <strong>Questions to Consider:</strong>
-    <ul>
-      {questions_html}
-    </ul>
-  </div>
+<div class="jarvis-preview" style="background: #f8f9fa; padding: 1.2em; margin: 1.5em 0; border-left: 4px solid #6c757d; border-radius: 4px;">
+  <p style="font-weight: bold; margin: 0 0 0.5em 0; color: #495057;">📖 Chapter Preview</p>
+  <p style="margin: 0; font-style: italic; color: #495057; line-height: 1.6;">{preview}</p>
 </div>
 '''
 
+    def _create_questions_html(self, questions: list[str]) -> str:
+        """Create HTML block for learning questions (at end of chapter)."""
+        if not questions:
+            return ""
+
+        questions_html = '\n'.join(
+            f'<li style="margin: 0.8em 0;">{q}</li>' for q in questions
+        )
+
+        return f'''
+<div class="jarvis-questions" style="background: #fff3cd; padding: 1.2em; margin: 2em 0 1em 0; border-left: 4px solid #ffc107; border-radius: 4px;">
+  <p style="font-weight: bold; margin: 0 0 0.8em 0; color: #856404;">🤔 Before you continue...</p>
+  <p style="margin: 0 0 0.5em 0; color: #856404;">Take a moment to reflect on these questions:</p>
+  <ol style="margin: 0; padding-left: 1.5em; color: #856404; line-height: 1.6;">
+    {questions_html}
+  </ol>
+</div>
+'''
 
 # =============================================================================
 # MAIN PIPELINE
@@ -702,15 +760,17 @@ class BookProcessingPipeline:
         enhancements: dict[int, dict] = {}
 
         if self.anthropic_api_key:
-            # Filter to leaf chapters (actual content chapters)
-            leaf_chapters = [
-                ch for ch in chapters
-                if ch.word_count >= 500  # Skip very short chapters
-            ]
+            # Filter to content chapters using shared logic (skip front/back matter and short chapters)
+            leaf_chapters, skipped_count = filter_content_chapters(
+                chapters,
+                title_key='title',
+                word_count_key='word_count',
+                min_words=300
+            )
 
             # In preview mode, only process first 2 chapters
             chapters_to_enhance = leaf_chapters[:2] if preview else leaf_chapters
-            logger.info(f"  Enhancing {len(chapters_to_enhance)} chapters (out of {len(leaf_chapters)} leaf chapters)")
+            logger.info(f"  Enhancing {len(chapters_to_enhance)} content chapters (skipped {skipped_count} non-content/short chapters)")
 
             enhancer = EPUBLearningEnhancer(self.anthropic_api_key, reader_context)
 

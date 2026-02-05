@@ -36,6 +36,10 @@ from dotenv import load_dotenv
 from supabase import create_client
 import anthropic
 
+# Add lib to path
+sys.path.insert(0, os.path.dirname(__file__))
+from lib.chapter_filter import NON_CONTENT_TITLES
+
 load_dotenv()
 
 SUPABASE_URL = os.environ.get('SUPABASE_URL', '').strip()
@@ -356,15 +360,7 @@ class AnkiCardGenerator:
         # Filter to chapters with actual content (not just whitespace)
         all_chapters = [c for c in all_chapters if c.get('content') and len(c['content'].strip()) > 100]
 
-        # Filter out non-content chapters (front/back matter)
-        NON_CONTENT_TITLES = {
-            'copyright', 'copyright page', 'contents', 'table of contents',
-            'acknowledgments', 'acknowledgements', 'notes', 'index', 'endnotes',
-            'about the author', 'about the authors', 'dedication', 'epigraph',
-            'also by', 'title page', 'half title', 'frontispiece', 'colophon',
-            'bibliography', 'references', 'further reading', 'glossary',
-            'praise for', 'advance praise', 'reviews', 'credits', 'permissions'
-        }
+        # Filter out non-content chapters (front/back matter) using shared filter
         all_chapters = [
             c for c in all_chapters
             if not any(
