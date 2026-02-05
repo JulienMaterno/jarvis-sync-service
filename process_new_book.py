@@ -68,6 +68,7 @@ from lib.epub_parser import EPUBParser, EPUBMetadata, Chapter, parse_epub_file
 from lib.enhancement_context import build_reader_context_sync, ReaderContext
 from lib.bookfusion_client import BookfusionClient, BookfusionMetadata, UploadResult
 from lib.chapter_filter import filter_content_chapters
+from lib.subchapter_detector import detect_subchapters, SubChapter
 
 # =============================================================================
 # CONFIGURATION
@@ -450,6 +451,124 @@ Format as JSON:
             "chapter_map": []
         }
 
+    def generate_subchapter_enhancement(
+        self,
+        subchapter: SubChapter,
+        chapter_title: str,
+        book_title: str,
+        section_number: int,
+        total_sections: int,
+        previous_sections: list[SubChapter],
+        book_author: Optional[str] = None
+    ) -> dict:
+        """
+        Generate enhancement for a sub-chapter section.
+
+        Args:
+            subchapter: SubChapter to enhance
+            chapter_title: Title of the parent chapter
+            book_title: Title of the book
+            section_number: This section's number (1-indexed)
+            total_sections: Total number of sections in chapter
+            previous_sections: List of previous SubChapters for context
+            book_author: Author of the book
+
+        Returns:
+            Dict with 'section_summary', 'context_bridge', 'learning_questions'
+        """
+        client = self._get_client()
+
+        # Build previous sections summary for context
+        prev_summary = ""
+        if previous_sections:
+            prev_parts = []
+            for ps in previous_sections[-3:]:  # Last 3 sections for context
+                prev_parts.append(f"- **{ps.title}** ({ps.word_count} words)")
+            prev_summary = "Previous sections in this chapter:\n" + "\n".join(prev_parts)
+        else:
+            prev_summary = "This is the first section of the chapter."
+
+        # Truncate content if too long
+        content = subchapter.content
+        words = content.split()
+        if len(words) > 2500:
+            content = ' '.join(words[:2500]) + '\n\n[...section continues...]'
+
+        # Determine question count based on word count
+        if subchapter.word_count < 800:
+            question_range = "1-2"
+        elif subchapter.word_count < 2000:
+            question_range = "2-3"
+        else:
+            question_range = "3-5"
+
+        prompt = f"""Create a factual summary for this book section.
+
+BOOK: {book_title}
+{f'AUTHOR: {book_author}' if book_author else ''}
+CHAPTER: {chapter_title}
+SECTION: {subchapter.title} (Section {section_number} of {total_sections})
+WORD COUNT: {subchapter.word_count}
+
+{prev_summary}
+
+SECTION CONTENT:
+{content}
+
+Generate:
+
+1. SECTION OVERVIEW (50-100 words)
+   Factual description to help reader decide: read or skip this section?
+   - What topics/arguments are presented
+   - Key examples or evidence used
+   - Role in chapter's overall argument
+
+2. CONTEXT BRIDGE (1-2 sentences)
+   What does reader need from PREVIOUS sections to follow this?
+   If first section: what background knowledge is assumed?
+
+   Examples:
+   - "Builds on the enclosure movement from the previous section."
+   - "Standalone section - no prior context needed."
+   - "Assumes reader understands Descartes' dualism from earlier."
+
+3. LEARNING QUESTIONS ({question_range} questions based on content density)
+   Questions to prime active reading.
+
+Return JSON:
+```json
+{{
+  "section_summary": "Your section overview here...",
+  "context_bridge": "What reader needs to know...",
+  "learning_questions": [
+    "Question 1?",
+    "Question 2?"
+  ]
+}}
+```
+"""
+
+        response = client.messages.create(
+            model="claude-sonnet-4-5-20250929",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        # Parse JSON from response
+        import re
+        text = response.content[0].text
+
+        json_match = re.search(r'```json\s*(\{[\s\S]*?\})\s*```', text)
+        if json_match:
+            return json.loads(json_match.group(1))
+
+        # Fallback
+        return {
+            "section_summary": f"This section covers {subchapter.title}.",
+            "context_bridge": "Continue from the previous section.",
+            "learning_questions": ["What is the main point of this section?"]
+        }
+
     def _create_book_overview_html(self, book_summary: dict, book_title: str) -> str:
         """Create HTML for book overview page."""
         overview = book_summary.get('book_overview', '')
@@ -605,6 +724,31 @@ Format as JSON:
                             else:
                                 body.insert(0, preview_soup)
 
+                        # Inject sub-chapter summaries after section headers (h2)
+                        subchapters = enhancement.get('subchapters', [])
+                        if subchapters:
+                            subchapter_count = 0
+                            for subch in subchapters:
+                                subch_enhancement = subch.get('enhancement', {})
+                                section_header = subch.get('section_header', subch.get('title', ''))
+                                if not subch_enhancement or not section_header:
+                                    continue
+
+                                # Find matching h2 header in HTML
+                                for h2 in body.find_all('h2'):
+                                    h2_text = h2.get_text(strip=True)
+                                    # Fuzzy match: check if header text matches
+                                    if section_header.lower() in h2_text.lower() or h2_text.lower() in section_header.lower():
+                                        subch_html = self._create_subchapter_summary_html(subch_enhancement)
+                                        if subch_html:
+                                            subch_soup = BeautifulSoup(subch_html, 'html.parser')
+                                            h2.insert_after(subch_soup)
+                                            subchapter_count += 1
+                                        break
+
+                            if subchapter_count > 0:
+                                logger.debug(f"    Injected {subchapter_count} sub-chapter summaries")
+
                         # Append questions at the end
                         if questions_html:
                             questions_soup = BeautifulSoup(questions_html, 'html.parser')
@@ -672,6 +816,37 @@ Format as JSON:
 </div>
 '''
 
+    def _create_subchapter_summary_html(self, enhancement: dict) -> str:
+        """Create HTML block for sub-chapter summary (lighter styling than chapter)."""
+        summary = enhancement.get('section_summary', '')
+        context = enhancement.get('context_bridge', '')
+        questions = enhancement.get('learning_questions', [])
+
+        if not summary:
+            return ""
+
+        context_html = ''
+        if context:
+            context_html = f'<p style="font-style: italic; margin-top: 0.5em; color: #6c757d; font-size: 0.9em;">📎 Context: {context}</p>'
+
+        questions_html = ''
+        if questions:
+            q_list = '\n'.join(f'<li>{q}</li>' for q in questions)
+            questions_html = f'''
+<details style="margin-top: 0.8em;">
+  <summary style="cursor: pointer; color: #856404; font-size: 0.9em;">Preview questions ({len(questions)})</summary>
+  <ol style="margin: 0.5em 0; padding-left: 1.5em; color: #856404; font-size: 0.9em;">{q_list}</ol>
+</details>'''
+
+        return f'''
+<div class="jarvis-section-preview" style="background: #f8f9fa; padding: 0.8em 1em; margin: 0.5em 0 1em 0; border-left: 3px solid #adb5bd; border-radius: 3px; font-size: 0.95em;">
+  <p style="margin: 0; color: #495057; line-height: 1.5;">{summary}</p>
+  {context_html}
+  {questions_html}
+</div>
+'''
+
+
 # =============================================================================
 # MAIN PIPELINE
 # =============================================================================
@@ -734,22 +909,24 @@ class BookProcessingPipeline:
         return response.data[0]
 
     def store_chapters(self, book_id: str, chapters: list[Chapter], enhancements: dict[int, dict]) -> int:
-        """Store chapters in book_chapters table."""
+        """Store chapters and sub-chapters in book_chapters table."""
         # Delete existing chapters for this book
         existing = self.supabase.table('book_chapters').select('id').eq(
             'book_id', book_id
         ).execute()
         if existing.data:
-            print(f"  Removing {len(existing.data)} existing chapters...")
+            logger.info(f"  Removing {len(existing.data)} existing chapters...")
             self.supabase.table('book_chapters').delete().eq(
                 'book_id', book_id
             ).execute()
 
-        # Insert new chapters
-        chapter_records = []
+        # Insert parent chapters first, then sub-chapters
+        chapter_id_map = {}  # chapter_number -> id
+
+        # Insert parent chapters
         for chapter in chapters:
             enhancement = enhancements.get(chapter.number, {})
-            chapter_records.append({
+            chapter_record = {
                 'book_id': book_id,
                 'chapter_number': chapter.number,
                 'chapter_title': chapter.title,
@@ -759,15 +936,42 @@ class BookProcessingPipeline:
                 'word_count': chapter.word_count,
                 'preview_summary': enhancement.get('preview_summary'),
                 'learning_questions': enhancement.get('learning_questions')
-            })
+            }
 
-        # Insert in batches
-        batch_size = 10
-        for i in range(0, len(chapter_records), batch_size):
-            batch = chapter_records[i:i + batch_size]
-            self.supabase.table('book_chapters').insert(batch).execute()
+            response = self.supabase.table('book_chapters').insert(chapter_record).execute()
+            if response.data:
+                chapter_id_map[chapter.number] = response.data[0]['id']
 
-        return len(chapter_records)
+        # Insert sub-chapters with parent reference
+        subchapter_count = 0
+        for chapter in chapters:
+            enhancement = enhancements.get(chapter.number, {})
+            subchapters = enhancement.get('subchapters', [])
+            parent_id = chapter_id_map.get(chapter.number)
+
+            if subchapters and parent_id:
+                for subch in subchapters:
+                    subch_enhancement = subch.get('enhancement', {})
+                    subch_record = {
+                        'book_id': book_id,
+                        'parent_chapter_id': parent_id,
+                        'chapter_number': chapter.number,  # Same as parent for ordering
+                        'subchapter_number': subch.get('number'),
+                        'chapter_title': subch.get('title'),
+                        'section_header': subch.get('section_header'),
+                        'word_count': subch.get('word_count'),
+                        'detection_method': subch.get('detection_method'),
+                        'preview_summary': subch_enhancement.get('section_summary'),
+                        'context_bridge': subch_enhancement.get('context_bridge'),
+                        'learning_questions': subch_enhancement.get('learning_questions')
+                    }
+                    self.supabase.table('book_chapters').insert(subch_record).execute()
+                    subchapter_count += 1
+
+        if subchapter_count > 0:
+            logger.info(f"  Stored {subchapter_count} sub-chapters")
+
+        return len(chapters) + subchapter_count
 
     def update_book_urls(
         self,
@@ -985,6 +1189,80 @@ class BookProcessingPipeline:
                 logger.error(f"  Error generating book summary: {e}")
             logger.info(f"  Step 4b completed in {time.time() - step_start:.1f}s")
 
+        # Step 4c: Generate sub-chapter enhancements for long chapters
+        subchapter_count = 0
+        if self.anthropic_api_key and enhancements:
+            step_start = time.time()
+            logger.info("[4c/10] Generating sub-chapter enhancements...")
+
+            # Get the anthropic client for AI detection fallback
+            import anthropic
+            anthropic_client = anthropic.Anthropic(api_key=self.anthropic_api_key)
+
+            enhancer = EPUBLearningEnhancer(self.anthropic_api_key, reader_context)
+
+            for chapter in chapters:
+                # Only process chapters that have enhancements and are long enough
+                if chapter.number not in enhancements:
+                    continue
+                if chapter.word_count < 5000:
+                    continue
+
+                # Detect sub-chapters
+                subchapters = detect_subchapters(
+                    chapter_content=chapter.content,
+                    chapter_title=chapter.title or f'Chapter {chapter.number}',
+                    book_title=metadata.title or "Unknown",
+                    chapter_word_count=chapter.word_count,
+                    anthropic_client=anthropic_client,
+                    min_chapter_words=5000,
+                    min_section_words=300
+                )
+
+                if len(subchapters) >= 2:
+                    chapter_title = chapter.title or f'Chapter {chapter.number}'
+                    logger.info(f"  Found {len(subchapters)} sub-chapters in '{chapter_title[:40]}'")
+
+                    # Generate enhancements for each sub-chapter
+                    subchapter_data = []
+                    for i, subchapter in enumerate(subchapters):
+                        if preview and i >= 2:  # In preview mode, only process first 2 sub-chapters
+                            break
+
+                        subch_start = time.time()
+                        try:
+                            enhancement_data = enhancer.generate_subchapter_enhancement(
+                                subchapter=subchapter,
+                                chapter_title=chapter_title,
+                                book_title=metadata.title or "Unknown",
+                                section_number=i + 1,
+                                total_sections=len(subchapters),
+                                previous_sections=subchapters[:i],
+                                book_author=metadata.author
+                            )
+                            subchapter_data.append({
+                                'number': subchapter.number,
+                                'title': subchapter.title,
+                                'section_header': subchapter.section_header,
+                                'word_count': subchapter.word_count,
+                                'detection_method': subchapter.detection_method,
+                                'enhancement': enhancement_data
+                            })
+                            subchapter_count += 1
+                            elapsed = time.time() - subch_start
+                            logger.info(f"    [{i+1}/{len(subchapters)}] {subchapter.title[:30]}... ({elapsed:.1f}s)")
+                        except Exception as e:
+                            logger.error(f"    Error enhancing sub-chapter: {e}")
+
+                    # Add sub-chapters to the chapter enhancement
+                    enhancements[chapter.number]['subchapters'] = subchapter_data
+
+            if subchapter_count > 0:
+                logger.info(f"  Step 4c completed in {time.time() - step_start:.1f}s - {subchapter_count} sub-chapters enhanced")
+            else:
+                logger.info("  No long chapters found for sub-chapter splitting")
+        results['subchapters_generated'] = subchapter_count
+
         # Step 5: Store chapters
         step_start = time.time()
         logger.info("[5/10] Storing chapters...")
@@ -1082,8 +1360,10 @@ class BookProcessingPipeline:
         if not preview:
             update_data = {
                 'processed_at': datetime.now(timezone.utc).isoformat(),
-                'updated_at': datetime.now(timezone.utc).isoformat()
+                'updated_at': datetime.now(timezone.utc).isoformat(),
+                'word_count': total_words  # Store book's total word count
             }
+            logger.info(f"  Storing word count: {total_words:,}")
 
             # Store book summary if we generated one
             if book_summary:
@@ -1116,8 +1396,10 @@ class BookProcessingPipeline:
         logger.info("=" * 60)
         logger.info(f"Book: {results['book_title']}")
         logger.info(f"Book ID: {results['book_id']}")
+        logger.info(f"Word count: {total_words:,}")
         logger.info(f"Chapters: {len(chapters)}")
-        logger.info(f"Enhancements: {results['enhancements_generated']}")
+        logger.info(f"Chapter enhancements: {results['enhancements_generated']}")
+        logger.info(f"Sub-chapter enhancements: {results.get('subchapters_generated', 0)}")
         logger.info(f"Total time: {total_time:.1f}s")
         if results['original_drive_url']:
             logger.info(f"Original Drive: {results['original_drive_url']}")
