@@ -1,11 +1,13 @@
 import asyncio
 import os
 from datetime import datetime, timezone
+from typing import Optional, List
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
+from pydantic import BaseModel
 from lib.sync_service import sync_contacts
 from lib.notion_sync import sync_notion_to_supabase, sync_supabase_to_notion
 from lib.telegram_client import notify_error, reset_failure_count
@@ -3161,3 +3163,220 @@ async def process_book_inbox(preview: bool = False):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# =============================================================================
+# SUMMARY BOOK PIPELINE
+# =============================================================================
+
+class CreateSummaryBookRequest(BaseModel):
+    """Request body for creating a summary book."""
+    topic: Optional[str] = None
+    title: Optional[str] = None
+    book_list: Optional[List[dict]] = None
+    max_books: int = 30
+    context: str = ""
+    project_id: Optional[str] = None
+    resume_from: Optional[str] = None
+    compile_only: bool = False
+    skip_upload: bool = False
+    workers: int = 8
+
+
+# Track running summary book jobs
+_summary_book_jobs: dict = {}
+
+
+@app.post("/books/create-summary-book")
+async def create_summary_book(request: CreateSummaryBookRequest, background_tasks: BackgroundTasks):
+    """
+    Create a summary book from a topic or book list.
+
+    This is a long-running operation that:
+    1. Generates/uses a book list
+    2. Downloads EPUBs from LibGen
+    3. Converts PDFs to EPUB
+    4. Processes all books with Haiku (parallel AI summaries)
+    5. Compiles into a single summary EPUB
+    6. Uploads to Bookfusion
+
+    The job runs in the background. Use GET /books/summary-book-status/{project_id}
+    to check progress.
+
+    Args:
+        topic: Topic for AI-generated book list (e.g., "synthetic biology")
+        title: Custom title for the summary book
+        book_list: Pre-defined list of books [{"title": "...", "author": "..."}]
+        max_books: Max books when generating from topic (default 30)
+        context: Additional context for AI book selection
+        project_id: Resume an existing project
+        resume_from: Step to resume from ('download', 'convert', 'process', 'compile', 'upload')
+        compile_only: Only compile + upload (skip download/process)
+        skip_upload: Don't upload to Bookfusion
+        workers: Number of parallel workers (default 8)
+
+    Returns:
+        Project ID and status for tracking
+    """
+    # Validate: need either topic, book_list, or project_id
+    if not request.topic and not request.book_list and not request.project_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Must provide 'topic', 'book_list', or 'project_id'"
+        )
+
+    import uuid
+
+    project_id = request.project_id or str(uuid.uuid4())[:8]
+    title = request.title or (f"Summary: {request.topic.title()}" if request.topic else "Summary Book")
+
+    logger.info(f"Creating summary book: project={project_id}, title={title}")
+
+    # Track job status
+    _summary_book_jobs[project_id] = {
+        "project_id": project_id,
+        "title": title,
+        "status": "queued",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "current_step": None,
+        "error": None,
+    }
+
+    async def _run_pipeline():
+        """Run the summary book pipeline in background."""
+        try:
+            _summary_book_jobs[project_id]["status"] = "running"
+
+            from scripts.create_summary_book import (
+                generate_book_list, run_pipeline
+            )
+
+            # Step 1: Get book list
+            book_list = request.book_list
+            if not book_list and request.topic and not request.project_id:
+                _summary_book_jobs[project_id]["current_step"] = "generating_book_list"
+                logger.info(f"[{project_id}] Generating book list for topic: {request.topic}")
+                book_list = await run_in_threadpool(
+                    generate_book_list,
+                    request.topic,
+                    request.max_books,
+                    request.context
+                )
+                logger.info(f"[{project_id}] Generated {len(book_list)} books")
+            elif not book_list:
+                book_list = []
+
+            _summary_book_jobs[project_id]["book_count"] = len(book_list)
+            _summary_book_jobs[project_id]["current_step"] = "running_pipeline"
+
+            # Step 2: Run full pipeline
+            import scripts.create_summary_book as pipeline_module
+            pipeline_module.NUM_WORKERS = request.workers
+
+            result = await run_in_threadpool(
+                run_pipeline,
+                title,
+                book_list,
+                project_id,
+                request.resume_from,
+                request.compile_only,
+                request.skip_upload
+            )
+
+            _summary_book_jobs[project_id].update({
+                "status": "completed",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "result": result,
+                "current_step": None,
+            })
+            logger.info(f"[{project_id}] Summary book pipeline completed")
+
+        except Exception as e:
+            logger.error(f"[{project_id}] Summary book pipeline failed: {e}", exc_info=True)
+            _summary_book_jobs[project_id].update({
+                "status": "failed",
+                "error": str(e),
+                "current_step": None,
+            })
+
+    background_tasks.add_task(_run_pipeline)
+
+    return {
+        "status": "queued",
+        "project_id": project_id,
+        "title": title,
+        "message": f"Summary book pipeline started. Track progress at /books/summary-book-status/{project_id}"
+    }
+
+
+@app.get("/books/summary-book-status/{project_id}")
+async def get_summary_book_status(project_id: str):
+    """
+    Get the status of a summary book pipeline job.
+
+    Returns current step, progress, and result when complete.
+    """
+    # Check in-memory job status first
+    if project_id in _summary_book_jobs:
+        return _summary_book_jobs[project_id]
+
+    # Check on-disk project file
+    try:
+        from scripts.create_summary_book import load_project
+        project = await run_in_threadpool(load_project, project_id)
+        return {
+            "project_id": project_id,
+            "title": project.get("title"),
+            "status": project.get("status", "unknown"),
+            "results": project.get("results"),
+            "created_at": project.get("created_at"),
+        }
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
+    except Exception as e:
+        logger.error(f"Error getting summary book status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/books/summary-book-projects")
+async def list_summary_book_projects():
+    """List all summary book projects."""
+    try:
+        from pathlib import Path
+        import json
+
+        projects_dir = Path(__file__).parent / "data" / "summary_projects"
+        if not projects_dir.exists():
+            return {"projects": []}
+
+        projects = []
+        for f in sorted(projects_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            if f.stem.endswith("_books"):
+                continue  # Skip book list files
+            try:
+                with open(f, 'r', encoding='utf-8') as fh:
+                    project = json.load(fh)
+                    projects.append({
+                        "project_id": project.get("project_id"),
+                        "title": project.get("title"),
+                        "status": project.get("status"),
+                        "book_count": len(project.get("book_list", [])),
+                        "created_at": project.get("created_at"),
+                        "updated_at": project.get("updated_at"),
+                    })
+            except Exception:
+                continue
+
+        # Also include in-memory jobs not yet saved to disk
+        for pid, job in _summary_book_jobs.items():
+            if not any(p.get("project_id") == pid for p in projects):
+                projects.insert(0, {
+                    "project_id": pid,
+                    "title": job.get("title"),
+                    "status": job.get("status"),
+                    "book_count": job.get("book_count", 0),
+                    "started_at": job.get("started_at"),
+                })
+
+        return {"projects": projects, "count": len(projects)}
+    except Exception as e:
+        logger.error(f"Error listing summary book projects: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
