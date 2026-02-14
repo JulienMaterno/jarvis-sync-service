@@ -90,6 +90,70 @@ if not _INTERNAL_API_KEY:
     )
 
 
+_INTELLIGENCE_SERVICE_URL = os.getenv(
+    "INTELLIGENCE_SERVICE_URL",
+    "https://jarvis-intelligence-service-776871804948.asia-southeast1.run.app",
+)
+
+# Map sync entity names → knowledge source_types for post-sync indexing
+_SYNC_TO_INDEX_TYPES = {
+    "contacts": "contact",
+    "meetings": "meeting",
+    "tasks": "task",
+    "reflections": "reflection",
+    "journals": "journal",
+    "calendar_events": "calendar",
+    "calendar": "calendar",
+    "gmail": "email",
+    "emails": "email",
+    "beeper": "beeper_message",
+    "beeper_messages": "beeper_message",
+}
+
+
+async def _trigger_knowledge_indexing(synced_entities: list) -> None:
+    """Call Intelligence Service to index newly synced data.
+
+    Runs as a background task after sync completes. Only indexes
+    the source types that were actually synced. Fire-and-forget.
+    """
+    # Map synced entity names to knowledge source_types
+    source_types = []
+    for entity in synced_entities:
+        mapped = _SYNC_TO_INDEX_TYPES.get(entity)
+        if mapped and mapped not in source_types:
+            source_types.append(mapped)
+
+    if not source_types:
+        return
+
+    try:
+        import httpx
+
+        headers = {}
+        if _INTERNAL_API_KEY:
+            headers["X-API-Key"] = _INTERNAL_API_KEY
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{_INTELLIGENCE_SERVICE_URL}/api/v1/knowledge/index/incremental",
+                json={"source_types": source_types, "batch_size": 30},
+                headers=headers,
+            )
+            response.raise_for_status()
+            result = response.json()
+            total = result.get("total_indexed", 0)
+            if total > 0:
+                logger.info(
+                    "Knowledge indexing: %d new chunks for %s",
+                    total, source_types,
+                )
+            else:
+                logger.debug("Knowledge indexing: nothing new for %s", source_types)
+    except Exception as e:
+        logger.warning(f"Knowledge indexing trigger failed (non-blocking): {e}")
+
+
 class APIKeyAuthMiddleware(BaseHTTPMiddleware):
     """
     Middleware to enforce API key authentication on all endpoints.
@@ -893,7 +957,19 @@ async def sync_everything(background_tasks: BackgroundTasks):
 
         # Schedule audit to run in background (doesn't block response)
         background_tasks.add_task(record_audit_in_background)
-        
+
+        # Trigger knowledge indexing for syncs that succeeded
+        if success_count > 0:
+            # Include both change-detected entities AND always-run syncs
+            all_synced = list(synced_entities)
+            for key in ("calendar_sync", "gmail_sync", "beeper_sync"):
+                if results.get(key, {}).get("status") == "success":
+                    all_synced.append(key.replace("_sync", ""))
+            background_tasks.add_task(
+                _trigger_knowledge_indexing,
+                all_synced,
+            )
+
         return {
             "status": "completed",
             "run_id": run_id,
