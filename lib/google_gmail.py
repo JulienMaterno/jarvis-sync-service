@@ -710,6 +710,148 @@ class GmailClient:
                     headers=headers,
                     json={"id": draft_id}
                 )
-            
+
+            response.raise_for_status()
+            return response.json()
+
+    # =========================================================================
+    # LABEL MANAGEMENT - List, create, and modify labels on messages
+    # =========================================================================
+
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        max_delay=30.0,
+        exponential_factor=2.0,
+        circuit_breaker=_gmail_breaker
+    )
+    async def get_labels(self) -> List[Dict[str, Any]]:
+        """
+        List all Gmail labels.
+
+        Returns:
+            List of label objects with id, name, type, etc.
+        """
+        await self._ensure_token()
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.get(
+                f"{GOOGLE_GMAIL_API_BASE}/labels",
+                headers=headers
+            )
+
+            if response.status_code == 401:
+                self.access_token = await get_access_token()
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                response = await client.get(
+                    f"{GOOGLE_GMAIL_API_BASE}/labels",
+                    headers=headers
+                )
+
+            response.raise_for_status()
+            data = response.json()
+            return data.get("labels", [])
+
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        max_delay=30.0,
+        exponential_factor=2.0,
+        circuit_breaker=_gmail_breaker
+    )
+    async def create_label(
+        self,
+        name: str,
+        label_list_visibility: str = "labelShow",
+        message_list_visibility: str = "show"
+    ) -> Dict[str, Any]:
+        """
+        Create a new Gmail label.
+
+        Args:
+            name: Label name (e.g., "Follow-Up")
+            label_list_visibility: "labelShow", "labelShowIfUnread", or "labelHide"
+            message_list_visibility: "show" or "hide"
+
+        Returns:
+            Created label object with id, name, type
+        """
+        await self._ensure_token()
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+
+        request_body = {
+            "name": name,
+            "labelListVisibility": label_list_visibility,
+            "messageListVisibility": message_list_visibility
+        }
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{GOOGLE_GMAIL_API_BASE}/labels",
+                headers=headers,
+                json=request_body
+            )
+
+            if response.status_code == 401:
+                self.access_token = await get_access_token()
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                response = await client.post(
+                    f"{GOOGLE_GMAIL_API_BASE}/labels",
+                    headers=headers,
+                    json=request_body
+                )
+
+            response.raise_for_status()
+            return response.json()
+
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        max_delay=30.0,
+        exponential_factor=2.0,
+        circuit_breaker=_gmail_breaker
+    )
+    async def modify_message_labels(
+        self,
+        message_id: str,
+        add_label_ids: Optional[List[str]] = None,
+        remove_label_ids: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """
+        Add or remove labels from a message.
+
+        Args:
+            message_id: The Gmail message ID
+            add_label_ids: List of label IDs to add
+            remove_label_ids: List of label IDs to remove
+
+        Returns:
+            Updated message object
+        """
+        await self._ensure_token()
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+
+        request_body = {
+            "addLabelIds": add_label_ids or [],
+            "removeLabelIds": remove_label_ids or []
+        }
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{GOOGLE_GMAIL_API_BASE}/messages/{message_id}/modify",
+                headers=headers,
+                json=request_body
+            )
+
+            if response.status_code == 401:
+                self.access_token = await get_access_token()
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                response = await client.post(
+                    f"{GOOGLE_GMAIL_API_BASE}/messages/{message_id}/modify",
+                    headers=headers,
+                    json=request_body
+                )
+
             response.raise_for_status()
             return response.json()

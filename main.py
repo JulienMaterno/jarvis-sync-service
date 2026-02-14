@@ -1,6 +1,6 @@
 import asyncio
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,9 +25,10 @@ from syncs.tasks_sync import run_sync as run_task_sync
 # Import reflection sync (using new unified service)
 from syncs.reflections_sync import run_sync as run_reflection_sync
 
-# Import calendar and gmail sync
+# Import calendar, gmail, and follow-up sync
 from sync_calendar import run_calendar_sync
 from sync_gmail import run_gmail_sync
+from sync_follow_ups import run_follow_up_sync
 
 # Import journal sync (using new unified service)
 from syncs.journals_sync import run_sync as run_journal_sync
@@ -46,6 +47,9 @@ from syncs.documents_sync import run_sync as run_documents_sync
 # Import newsletters sync
 from syncs.newsletters_sync import run_sync as run_newsletters_sync
 
+# Import follow-ups Notion sync
+from syncs.follow_ups_sync import run_sync as run_follow_ups_notion_sync
+
 # Import ActivityWatch sync
 from sync_activitywatch import run_activitywatch_sync, ActivityWatchSync, format_activity_summary_for_journal
 
@@ -55,8 +59,9 @@ from sync_beeper import run_beeper_sync, run_beeper_relink
 # Import Anki sync
 from syncs.anki_sync import run_anki_sync
 
-# Import Supabase client for Beeper sync
+# Import Supabase client and Gmail client
 from lib.supabase_client import supabase
+from lib.google_gmail import GmailClient
 
 # Import sync audit for inventory and health checks
 from lib.sync_audit import (
@@ -689,7 +694,13 @@ async def sync_everything(background_tasks: BackgroundTasks):
 
         # === GMAIL SYNC (always run - external source) ===
         await run_step("gmail_sync", run_gmail_sync)
-        
+
+        # === EMAIL FOLLOW-UP SYNC (after Gmail, uses fresh email data) ===
+        await run_step("follow_up_sync", run_follow_up_sync)
+
+        # === FOLLOW-UPS NOTION SYNC (bidirectional, after follow-up sync) ===
+        await run_step("follow_ups_notion_sync", run_follow_ups_notion_sync, full_sync=False, since_hours=24)
+
         # === BOOKS SYNC (Notion → Supabase, one-way) ===
         await run_step("books_sync", run_books_sync, full_sync=False, since_hours=24)
         
@@ -1946,6 +1957,146 @@ async def send_draft(draft_id: str):
         
     except Exception as e:
         logger.error(f"Failed to send draft {draft_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Email Follow-Up Tracking ---
+
+@app.post("/sync/follow-ups")
+async def sync_follow_ups():
+    """Manually trigger follow-up sync."""
+    try:
+        logger.info("Starting follow-up sync via API")
+        result = await run_follow_up_sync()
+        return {"status": "success", "data": result}
+    except Exception as e:
+        logger.error(f"Follow-up sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/follow-ups")
+async def list_follow_ups(status: Optional[str] = None):
+    """
+    List tracked follow-ups with optional status filter.
+
+    Args:
+        status: Filter by status (pending, draft_created, send_now, sent, replied, cancelled)
+    """
+    try:
+        query = supabase.table("email_follow_ups").select(
+            "id, subject, recipient_email, recipient_name, status, "
+            "follow_up_count, max_follow_ups, interval_days, "
+            "next_follow_up_date, original_date, last_sent_at, "
+            "draft_body, gmail_draft_id, contact_id, created_at"
+        ).is_("deleted_at", "null").order("created_at", desc=True)
+
+        if status:
+            query = query.eq("status", status)
+
+        result = query.execute()
+        return {"status": "success", "count": len(result.data), "data": result.data}
+    except Exception as e:
+        logger.error(f"Failed to list follow-ups: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/follow-ups/{follow_up_id}/cancel")
+async def cancel_follow_up(follow_up_id: str):
+    """Cancel a follow-up and remove Gmail label."""
+    try:
+        # Get the follow-up record
+        result = supabase.table("email_follow_ups").select(
+            "google_message_id, gmail_draft_id"
+        ).eq("id", follow_up_id).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Follow-up not found")
+
+        record = result.data[0]
+
+        # Update status
+        supabase.table("email_follow_ups").update({
+            "status": "cancelled",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", follow_up_id).execute()
+
+        # Remove Gmail label
+        gmail_client = GmailClient()
+        try:
+            # Get cached label ID
+            label_result = supabase.table("sync_state").select("value").eq(
+                "key", "gmail_follow_up_label_id"
+            ).execute()
+            if label_result.data and label_result.data[0].get("value"):
+                await gmail_client.modify_message_labels(
+                    record["google_message_id"],
+                    remove_label_ids=[label_result.data[0]["value"]]
+                )
+        except Exception as e:
+            logger.warning(f"Failed to remove Gmail label: {e}")
+
+        # Delete draft if exists
+        if record.get("gmail_draft_id"):
+            try:
+                await gmail_client.delete_draft(record["gmail_draft_id"])
+            except Exception:
+                pass
+
+        return {"status": "success", "message": "Follow-up cancelled"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to cancel follow-up: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/follow-ups/{follow_up_id}/send")
+async def send_follow_up(follow_up_id: str):
+    """Send a follow-up draft immediately."""
+    try:
+        result = supabase.table("email_follow_ups").select(
+            "gmail_draft_id, follow_up_count, max_follow_ups, interval_days, subject, recipient_email"
+        ).eq("id", follow_up_id).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Follow-up not found")
+
+        record = result.data[0]
+        if not record.get("gmail_draft_id"):
+            raise HTTPException(status_code=400, detail="No draft available to send")
+
+        # Send the draft
+        gmail_client = GmailClient()
+        await gmail_client.send_draft(record["gmail_draft_id"])
+
+        now = datetime.now(timezone.utc)
+        interval = record.get("interval_days", 7)
+
+        if record["follow_up_count"] >= record["max_follow_ups"]:
+            new_status = "sent"
+            next_date = now.isoformat()
+        else:
+            new_status = "pending"
+            next_date = (now + timedelta(days=interval)).isoformat()
+
+        supabase.table("email_follow_ups").update({
+            "status": new_status,
+            "gmail_draft_id": None,
+            "draft_body": None,
+            "last_sent_at": now.isoformat(),
+            "next_follow_up_date": next_date,
+            "updated_at": now.isoformat(),
+        }).eq("id", follow_up_id).execute()
+
+        return {
+            "status": "success",
+            "message": f"Follow-up sent to {record['recipient_email']}",
+            "next_status": new_status,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to send follow-up: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
