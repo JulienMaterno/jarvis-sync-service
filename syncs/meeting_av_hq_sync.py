@@ -6,12 +6,16 @@ when meetings involve specific contacts (e.g. Victor).
 
 Flow:
 1. Query meetings in Supabase with matching contact_id
-2. Check which ones haven't been synced to AV HQ yet (tracked in sync_state)
-3. For new meetings, create a page in AV HQ Meeting DB with summary + transcript
-4. Store the AV HQ page ID mapping in sync_state
+2. Query existing pages in AV HQ Meeting DB to get their dates
+3. Skip meetings whose date already has a page (avoids duplicating manually created entries)
+4. For new meetings, create a page in AV HQ Meeting DB with summary + transcript
+5. Store the AV HQ page ID mapping in sync_state
 
 The AV HQ Meeting DB schema is simple: Name (title) + Date (date).
 Content is written as page body: summary + transcript.
+
+Dedup strategy: matches by date (YYYY-MM-DD). If a page with the same date
+already exists in the DB (whether manually created or auto-synced), it's skipped.
 
 Configuration stored in sync_state table (key: av_hq_meeting_sync_contacts):
 [
@@ -26,7 +30,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 
 from lib.sync_base import (
     NotionClient,
@@ -103,6 +107,25 @@ def _save_sync_map(supabase_client, sync_map: Dict[str, str]):
         }).execute()
     except Exception as e:
         logger.warning(f"Could not save sync map: {e}")
+
+
+def _get_existing_av_hq_dates(notion: NotionClient) -> Set[str]:
+    """Query AV HQ Meeting DB and return set of existing date strings (YYYY-MM-DD)."""
+    try:
+        pages = notion.query_database(AV_HQ_MEETING_DB_ID)
+        dates = set()
+        for page in pages:
+            props = page.get("properties", {})
+            date_prop = props.get("Date", {})
+            date_obj = date_prop.get("date") or {}
+            start = date_obj.get("start", "")
+            if start:
+                dates.add(start[:10])  # YYYY-MM-DD
+        logger.info(f"Found {len(dates)} existing dates in AV HQ Meeting DB")
+        return dates
+    except Exception as e:
+        logger.warning(f"Could not query AV HQ Meeting DB: {e}")
+        return set()
 
 
 def _fetch_meetings_for_contacts(
@@ -216,6 +239,9 @@ def run_sync(
     sync_map = {} if full_sync else _get_sync_map(supabase_client)
     logger.info(f"Sync map has {len(sync_map)} existing entries")
 
+    # Query existing AV HQ DB entries to avoid duplicating manually created pages
+    existing_dates = _get_existing_av_hq_dates(notion)
+
     # Fetch meetings
     meetings = _fetch_meetings_for_contacts(supabase_client, contact_ids)
     logger.info(f"Found {len(meetings)} meetings for {len(contact_ids)} contacts")
@@ -223,6 +249,7 @@ def run_sync(
     stats: Dict[str, Any] = {
         "meetings_found": len(meetings),
         "already_synced": 0,
+        "skipped_date_exists": 0,
         "newly_synced": 0,
         "errors": [],
     }
@@ -232,6 +259,15 @@ def run_sync(
 
         if meeting_id in sync_map:
             stats["already_synced"] += 1
+            continue
+
+        # Check if a page with this date already exists in AV HQ DB
+        meeting_date = str(meeting.get("date", ""))[:10]
+        if meeting_date and meeting_date in existing_dates:
+            # Mark as synced so we don't re-check next time
+            sync_map[meeting_id] = f"existing:{meeting_date}"
+            stats["skipped_date_exists"] += 1
+            logger.info(f"Skipping '{meeting.get('title')}' — date {meeting_date} already in AV HQ DB")
             continue
 
         title = meeting.get("title", "Untitled")
@@ -268,9 +304,11 @@ def run_sync(
                     f"({i + len(chunk)}/{len(remaining)} remaining)"
                 )
 
-            # Track in sync map and persist immediately
+            # Track in sync map and update existing dates
             sync_map[meeting_id] = av_hq_page_id
             _save_sync_map(supabase_client, sync_map)
+            if meeting_date:
+                existing_dates.add(meeting_date)
 
             stats["newly_synced"] += 1
             logger.info(f"  Done: '{title}'")
@@ -280,11 +318,16 @@ def run_sync(
             logger.error(error_msg)
             stats["errors"].append(error_msg)
 
+    # Persist sync map (includes both newly synced and skipped-by-date entries)
+    if stats["newly_synced"] > 0 or stats["skipped_date_exists"] > 0:
+        _save_sync_map(supabase_client, sync_map)
+
     elapsed = time.time() - start_time
     stats["elapsed_seconds"] = round(elapsed, 2)
     logger.info(
         f"AV HQ meeting sync complete: "
-        f"{stats['newly_synced']} new, {stats['already_synced']} existing "
+        f"{stats['newly_synced']} new, {stats['already_synced']} existing, "
+        f"{stats['skipped_date_exists']} skipped (date exists) "
         f"in {elapsed:.1f}s"
     )
     return stats
