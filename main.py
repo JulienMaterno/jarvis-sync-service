@@ -2140,6 +2140,137 @@ async def webhook_send_follow_up(request: Request, secret: str = ""):
     return {"status": "success", "message": f"Follow-up sent to {record['recipient_email']}"}
 
 
+@app.post("/follow-ups/track")
+async def track_follow_up(email_id: str = "", thread_id: str = "", interval_days: int = 7, max_follow_ups: int = 3):
+    """
+    Start tracking an email for follow-up.
+    Accepts either email_id (UUID from emails table) or thread_id.
+    Adds Gmail Follow-Up label and creates tracking record.
+    """
+    from email.utils import parseaddr
+    from sync_follow_ups import FOLLOW_UP_LABEL_NAME, FollowUpSync
+
+    if not email_id and not thread_id:
+        raise HTTPException(status_code=400, detail="Provide either email_id or thread_id")
+
+    try:
+        # Look up the email
+        if email_id:
+            email_result = supabase.table("emails").select(
+                "id, google_message_id, thread_id, sender, recipient, subject, body_text, date"
+            ).eq("id", email_id).execute()
+        else:
+            # Find the most recent outbound email in the thread
+            email_result = supabase.table("emails").select(
+                "id, google_message_id, thread_id, sender, recipient, subject, body_text, date"
+            ).eq("thread_id", thread_id).order("date", desc=True).limit(10).execute()
+
+        if not email_result.data:
+            raise HTTPException(status_code=404, detail="Email not found")
+
+        # Get user email for sender check
+        syncer = FollowUpSync()
+        user_email = await syncer._get_user_email()
+
+        # Find the outbound email (sent by Aaron)
+        email_record = None
+        for e in email_result.data:
+            sender_email = parseaddr(e.get("sender", ""))[1].lower()
+            if sender_email == user_email:
+                email_record = e
+                break
+
+        if not email_record:
+            raise HTTPException(status_code=400, detail="No outbound email found (must be sent by you)")
+
+        # Check if thread is already tracked
+        existing = supabase.table("email_follow_ups").select("id, status").eq(
+            "thread_id", email_record["thread_id"]
+        ).is_("deleted_at", "null").execute()
+
+        if existing.data:
+            rec = existing.data[0]
+            return {
+                "status": "already_tracked",
+                "follow_up_id": rec["id"],
+                "current_status": rec["status"],
+                "message": f"Thread already tracked (status: {rec['status']})",
+            }
+
+        # Add Gmail Follow-Up label
+        label_id = await syncer._ensure_label()
+        try:
+            await syncer.gmail_client.modify_message_labels(
+                email_record["google_message_id"],
+                add_label_ids=[label_id]
+            )
+        except Exception as e:
+            logger.warning(f"Failed to add Gmail label (continuing anyway): {e}")
+
+        # Extract recipient info
+        recipient_raw = email_record.get("recipient", "")
+        recipient_email = parseaddr(recipient_raw)[1].lower() if recipient_raw else ""
+        recipient_name = parseaddr(recipient_raw)[0] if recipient_raw else ""
+
+        # Look up contact
+        from lib.supabase_client import find_contact_by_email
+        contact_id = find_contact_by_email(recipient_email) if recipient_email else None
+
+        if not recipient_name and contact_id:
+            try:
+                contact_result = supabase.table("contacts").select("full_name").eq(
+                    "id", contact_id
+                ).limit(1).execute()
+                if contact_result.data:
+                    recipient_name = contact_result.data[0].get("full_name", "")
+            except Exception:
+                pass
+
+        # Create tracking record
+        now = datetime.now(timezone.utc)
+        follow_up_record = {
+            "email_id": email_record["id"],
+            "google_message_id": email_record["google_message_id"],
+            "thread_id": email_record["thread_id"],
+            "subject": email_record.get("subject"),
+            "recipient_email": recipient_email,
+            "recipient_name": recipient_name or None,
+            "original_body_text": (email_record.get("body_text") or "")[:5000] or None,
+            "original_date": email_record.get("date"),
+            "contact_id": contact_id,
+            "status": "pending",
+            "interval_days": interval_days,
+            "next_follow_up_date": (now + timedelta(days=interval_days)).isoformat(),
+            "follow_up_count": 0,
+            "max_follow_ups": max_follow_ups,
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+        }
+
+        insert_result = supabase.table("email_follow_ups").insert(follow_up_record).execute()
+        new_record = insert_result.data[0] if insert_result.data else {}
+
+        logger.info(
+            f"Tracking follow-up via API: '{email_record.get('subject')}' "
+            f"to {recipient_email} (interval: {interval_days}d, max: {max_follow_ups})"
+        )
+
+        return {
+            "status": "success",
+            "follow_up_id": new_record.get("id"),
+            "subject": email_record.get("subject"),
+            "recipient": recipient_email,
+            "next_follow_up_date": follow_up_record["next_follow_up_date"],
+            "message": f"Now tracking follow-up to {recipient_email}",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to track follow-up: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/follow-ups/{follow_up_id}/cancel")
 async def cancel_follow_up(follow_up_id: str):
     """Cancel a follow-up and remove Gmail label."""
