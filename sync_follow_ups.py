@@ -639,11 +639,14 @@ class FollowUpSync:
             "follow_up_count": follow_up_count,
         }
 
+        api_key = os.getenv("INTERNAL_API_KEY", "")
+
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(
                     f"{INTELLIGENCE_SERVICE_URL}/api/v1/follow-up/generate-draft",
                     json=payload,
+                    headers={"X-API-Key": api_key},
                 )
                 response.raise_for_status()
                 data = response.json()
