@@ -29,7 +29,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Set
 
 from lib.sync_base import (
@@ -169,6 +169,26 @@ def _fetch_transcript_text(supabase_client, transcript_id: str) -> Optional[str]
     return None
 
 
+def _parse_date_utc(date_val: Any) -> Optional[str]:
+    """Extract YYYY-MM-DD from a date value, always in UTC.
+
+    Supabase returns timestamps like '2026-02-04T16:00:00+00:00'.
+    We want the UTC date, not the local-tz date.
+    """
+    if not date_val:
+        return None
+    s = str(date_val)
+    # If it's already a bare date (YYYY-MM-DD), use it directly
+    if len(s) == 10:
+        return s
+    # Parse ISO string and extract UTC date
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return s[:10]
+
+
 def _build_notion_properties(meeting: Dict[str, Any]) -> Dict:
     """Build Notion API properties for the AV HQ Meeting DB page."""
     title = meeting.get("title") or "Untitled Meeting"
@@ -176,9 +196,8 @@ def _build_notion_properties(meeting: Dict[str, Any]) -> Dict:
         "Name": {"title": [{"text": {"content": title[:2000]}}]},
     }
 
-    date_val = meeting.get("date")
-    if date_val:
-        date_str = str(date_val)[:10]  # YYYY-MM-DD
+    date_str = _parse_date_utc(meeting.get("date"))
+    if date_str:
         props["Date"] = {"date": {"start": date_str}}
 
     return props
@@ -261,14 +280,28 @@ def run_sync(
             stats["already_synced"] += 1
             continue
 
-        # Check if a page with this date already exists in AV HQ DB
-        meeting_date = str(meeting.get("date", ""))[:10]
-        if meeting_date and meeting_date in existing_dates:
-            # Mark as synced so we don't re-check next time
-            sync_map[meeting_id] = f"existing:{meeting_date}"
-            stats["skipped_date_exists"] += 1
-            logger.info(f"Skipping '{meeting.get('title')}' — date {meeting_date} already in AV HQ DB")
-            continue
+        # Check if a page with this date (+/- 1 day for timezone tolerance)
+        # already exists in AV HQ DB
+        meeting_date = _parse_date_utc(meeting.get("date"))
+        if meeting_date:
+            try:
+                d = datetime.strptime(meeting_date, "%Y-%m-%d").date()
+                nearby = {
+                    (d - timedelta(days=1)).isoformat(),
+                    d.isoformat(),
+                    (d + timedelta(days=1)).isoformat(),
+                }
+            except ValueError:
+                nearby = {meeting_date}
+            if nearby & existing_dates:
+                matched = nearby & existing_dates
+                sync_map[meeting_id] = f"existing:{meeting_date}"
+                stats["skipped_date_exists"] += 1
+                logger.info(
+                    f"Skipping '{meeting.get('title')}' — "
+                    f"date {meeting_date} matches existing {matched}"
+                )
+                continue
 
         title = meeting.get("title", "Untitled")
         try:
