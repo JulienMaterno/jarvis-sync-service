@@ -469,12 +469,28 @@ class FollowUpSync:
                     logger.error(f"Failed to generate draft for {follow_up['id']}")
                     continue
 
-                # Create Gmail draft as threaded reply
+                # Build full email body with quoted original
                 subject = follow_up.get("subject", "")
+                original_body = follow_up.get("original_body_text", "")
+                original_date = follow_up.get("original_date", "")
+                recipient_name = follow_up.get("recipient_name", follow_up["recipient_email"])
+
+                # Format quoted original email below the follow-up
+                full_body = draft_body
+                if original_body:
+                    date_display = original_date[:10] if original_date else "unknown date"
+                    quoted_original = "\n".join(f"> {line}" for line in original_body.strip().splitlines())
+                    full_body += (
+                        f"\n\n"
+                        f"On {date_display}, Aaron wrote:\n"
+                        f"{quoted_original}"
+                    )
+
+                # Create Gmail draft as threaded reply
                 draft = await self.gmail_client.create_draft(
                     to=follow_up["recipient_email"],
                     subject=f"Re: {subject}" if subject and not subject.lower().startswith("re:") else subject,
-                    body=draft_body,
+                    body=full_body,
                     reply_to_message_id=follow_up["google_message_id"]
                 )
 

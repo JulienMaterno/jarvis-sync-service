@@ -2100,6 +2100,97 @@ async def send_follow_up(follow_up_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/follow-ups/webhook/send")
+async def webhook_send_follow_up(request: Request, secret: str = ""):
+    """
+    Webhook endpoint for Notion 'Send' button.
+    Looks up the follow-up by Notion page ID from the webhook payload.
+    Requires ?secret= query parameter for basic auth.
+    """
+    # Simple secret check
+    expected_secret = os.getenv("FOLLOW_UP_WEBHOOK_SECRET", "jarvis-followup-send-2026")
+    if secret != expected_secret:
+        raise HTTPException(status_code=403, detail="Invalid webhook secret")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    # Try to extract Notion page ID from various payload locations
+    notion_page_id = None
+
+    # Notion webhook payloads can vary - try common structures
+    if isinstance(body, dict):
+        # Direct page_id field
+        notion_page_id = body.get("page_id") or body.get("pageId")
+
+        # Nested in data object
+        if not notion_page_id and "data" in body:
+            data = body["data"]
+            if isinstance(data, dict):
+                notion_page_id = data.get("page_id") or data.get("pageId") or data.get("url", "")
+
+        # Try to extract from page URL in any field
+        if not notion_page_id:
+            for key, val in body.items():
+                if isinstance(val, str) and ("notion.so" in val or len(val) == 32):
+                    # Could be a page ID or URL
+                    notion_page_id = val.replace("-", "").split("/")[-1].split("?")[0]
+                    if len(notion_page_id) == 32:
+                        break
+                    notion_page_id = None
+
+    if not notion_page_id:
+        logger.warning(f"Notion webhook: could not extract page_id from payload: {body}")
+        raise HTTPException(status_code=400, detail="Could not determine follow-up from webhook payload")
+
+    # Normalize the page ID (add dashes if needed)
+    clean_id = notion_page_id.replace("-", "")
+    if len(clean_id) == 32:
+        notion_page_id = f"{clean_id[:8]}-{clean_id[8:12]}-{clean_id[12:16]}-{clean_id[16:20]}-{clean_id[20:]}"
+
+    # Look up follow-up by notion_page_id
+    result = supabase.table("email_follow_ups").select(
+        "id, gmail_draft_id, follow_up_count, max_follow_ups, interval_days, subject, recipient_email, status"
+    ).eq("notion_page_id", notion_page_id).is_("deleted_at", "null").execute()
+
+    if not result.data:
+        logger.warning(f"Notion webhook: no follow-up found for page {notion_page_id}")
+        raise HTTPException(status_code=404, detail=f"No follow-up found for Notion page {notion_page_id}")
+
+    record = result.data[0]
+
+    if not record.get("gmail_draft_id"):
+        return {"status": "no_draft", "message": "No draft available yet - draft will be generated when timer expires"}
+
+    # Send the draft
+    gmail_client = GmailClient()
+    await gmail_client.send_draft(record["gmail_draft_id"])
+
+    now = datetime.now(timezone.utc)
+    interval = record.get("interval_days", 7)
+
+    if record["follow_up_count"] >= record["max_follow_ups"]:
+        new_status = "sent"
+        next_date = now.isoformat()
+    else:
+        new_status = "pending"
+        next_date = (now + timedelta(days=interval)).isoformat()
+
+    supabase.table("email_follow_ups").update({
+        "status": new_status,
+        "gmail_draft_id": None,
+        "draft_body": None,
+        "last_sent_at": now.isoformat(),
+        "next_follow_up_date": next_date,
+        "updated_at": now.isoformat(),
+    }).eq("id", record["id"]).execute()
+
+    logger.info(f"Notion webhook: sent follow-up to {record['recipient_email']} (page {notion_page_id})")
+    return {"status": "success", "message": f"Follow-up sent to {record['recipient_email']}"}
+
+
 # --- Books Sync ---
 
 @app.post("/sync/books")
