@@ -170,7 +170,7 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
     """
 
     # Paths that never require authentication
-    PUBLIC_PATHS = {"/", "/health"}
+    PUBLIC_PATHS = {"/", "/health", "/follow-ups/webhook/send"}
     # Path prefixes that never require authentication (health sub-routes)
     PUBLIC_PREFIXES = ("/health/",)
 
