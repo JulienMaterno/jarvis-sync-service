@@ -49,8 +49,11 @@ SUPABASE_URL = os.environ.get('SUPABASE_URL')
 SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
 
 # Safety valve threshold - abort if source has <10% of destination
-SAFETY_VALVE_THRESHOLD = 0.1
-SAFETY_VALVE_MIN_RECORDS = 10  # Only apply safety valve if destination has > this many
+# Configurable via environment variables for operational flexibility
+SAFETY_VALVE_THRESHOLD = float(os.environ.get('SAFETY_VALVE_THRESHOLD', '0.1'))
+SAFETY_VALVE_MIN_RECORDS = int(os.environ.get('SAFETY_VALVE_MIN_RECORDS', '10'))
+# Mode: "abort" (default) = stop sync, "warn" = log warning but continue
+SAFETY_VALVE_MODE = os.environ.get('SAFETY_VALVE_MODE', 'abort').lower()
 
 # Notion API limits
 MAX_BLOCKS_PER_REQUEST = 100  # Notion allows max 100 blocks per append request
@@ -87,19 +90,76 @@ def format_exception(e: Exception) -> str:
 # RETRY DECORATOR
 # ============================================================================
 
+class NotionRateLimitError(Exception):
+    """Raised when Notion API returns 429 Too Many Requests."""
+
+    def __init__(self, retry_after: Optional[float] = None, message: str = ""):
+        self.retry_after = retry_after
+        super().__init__(message or f"Notion rate limit hit (retry_after={retry_after}s)")
+
+
+def _extract_retry_after(response: httpx.Response) -> Optional[float]:
+    """Extract Retry-After value from HTTP response headers.
+
+    The Retry-After header can be either a number of seconds or an HTTP-date.
+    Notion typically sends seconds.
+    """
+    retry_after = response.headers.get('Retry-After') or response.headers.get('retry-after')
+    if retry_after is not None:
+        try:
+            return float(retry_after)
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
 def retry_on_error(max_retries: int = 3, base_delay: float = 1.0, exceptions: tuple = (Exception,)):
-    """Decorator for automatic retry with exponential backoff."""
+    """Decorator for automatic retry with exponential backoff.
+
+    Includes specific handling for HTTP 429 (rate limit) responses:
+    - Uses the Retry-After header value when available
+    - Applies longer exponential backoff for rate-limited requests
+    - Does not retry non-retryable 4xx errors (except 429)
+    """
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
+            logger = logging.getLogger('retry_on_error')
             last_exception = None
             for attempt in range(max_retries):
                 try:
                     return func(*args, **kwargs)
                 except exceptions as e:
                     last_exception = e
+
+                    # For HTTP errors, only retry 429 and 5xx
+                    if isinstance(e, httpx.HTTPStatusError):
+                        status = e.response.status_code
+                        if status == 429:
+                            # Rate limited - use Retry-After header if available
+                            retry_after = _extract_retry_after(e.response)
+                            if retry_after and retry_after > 0:
+                                delay = retry_after
+                            else:
+                                # Exponential backoff with longer base for rate limits
+                                delay = base_delay * (2 ** (attempt + 1))
+                            if attempt < max_retries - 1:
+                                logger.warning(
+                                    f"Rate limited (429) in {func.__name__}, attempt {attempt + 1}/{max_retries}. "
+                                    f"Waiting {delay:.1f}s before retry."
+                                )
+                                time.sleep(delay)
+                                continue
+                        elif status < 500:
+                            # Non-retryable client error (400, 401, 403, 404, etc.)
+                            raise
+
                     if attempt < max_retries - 1:
                         delay = base_delay * (2 ** attempt)
+                        logger.warning(
+                            f"Transient error in {func.__name__}, attempt {attempt + 1}/{max_retries}: "
+                            f"{type(e).__name__}. Retrying in {delay:.1f}s."
+                        )
                         time.sleep(delay)
             raise last_exception
         return wrapper
@@ -107,19 +167,47 @@ def retry_on_error(max_retries: int = 3, base_delay: float = 1.0, exceptions: tu
 
 
 def retry_on_error_async(max_retries: int = 3, base_delay: float = 1.0, exceptions: tuple = (Exception,)):
-    """Async decorator for automatic retry with exponential backoff."""
+    """Async decorator for automatic retry with exponential backoff.
+
+    Includes specific handling for HTTP 429 (rate limit) responses.
+    """
     import asyncio
     def decorator(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
+            logger = logging.getLogger('retry_on_error_async')
             last_exception = None
             for attempt in range(max_retries):
                 try:
                     return await func(*args, **kwargs)
                 except exceptions as e:
                     last_exception = e
+
+                    # For HTTP errors, only retry 429 and 5xx
+                    if isinstance(e, httpx.HTTPStatusError):
+                        status = e.response.status_code
+                        if status == 429:
+                            retry_after = _extract_retry_after(e.response)
+                            if retry_after and retry_after > 0:
+                                delay = retry_after
+                            else:
+                                delay = base_delay * (2 ** (attempt + 1))
+                            if attempt < max_retries - 1:
+                                logger.warning(
+                                    f"Rate limited (429) in {func.__name__}, attempt {attempt + 1}/{max_retries}. "
+                                    f"Waiting {delay:.1f}s before retry."
+                                )
+                                await asyncio.sleep(delay)
+                                continue
+                        elif status < 500:
+                            raise
+
                     if attempt < max_retries - 1:
                         delay = base_delay * (2 ** attempt)
+                        logger.warning(
+                            f"Transient error in {func.__name__}, attempt {attempt + 1}/{max_retries}: "
+                            f"{type(e).__name__}. Retrying in {delay:.1f}s."
+                        )
                         await asyncio.sleep(delay)
             raise last_exception
         return wrapper
@@ -455,13 +543,16 @@ class NotionClient:
             return []
     
     @retry_on_error(max_retries=3, base_delay=1.0)
-    def append_blocks(self, page_id: str, blocks: List[Dict]) -> List[Dict]:
-        """Append content blocks to a page."""
+    def append_blocks(self, page_id: str, blocks: List[Dict], after: Optional[str] = None) -> List[Dict]:
+        """Append content blocks to a page, optionally after a specific block."""
         if not blocks:
             return []
+        body: Dict[str, Any] = {"children": blocks}
+        if after:
+            body["after"] = after
         response = self.client.patch(
             f'https://api.notion.com/v1/blocks/{page_id}/children',
-            json={"children": blocks}
+            json=body
         )
         response.raise_for_status()
         return response.json().get('results', [])
@@ -1054,8 +1145,8 @@ def _build_rich_text_block(block_type: str, text: str, extra_props: Dict = None)
     Returns:
         Notion block dictionary
     """
-    # Truncate to Notion's limit
-    text = text[:2000] if text else ""
+    # Truncate to Notion's limit (1990 for safety margin)
+    text = text[:1990] if text else ""
     rich_text = parse_markdown_to_rich_text(text)
 
     block = {
@@ -1079,7 +1170,7 @@ def _build_rich_text_block(block_type: str, text: str, extra_props: Dict = None)
 class ContentBlockBuilder:
     """Helper class to build Notion content blocks from text with markdown support."""
 
-    NOTION_BLOCK_LIMIT = 2000  # Notion's character limit per block
+    NOTION_BLOCK_LIMIT = 1990  # Notion's character limit per block (using 1990 for safety margin)
     
     @staticmethod
     def paragraph(text: str) -> Dict:
@@ -1468,22 +1559,37 @@ class BaseSyncService(ABC, Generic[T]):
         return dest_record.get('id', '')
     
     def check_safety_valve(
-        self, 
-        source_count: int, 
-        dest_count: int, 
+        self,
+        source_count: int,
+        dest_count: int,
         direction: str
     ) -> Tuple[bool, str]:
         """
         Check if sync should proceed based on record counts.
+
+        Uses module-level configuration:
+        - SAFETY_VALVE_THRESHOLD: ratio below which sync is flagged (default 0.1)
+        - SAFETY_VALVE_MIN_RECORDS: skip check if destination has fewer records (default 10)
+        - SAFETY_VALVE_MODE: "abort" to stop sync, "warn" to log and continue (default "abort")
+
         Returns (is_safe, message).
         """
         if dest_count <= SAFETY_VALVE_MIN_RECORDS:
-            return True, "Safety valve bypassed (destination below threshold)"
-        
+            return True, f"Safety valve bypassed (destination has {dest_count} records, below minimum threshold of {SAFETY_VALVE_MIN_RECORDS})"
+
+        ratio = source_count / dest_count if dest_count > 0 else 1.0
         if source_count < dest_count * SAFETY_VALVE_THRESHOLD:
-            msg = f"Safety Valve Triggered: Source has {source_count}, destination has {dest_count}. Aborting {direction}."
+            msg = (
+                f"Safety Valve Triggered [{direction}]: "
+                f"source={source_count}, destination={dest_count}, "
+                f"ratio={ratio:.2%}, threshold={SAFETY_VALVE_THRESHOLD:.0%}, "
+                f"mode={SAFETY_VALVE_MODE}"
+            )
+            if SAFETY_VALVE_MODE == 'warn':
+                self.logger.warning(f"{msg} -- continuing in warning-only mode")
+                return True, msg
             return False, msg
-        
+
         return True, ""
     
     def compare_timestamps(
@@ -2102,14 +2208,18 @@ def create_cli_parser(service_name: str) -> argparse.ArgumentParser:
 __all__ = [
     # Configuration
     'NOTION_API_TOKEN',
-    'SUPABASE_URL', 
+    'SUPABASE_URL',
     'SUPABASE_KEY',
     'SAFETY_VALVE_THRESHOLD',
+    'SAFETY_VALVE_MIN_RECORDS',
+    'SAFETY_VALVE_MODE',
     
     # Utilities
     'setup_logger',
     'retry_on_error',
     'retry_on_error_async',
+    'NotionRateLimitError',
+    '_extract_retry_after',
     
     # Data classes
     'SyncDirection',
