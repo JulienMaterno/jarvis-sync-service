@@ -59,6 +59,9 @@ from sync_beeper import run_beeper_sync, run_beeper_relink
 # Import Beeper → Notion sync (one-way: appends messages to Notion pages)
 from syncs.beeper_notion_sync import run_sync as run_beeper_notion_sync
 
+# Import Meeting → AV HQ sync (one-way: creates meeting pages in AV HQ teamspace)
+from syncs.meeting_av_hq_sync import run_sync as run_meeting_av_hq_sync
+
 # Import Anki sync
 from syncs.anki_sync import run_anki_sync
 
@@ -726,6 +729,10 @@ async def sync_everything(background_tasks: BackgroundTasks):
         # === BEEPER → NOTION SYNC (append new messages to Notion pages) ===
         # Runs after beeper sync so new messages are in Supabase first
         await run_step("beeper_notion_sync", run_beeper_notion_sync, supabase, full_sync=False)
+
+        # === MEETING → AV HQ SYNC (create meeting pages in AV HQ teamspace) ===
+        # Runs after meeting sync so new meetings are in Supabase first
+        await run_step("meeting_av_hq_sync", run_meeting_av_hq_sync, supabase, full_sync=False)
 
         # === ANKI SYNC (Supabase ↔ Anki Desktop) - Daily at 3 AM ===
         # Only runs once per day at 3 AM (requires local Anki Desktop with AnkiConnect)
@@ -2710,6 +2717,27 @@ async def sync_beeper_notion(full: bool = False):
         return {"status": "success", **result}
     except Exception as e:
         logger.error(f"Beeper→Notion sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/sync/meeting-av-hq")
+async def sync_meeting_av_hq(full: bool = False):
+    """
+    Sync meetings with AV HQ contacts to the AV HQ Meeting DB.
+
+    Creates pages in the AV HQ teamspace Meeting database for meetings
+    involving configured contacts (e.g. Victor), with summary + transcript.
+
+    Args:
+        full: If True, re-sync all meetings (ignore existing sync map).
+              If False, only sync meetings not yet in AV HQ.
+    """
+    try:
+        logger.info(f"Starting Meeting→AV HQ sync via API (full={full})")
+        result = await run_in_threadpool(run_meeting_av_hq_sync, supabase, full_sync=full)
+        return {"status": "success", **result}
+    except Exception as e:
+        logger.error(f"Meeting→AV HQ sync failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
