@@ -56,6 +56,9 @@ from sync_activitywatch import run_activitywatch_sync, ActivityWatchSync, format
 # Import Beeper sync
 from sync_beeper import run_beeper_sync, run_beeper_relink
 
+# Import Beeper → Notion sync (one-way: appends messages to Notion pages)
+from syncs.beeper_notion_sync import run_sync as run_beeper_notion_sync
+
 # Import Anki sync
 from syncs.anki_sync import run_anki_sync
 
@@ -719,6 +722,10 @@ async def sync_everything(background_tasks: BackgroundTasks):
         # === BEEPER SYNC (WhatsApp/Telegram/LinkedIn messages) ===
         # This gracefully handles offline laptop - just skips and catches up next run
         await run_step("beeper_sync", run_beeper_sync, supabase, full_sync=False)
+
+        # === BEEPER → NOTION SYNC (append new messages to Notion pages) ===
+        # Runs after beeper sync so new messages are in Supabase first
+        await run_step("beeper_notion_sync", run_beeper_notion_sync, supabase, full_sync=False)
 
         # === ANKI SYNC (Supabase ↔ Anki Desktop) - Daily at 3 AM ===
         # Only runs once per day at 3 AM (requires local Anki Desktop with AnkiConnect)
@@ -2012,10 +2019,22 @@ async def webhook_send_follow_up(request: Request, secret: str = ""):
     if secret != expected_secret:
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
+    import re
+
     try:
         body = await request.json()
     except Exception:
         body = {}
+
+    logger.info(f"Notion webhook payload: {body}")
+
+    def _extract_notion_page_id(value: str) -> Optional[str]:
+        """Extract a 32-char hex page ID from a Notion URL or raw ID."""
+        # Notion URLs end with a 32-char hex ID (possibly after a title slug)
+        match = re.search(r'([0-9a-f]{32})', value.replace("-", ""))
+        if match:
+            return match.group(1)
+        return None
 
     # Try to extract Notion page ID from various payload locations
     notion_page_id = None
@@ -2023,32 +2042,36 @@ async def webhook_send_follow_up(request: Request, secret: str = ""):
     # Notion webhook payloads can vary - try common structures
     if isinstance(body, dict):
         # Direct page_id field
-        notion_page_id = body.get("page_id") or body.get("pageId")
+        for key in ("page_id", "pageId", "id"):
+            if body.get(key):
+                notion_page_id = _extract_notion_page_id(str(body[key]))
+                if notion_page_id:
+                    break
 
         # Nested in data object
         if not notion_page_id and "data" in body:
             data = body["data"]
             if isinstance(data, dict):
-                notion_page_id = data.get("page_id") or data.get("pageId") or data.get("url", "")
+                for key in ("page_id", "pageId", "id", "url"):
+                    if data.get(key):
+                        notion_page_id = _extract_notion_page_id(str(data[key]))
+                        if notion_page_id:
+                            break
 
-        # Try to extract from page URL in any field
+        # Scan all string values for Notion URLs or page IDs
         if not notion_page_id:
             for key, val in body.items():
-                if isinstance(val, str) and ("notion.so" in val or len(val) == 32):
-                    # Could be a page ID or URL
-                    notion_page_id = val.replace("-", "").split("/")[-1].split("?")[0]
-                    if len(notion_page_id) == 32:
+                if isinstance(val, str) and ("notion.so" in val or "notion.com" in val):
+                    notion_page_id = _extract_notion_page_id(val)
+                    if notion_page_id:
                         break
-                    notion_page_id = None
 
     if not notion_page_id:
         logger.warning(f"Notion webhook: could not extract page_id from payload: {body}")
         raise HTTPException(status_code=400, detail="Could not determine follow-up from webhook payload")
 
-    # Normalize the page ID (add dashes if needed)
-    clean_id = notion_page_id.replace("-", "")
-    if len(clean_id) == 32:
-        notion_page_id = f"{clean_id[:8]}-{clean_id[8:12]}-{clean_id[12:16]}-{clean_id[16:20]}-{clean_id[20:]}"
+    # Format as UUID with dashes
+    notion_page_id = f"{notion_page_id[:8]}-{notion_page_id[8:12]}-{notion_page_id[12:16]}-{notion_page_id[16:20]}-{notion_page_id[20:]}"
 
     # Look up follow-up by notion_page_id
     result = supabase.table("email_follow_ups").select(
@@ -2509,6 +2532,27 @@ async def sync_beeper(full: bool = False):
         return {"status": "success", **result}
     except Exception as e:
         logger.error(f"Beeper sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/sync/beeper-notion")
+async def sync_beeper_notion(full: bool = False):
+    """
+    Sync Beeper messages to Notion pages.
+
+    Appends new messages from beeper_messages in Supabase to configured
+    Notion pages. Requires BEEPER_NOTION_SYNC_MAPPINGS env var.
+
+    Args:
+        full: If True, resync all messages (ignore cursor).
+              If False, only sync since last sync time.
+    """
+    try:
+        logger.info(f"Starting Beeper→Notion sync via API (full={full})")
+        result = await run_in_threadpool(run_beeper_notion_sync, supabase, full_sync=full)
+        return {"status": "success", **result}
+    except Exception as e:
+        logger.error(f"Beeper→Notion sync failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
