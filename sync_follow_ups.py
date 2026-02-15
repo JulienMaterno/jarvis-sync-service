@@ -350,7 +350,7 @@ class FollowUpSync:
                 # Check for newer messages in this thread from the emails table
                 thread_emails = await asyncio.to_thread(
                     lambda tid=thread_id, odate=original_date: supabase.table("emails")
-                    .select("sender, date, google_message_id")
+                    .select("sender, date, google_message_id, subject, body_text")
                     .eq("thread_id", tid)
                     .gt("date", odate)
                     .order("date", desc=False)
@@ -453,13 +453,13 @@ class FollowUpSync:
                 await asyncio.to_thread(
                     lambda fid=follow_up["id"]: supabase.table("email_follow_ups")
                     .update({
-                        "status": "cancelled",
+                        "status": "sent",
                         "updated_at": datetime.now(timezone.utc).isoformat(),
                     })
                     .eq("id", fid)
                     .execute()
                 )
-                logger.info(f"Max follow-ups reached for {follow_up['id']}, cancelling")
+                logger.info(f"Max follow-ups reached for {follow_up['id']}, marking as sent")
                 continue
 
             try:

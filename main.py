@@ -2110,6 +2110,32 @@ async def webhook_send_follow_up(request: Request, secret: str = ""):
         "updated_at": now.isoformat(),
     }).eq("id", record["id"]).execute()
 
+    # Update Notion page immediately so user sees feedback
+    notion_token = os.getenv("NOTION_API_TOKEN")
+    if notion_token:
+        try:
+            import httpx
+            notion_status = "Sent" if new_status == "sent" else "Pending"
+            last_sent_date = now.strftime("%Y-%m-%d")
+            async with httpx.AsyncClient(timeout=10.0) as http_client:
+                await http_client.patch(
+                    f"https://api.notion.com/v1/pages/{notion_page_id}",
+                    headers={
+                        "Authorization": f"Bearer {notion_token}",
+                        "Notion-Version": "2022-06-28",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "properties": {
+                            "Status": {"select": {"name": notion_status}},
+                            "Last Sent": {"date": {"start": last_sent_date}},
+                        }
+                    },
+                )
+            logger.info(f"Updated Notion page status to '{notion_status}'")
+        except Exception as e:
+            logger.warning(f"Failed to update Notion page status (non-blocking): {e}")
+
     logger.info(f"Notion webhook: sent follow-up to {record['recipient_email']} (page {notion_page_id})")
     return {"status": "success", "message": f"Follow-up sent to {record['recipient_email']}"}
 
