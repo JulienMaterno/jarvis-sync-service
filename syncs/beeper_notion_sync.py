@@ -58,6 +58,16 @@ ANCHOR_KEY_PREFIX = "beeper_notion_sync_anchor"
 # Time gap threshold for adding separators (hours)
 TIME_GAP_THRESHOLD_HOURS = 4
 
+# Sender name cleanup: outgoing messages use beeper ID instead of real name
+SENDER_NAME_MAP = {
+    "@aaronpuetting:beeper.com": "Aaron",
+}
+
+
+def _clean_sender_name(raw_name: str) -> str:
+    """Map beeper IDs to friendly display names."""
+    return SENDER_NAME_MAP.get(raw_name, raw_name)
+
 
 def _load_mappings(supabase_client) -> List[Dict[str, Any]]:
     """Load chat-to-page mappings from sync_state table, with env var fallback."""
@@ -216,7 +226,7 @@ def _format_messages_newest_first(messages: List[Dict[str, Any]]) -> List[Dict]:
                 blocks.append(ContentBlockBuilder.paragraph(f"*{gap_text}*"))
 
         # Message line
-        sender = msg.get("sender_name", "Unknown")
+        sender = _clean_sender_name(msg.get("sender_name", "Unknown"))
         line = f"**{sender}** `{time_str}` {content}"
         if len(line) > 1990:
             line = line[:1987] + "..."
