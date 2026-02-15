@@ -33,6 +33,48 @@ INTELLIGENCE_SERVICE_URL = os.getenv(
 
 FOLLOW_UP_LABEL_NAME = "Follow-Up"
 DEFAULT_INTERVAL_DAYS = 7
+
+# Auto-reply detection patterns (case-insensitive subject checks)
+AUTO_REPLY_SUBJECT_PATTERNS = [
+    "out of office",
+    "automatic reply",
+    "auto-reply",
+    "autoreply",
+    "auto reply",
+    "away from office",
+    "on leave",
+    "out of the office",
+    "i am currently out",
+    "vacation reply",
+    "absence notice",
+]
+
+# Sender patterns that indicate auto-generated messages
+AUTO_REPLY_SENDER_PATTERNS = [
+    "mailer-daemon@",
+    "noreply@",
+    "no-reply@",
+    "postmaster@",
+    "donotreply@",
+]
+
+
+def _is_auto_reply(sender: str, subject: str, body_text: str = "") -> bool:
+    """Check if an email is an auto-reply (out-of-office, etc.)."""
+    sender_lower = sender.lower()
+    subject_lower = subject.lower() if subject else ""
+
+    # Check sender patterns
+    for pattern in AUTO_REPLY_SENDER_PATTERNS:
+        if pattern in sender_lower:
+            return True
+
+    # Check subject patterns
+    for pattern in AUTO_REPLY_SUBJECT_PATTERNS:
+        if pattern in subject_lower:
+            return True
+
+    return False
 DEFAULT_MAX_FOLLOW_UPS = 3
 
 
@@ -204,8 +246,24 @@ class FollowUpSync:
                     body_content = self.gmail_client.parse_message_body(payload)
                     body_text = body_content.get("text", "")
 
-                    # Try to find contact
-                    contact_id = find_contact_by_email(recipient_email) if recipient_email else None
+                    # Try to find contact and get name
+                    contact_id = None
+                    if recipient_email:
+                        contact_id = find_contact_by_email(recipient_email)
+                        # If no display name from email header, look up from contacts
+                        if not recipient_name and contact_id:
+                            try:
+                                contact_result = await asyncio.to_thread(
+                                    lambda cid=contact_id: supabase.table("contacts")
+                                    .select("full_name")
+                                    .eq("id", cid)
+                                    .limit(1)
+                                    .execute()
+                                )
+                                if contact_result.data:
+                                    recipient_name = contact_result.data[0].get("full_name", "")
+                            except Exception:
+                                pass
 
                     # Look up email_id from emails table
                     email_id = None
@@ -308,18 +366,24 @@ class FollowUpSync:
 
                 for email in thread_emails.data:
                     sender = email.get("sender", "")
+                    subject = email.get("subject", "")
+                    body_text = email.get("body_text", "")
                     sender_email_addr = parseaddr(sender)[1].lower() if sender else ""
 
                     if sender_email_addr == user_email:
                         # Aaron sent a new message - reset the timer
                         aaron_sent_new = True
+                    elif _is_auto_reply(sender, subject, body_text):
+                        # Skip auto-replies (out-of-office, etc.)
+                        logger.info(f"Skipping auto-reply in thread {thread_id}: {subject}")
+                        continue
                     else:
-                        # Someone else replied
+                        # Real reply from someone else
                         reply_found = True
                         break
 
                 if reply_found:
-                    # Mark as replied
+                    # Mark as replied (keep Gmail label for long-term tracking)
                     now = datetime.now(timezone.utc)
                     await asyncio.to_thread(
                         lambda fid=follow_up_id: supabase.table("email_follow_ups")
@@ -331,16 +395,7 @@ class FollowUpSync:
                         .execute()
                     )
 
-                    # Remove Gmail label
-                    try:
-                        await self.gmail_client.modify_message_labels(
-                            follow_up["google_message_id"],
-                            remove_label_ids=[label_id]
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to remove label from {follow_up['google_message_id']}: {e}")
-
-                    # Delete draft if exists
+                    # Delete draft if exists (no longer needed)
                     if follow_up.get("gmail_draft_id"):
                         try:
                             await self.gmail_client.delete_draft(follow_up["gmail_draft_id"])
@@ -348,7 +403,7 @@ class FollowUpSync:
                             logger.debug(f"Could not delete draft {follow_up['gmail_draft_id']}: {e}")
 
                     replies_found += 1
-                    logger.info(f"Reply detected for follow-up {follow_up_id}, marking resolved")
+                    logger.info(f"Reply detected for follow-up {follow_up_id}, status -> replied (label kept)")
 
                 elif aaron_sent_new and follow_up["status"] == "pending":
                     # Aaron sent a new message - reset the timer
