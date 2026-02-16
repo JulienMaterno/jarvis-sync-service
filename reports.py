@@ -8,6 +8,7 @@ from lib.telegram_client import send_telegram_message
 logger = logging.getLogger(__name__)
 
 INTELLIGENCE_SERVICE_URL = os.getenv("INTELLIGENCE_SERVICE_URL", "https://jarvis-intelligence-service-776871804948.asia-southeast1.run.app")
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
 
 
 def get_activity_summary_for_journal() -> dict:
@@ -325,6 +326,11 @@ async def generate_evening_journal_prompt():
         
         # Use 180s timeout - Intelligence Service can take time for AI analysis
         # Also handles Cloud Run cold starts
+        # Build headers with API key for Intelligence Service auth
+        is_headers = {}
+        if INTERNAL_API_KEY:
+            is_headers["X-API-Key"] = INTERNAL_API_KEY
+
         async with httpx.AsyncClient(timeout=180.0) as client:
             # Try new endpoint first, fallback to legacy
             try:
@@ -336,7 +342,8 @@ async def generate_evening_journal_prompt():
                         "timezone": user_tz_str,  # Use user's configured timezone
                         "user_name": "Aaron",
                         "previous_journals": previous_journals
-                    }
+                    },
+                    headers=is_headers
                 )
                 response.raise_for_status()
                 result = response.json()
@@ -351,12 +358,15 @@ async def generate_evening_journal_prompt():
                         json={
                             "activity_data": activity_data,
                             "timezone": user_tz_str  # Use user's configured timezone
-                        }
+                        },
+                        headers=is_headers
                     )
                     response.raise_for_status()
                     result = response.json()
                 else:
-                    raise
+                    # For auth errors or other failures, use fallback prompt
+                    logger.warning(f"Intelligence Service unavailable ({e.response.status_code}), using fallback prompt")
+                    result = _build_fallback_journal_prompt(activity_data, today, user_tz_str)
             except httpx.ReadTimeout:
                 logger.error("Intelligence Service timed out after 180s - using fallback prompt")
                 # Generate a basic fallback prompt without AI
