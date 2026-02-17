@@ -4135,7 +4135,7 @@ async def activity_heatmap():
 
   <!-- Activity Heatmap (green) -->
   <div class="section green" id="activity-section">
-    <h1>Screen Time</h1>
+    <h1>Working Time</h1>
     <div class="subtitle" id="activity-subtitle"></div>
     <div class="stats" id="activity-stats"></div>
     <div class="month-labels" id="activity-months"></div>
@@ -4216,6 +4216,10 @@ function formatDate(d) {{
   return d.toLocaleDateString('en-US', {{ weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }});
 }}
 
+function localDateStr(d) {{
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+}}
+
 function formatHours(h) {{
   if (!h || h < 0.01) return 'No activity';
   const hrs = Math.floor(h);
@@ -4264,21 +4268,30 @@ function renderHeatmap(config) {{
   let totalValue = 0;
   let activeDays = 0;
   let todayValue = 0;
-  let weekValue = 0;
+  let thisWeekValue = 0;
+  let prevWeekValue = 0;
   const weekStartMonth = [];
+
+  // Monday of current week (Mon-Sun)
+  const thisMonday = new Date(today);
+  thisMonday.setDate(today.getDate() - todayDay);
+  const prevMonday = new Date(thisMonday);
+  prevMonday.setDate(prevMonday.getDate() - 7);
+  const prevSunday = new Date(thisMonday);
+  prevSunday.setDate(prevSunday.getDate() - 1);
 
   const cursor = new Date(start);
   while (cursor <= today) {{
     const dayOfWeek = (cursor.getDay() + 6) % 7;
-    const dateStr = cursor.toISOString().split('T')[0];
+    const dateStr = localDateStr(cursor);
     const val = data[dateStr] || 0;
 
     totalValue += val;
     if (val > 0) activeDays++;
 
-    const diffDays = Math.round((today - cursor) / 86400000);
-    if (diffDays === 0) todayValue = val;
-    if (diffDays < 7) weekValue += val;
+    if (localDateStr(cursor) === localDateStr(today)) todayValue = val;
+    if (cursor >= thisMonday && cursor <= today) thisWeekValue += val;
+    if (cursor >= prevMonday && cursor <= prevSunday) prevWeekValue += val;
 
     if (dayOfWeek === 0) {{
       weekStartMonth.push({{ month: cursor.getMonth() }});
@@ -4320,7 +4333,7 @@ function renderHeatmap(config) {{
   for (let i = 0; i <= 365; i++) {{
     const d = new Date(today);
     d.setDate(d.getDate() - i);
-    const ds = d.toISOString().split('T')[0];
+    const ds = localDateStr(d);
     if ((data[ds] || 0) > 0) streak++;
     else break;
   }}
@@ -4331,9 +4344,18 @@ function renderHeatmap(config) {{
 
   const avgValue = totalDays > 0 ? totalValue / totalDays : 0;
 
+  // Week comparison
+  let weekDelta = '';
+  if (prevWeekValue > 0) {{
+    const pct = Math.round(((thisWeekValue - prevWeekValue) / prevWeekValue) * 100);
+    if (pct > 0) weekDelta = ' <span style="color:#3fb950;font-size:10px">&#9650; ' + pct + '%</span>';
+    else if (pct < 0) weekDelta = ' <span style="color:#f85149;font-size:10px">&#9660; ' + Math.abs(pct) + '%</span>';
+    else weekDelta = ' <span style="color:#7d8590;font-size:10px">=</span>';
+  }}
+
   statsEl.innerHTML = `
     <div class="stat"><div class="stat-value">${{formatValue(todayValue)}}</div><div class="stat-label">Today</div></div>
-    <div class="stat"><div class="stat-value">${{formatValue(weekValue)}}</div><div class="stat-label">This Week</div></div>
+    <div class="stat"><div class="stat-value">${{formatValue(thisWeekValue)}}${{weekDelta}}</div><div class="stat-label">This Week (vs prev)</div></div>
     <div class="stat"><div class="stat-value">${{formatValue(avgValue)}}</div><div class="stat-label">Daily Avg</div></div>
     <div class="stat"><div class="stat-value">${{streak}}d</div><div class="stat-label">Streak</div></div>
     <div class="stat"><div class="stat-value">${{activeDays}}</div><div class="stat-label">Active Days</div></div>
