@@ -4767,7 +4767,6 @@ document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
     const W = canvasC.offsetWidth;
     const H = 110;
     canvasC.width = W * 2; canvasC.height = H * 2;
-    ctx.scale(2, 2);
     const pad = {{ l: 30, r: 10, t: 10, b: 20 }};
     const cw = W - pad.l - pad.r;
     const ch = H - pad.t - pad.b;
@@ -4786,48 +4785,91 @@ document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
       paceAvg.push(aRun);
     }}
 
-    const maxP = Math.max(expectedTotal, ...paceToday, 1);
     const xOf = (i) => pad.l + (i / hours) * cw;
-    const yOf = (v) => pad.t + ch - (v / maxP) * ch;
+
+    // Today pace (green solid) + projection (green dotted)
+    const todayEnd = Math.min(nowHour - START_H, hours);
+
+    // Build projection: from current position, use avg incremental gains for remaining hours
+    let projected = [];
+    if (todayEnd >= 0) {{
+      const todaySoFar = paceToday[todayEnd] || 0;
+      for (let i = 0; i <= hours; i++) {{
+        if (i <= todayEnd) {{
+          projected.push(paceToday[i]);
+        }} else {{
+          // Add avg hourly increment from this hour onward
+          const avgIncrement = avgAtHour(START_H + i) / 3600;
+          projected.push((projected[i - 1] || todaySoFar) + avgIncrement);
+        }}
+      }}
+    }}
+
+    // Update maxP to include projection
+    const projMax = projected.length > 0 ? Math.max(...projected) : 0;
+    const maxP2 = Math.max(expectedTotal, ...paceToday, projMax, 1);
+    // Redefine yOf with updated max
+    const yOf2 = (v) => pad.t + ch - (v / maxP2) * ch;
+
+    // Redraw avg with corrected scale (clear and redraw everything)
+    ctx.clearRect(0, 0, canvasC.width, canvasC.height);
+    ctx.save();
+    ctx.scale(2, 2);
 
     // Expected end line
     ctx.strokeStyle = '#30363d'; ctx.lineWidth = 1;
     ctx.setLineDash([2, 2]);
-    ctx.beginPath(); ctx.moveTo(pad.l, yOf(expectedTotal)); ctx.lineTo(W - pad.r, yOf(expectedTotal)); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(pad.l, yOf2(expectedTotal)); ctx.lineTo(W - pad.r, yOf2(expectedTotal)); ctx.stroke();
     ctx.setLineDash([]);
     ctx.fillStyle = '#484f58'; ctx.font = '9px sans-serif'; ctx.textAlign = 'left';
-    ctx.fillText('avg day total: ' + expectedTotal.toFixed(1) + 'h', pad.l + 4, yOf(expectedTotal) - 4);
+    ctx.fillText('avg day total: ' + expectedTotal.toFixed(1) + 'h', pad.l + 4, yOf2(expectedTotal) - 4);
 
-    // Average pace (grey fill)
+    // Average pace (grey fill + line)
     ctx.fillStyle = 'rgba(72,79,88,0.2)';
-    ctx.beginPath(); ctx.moveTo(xOf(0), yOf(0));
-    paceAvg.forEach((v, i) => ctx.lineTo(xOf(i), yOf(v)));
-    ctx.lineTo(xOf(hours), yOf(0)); ctx.closePath(); ctx.fill();
-
-    // Average pace line
+    ctx.beginPath(); ctx.moveTo(xOf(0), yOf2(0));
+    paceAvg.forEach((v, i) => ctx.lineTo(xOf(i), yOf2(v)));
+    ctx.lineTo(xOf(hours), yOf2(0)); ctx.closePath(); ctx.fill();
     ctx.strokeStyle = '#484f58'; ctx.lineWidth = 1.5;
     ctx.beginPath();
-    paceAvg.forEach((v, i) => {{ i === 0 ? ctx.moveTo(xOf(i), yOf(v)) : ctx.lineTo(xOf(i), yOf(v)); }});
+    paceAvg.forEach((v, i) => {{ i === 0 ? ctx.moveTo(xOf(i), yOf2(v)) : ctx.lineTo(xOf(i), yOf2(v)); }});
     ctx.stroke();
 
-    // Today pace (green)
-    const todayEnd = Math.min(nowHour - START_H, hours);
+    // Today actual (solid green fill + line)
     if (todayEnd >= 0) {{
       ctx.fillStyle = 'rgba(57,211,83,0.15)';
-      ctx.beginPath(); ctx.moveTo(xOf(0), yOf(0));
-      for (let i = 0; i <= todayEnd; i++) ctx.lineTo(xOf(i), yOf(paceToday[i]));
-      ctx.lineTo(xOf(todayEnd), yOf(0)); ctx.closePath(); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(xOf(0), yOf2(0));
+      for (let i = 0; i <= todayEnd; i++) ctx.lineTo(xOf(i), yOf2(paceToday[i]));
+      ctx.lineTo(xOf(todayEnd), yOf2(0)); ctx.closePath(); ctx.fill();
 
       ctx.strokeStyle = '#39d353'; ctx.lineWidth = 2;
       ctx.beginPath();
       for (let i = 0; i <= todayEnd; i++) {{
-        i === 0 ? ctx.moveTo(xOf(i), yOf(paceToday[i])) : ctx.lineTo(xOf(i), yOf(paceToday[i]));
+        i === 0 ? ctx.moveTo(xOf(i), yOf2(paceToday[i])) : ctx.lineTo(xOf(i), yOf2(paceToday[i]));
       }}
       ctx.stroke();
 
+      // Projection (dotted green line from current position)
+      if (todayEnd < hours) {{
+        ctx.strokeStyle = '#39d353'; ctx.lineWidth = 1.5;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(xOf(todayEnd), yOf2(projected[todayEnd]));
+        for (let i = todayEnd + 1; i <= hours; i++) {{
+          ctx.lineTo(xOf(i), yOf2(projected[i]));
+        }}
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Projected end-of-day label
+        const projEnd = projected[hours];
+        ctx.fillStyle = 'rgba(57,211,83,0.6)'; ctx.font = '9px sans-serif'; ctx.textAlign = 'right';
+        ctx.fillText('~' + projEnd.toFixed(1) + 'h', W - pad.r - 2, yOf2(projEnd) - 5);
+      }}
+
+      // Dot at current position
       ctx.fillStyle = '#39d353';
       ctx.beginPath();
-      ctx.arc(xOf(todayEnd), yOf(paceToday[todayEnd]), 3, 0, Math.PI * 2);
+      ctx.arc(xOf(todayEnd), yOf2(paceToday[todayEnd]), 3, 0, Math.PI * 2);
       ctx.fill();
     }}
 
@@ -4835,71 +4877,68 @@ document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
     ctx.fillStyle = '#7d8590'; ctx.font = '9px sans-serif'; ctx.textAlign = 'center';
     for (let i = 0; i <= hours; i += 2) ctx.fillText((START_H + i) + '', xOf(i), H - 4);
     ctx.textAlign = 'right';
-    for (let v = 0; v <= maxP; v += 2) {{
-      ctx.fillText(v + 'h', pad.l - 4, yOf(v) + 3);
+    for (let v = 0; v <= maxP2; v += 2) {{
+      ctx.fillText(v + 'h', pad.l - 4, yOf2(v) + 3);
       ctx.strokeStyle = '#21262d'; ctx.lineWidth = 0.5;
-      ctx.beginPath(); ctx.moveTo(pad.l, yOf(v)); ctx.lineTo(W - pad.r, yOf(v)); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(pad.l, yOf2(v)); ctx.lineTo(W - pad.r, yOf2(v)); ctx.stroke();
     }}
+    ctx.restore();
 
     // Save base image for hover redraw
     const baseImage = ctx.getImageData(0, 0, canvasC.width, canvasC.height);
 
     // Hover tooltip
+    const fmtH = (v) => {{ const hrs = Math.floor(v); const m = Math.round((v - hrs) * 60); return hrs > 0 ? hrs + 'h ' + m + 'm' : m + 'm'; }};
     canvasC.style.cursor = 'crosshair';
     canvasC.addEventListener('mousemove', function(e) {{
       const rect = canvasC.getBoundingClientRect();
-      const mx = e.clientX - rect.left;
+      const scaleX = canvasC.width / rect.width;
+      const mx = (e.clientX - rect.left) * scaleX / 2;
       const i = Math.round((mx - pad.l) / cw * hours);
       if (i < 0 || i > hours) {{ ctx.putImageData(baseImage, 0, 0); return; }}
 
       ctx.putImageData(baseImage, 0, 0);
       const h = START_H + i;
-      const tVal = paceToday[i] || 0;
+      const isPast = h <= nowHour;
       const aVal = paceAvg[i] || 0;
+      const tVal = isPast ? (paceToday[i] || 0) : (projected[i] || 0);
       const x = xOf(i);
 
-      // Vertical crosshair line
       ctx.save();
       ctx.scale(2, 2);
+
+      // Vertical crosshair line
       ctx.strokeStyle = 'rgba(255,255,255,0.15)';
       ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, H - pad.b); ctx.stroke();
 
-      // Dots on both lines
-      if (h <= nowHour) {{
-        ctx.fillStyle = '#39d353';
-        ctx.beginPath(); ctx.arc(x, yOf(tVal), 4, 0, Math.PI * 2); ctx.fill();
-      }}
+      // Dots
+      ctx.fillStyle = isPast ? '#39d353' : 'rgba(57,211,83,0.5)';
+      ctx.beginPath(); ctx.arc(x, yOf2(tVal), 4, 0, Math.PI * 2); ctx.fill();
       ctx.fillStyle = '#484f58';
-      ctx.beginPath(); ctx.arc(x, yOf(aVal), 4, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(x, yOf2(aVal), 4, 0, Math.PI * 2); ctx.fill();
 
-      // Tooltip box
-      const fmtH = (v) => {{ const hrs = Math.floor(v); const m = Math.round((v - hrs) * 60); return hrs > 0 ? hrs + 'h ' + m + 'm' : m + 'm'; }};
+      // Tooltip content
       const diff = tVal - aVal;
-      const diffStr = (diff >= 0 ? '+' : '') + fmtH(Math.abs(diff));
       const line1 = h + ':00';
-      const line2 = 'Today: ' + fmtH(tVal);
+      const line2 = (isPast ? 'Today: ' : 'Projected: ') + fmtH(tVal);
       const line3 = 'Avg: ' + fmtH(aVal);
-      const line4 = (h <= nowHour) ? (diff >= 0 ? '▲ ' : '▼ ') + diffStr : '';
+      const line4 = isPast ? ((diff >= 0 ? '▲ ' : '▼ ') + (diff >= 0 ? '+' : '') + fmtH(Math.abs(diff))) : '';
 
       ctx.font = 'bold 10px sans-serif';
-      const tw = Math.max(ctx.measureText(line2).width, ctx.measureText(line3).width, ctx.measureText(line4).width) + 16;
+      const tw = Math.max(ctx.measureText(line2).width, ctx.measureText(line3).width, line4 ? ctx.measureText(line4).width : 0) + 16;
       const th = line4 ? 54 : 42;
       let tx = x + 8;
       if (tx + tw > W - pad.r) tx = x - tw - 8;
       let ty = pad.t + 4;
 
       ctx.fillStyle = 'rgba(22,27,34,0.92)';
-      ctx.strokeStyle = '#30363d';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.roundRect(tx, ty, tw, th, 4);
-      ctx.fill(); ctx.stroke();
+      ctx.strokeStyle = '#30363d'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.roundRect(tx, ty, tw, th, 4); ctx.fill(); ctx.stroke();
 
-      ctx.fillStyle = '#e6edf3'; ctx.font = 'bold 10px sans-serif';
-      ctx.textAlign = 'left';
+      ctx.fillStyle = '#e6edf3'; ctx.font = 'bold 10px sans-serif'; ctx.textAlign = 'left';
       ctx.fillText(line1, tx + 6, ty + 13);
-      ctx.fillStyle = '#39d353'; ctx.font = '10px sans-serif';
+      ctx.fillStyle = isPast ? '#39d353' : 'rgba(57,211,83,0.6)'; ctx.font = '10px sans-serif';
       ctx.fillText(line2, tx + 6, ty + 26);
       ctx.fillStyle = '#7d8590';
       ctx.fillText(line3, tx + 6, ty + 38);
