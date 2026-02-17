@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from fastapi.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
@@ -178,7 +179,7 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
     # Paths that never require authentication
     PUBLIC_PATHS = {"/", "/health", "/follow-ups/webhook/send"}
     # Path prefixes that never require authentication (health sub-routes)
-    PUBLIC_PREFIXES = ("/health/",)
+    PUBLIC_PREFIXES = ("/health/", "/dashboard/")
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
@@ -3927,3 +3928,363 @@ async def list_summary_book_projects():
     except Exception as e:
         logger.error(f"Error listing summary book projects: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# DASHBOARD - Visual widgets (public, no auth required)
+# ============================================================================
+
+@app.get("/dashboard/activity-heatmap", response_class=HTMLResponse)
+async def activity_heatmap():
+    """
+    GitHub-style contribution heatmap showing daily active screen time.
+    Embeddable in Notion via /embed block.
+    Data sourced from ActivityWatch via activity_summaries table.
+    """
+    import json as _json
+
+    try:
+        # Query last 365 days of activity summaries
+        result = supabase.table("activity_summaries").select(
+            "date, total_active_time, productive_time, distracting_time"
+        ).order("date", desc=False).limit(365).execute()
+
+        # Build date → hours map
+        data = {}
+        for row in result.data:
+            active_seconds = row.get("total_active_time") or 0
+            data[row["date"]] = round(active_seconds / 3600, 2)
+
+        data_json = _json.dumps(data)
+    except Exception as e:
+        logger.error(f"Failed to fetch activity data for heatmap: {e}")
+        data_json = "{}"
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Activity Heatmap</title>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: #0d1117;
+    color: #c9d1d9;
+    padding: 20px;
+    min-height: 100vh;
+  }}
+  .container {{ max-width: 960px; margin: 0 auto; }}
+  h1 {{
+    font-size: 16px;
+    font-weight: 600;
+    margin-bottom: 4px;
+    color: #e6edf3;
+  }}
+  .subtitle {{
+    font-size: 12px;
+    color: #7d8590;
+    margin-bottom: 16px;
+  }}
+  .stats {{
+    display: flex;
+    gap: 24px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }}
+  .stat {{
+    text-align: center;
+  }}
+  .stat-value {{
+    font-size: 24px;
+    font-weight: 700;
+    color: #e6edf3;
+  }}
+  .stat-label {{
+    font-size: 11px;
+    color: #7d8590;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }}
+  .heatmap-scroll {{
+    overflow-x: auto;
+    padding-bottom: 8px;
+  }}
+  .heatmap {{
+    display: inline-grid;
+    grid-template-rows: repeat(7, 13px);
+    grid-auto-flow: column;
+    grid-auto-columns: 13px;
+    gap: 3px;
+  }}
+  .day {{
+    width: 13px;
+    height: 13px;
+    border-radius: 2px;
+    outline: 1px solid rgba(27, 31, 35, 0.06);
+    outline-offset: -1px;
+  }}
+  .day:hover {{
+    outline: 2px solid #58a6ff;
+    outline-offset: -1px;
+    cursor: pointer;
+  }}
+  .lvl-0 {{ background-color: #161b22; }}
+  .lvl-1 {{ background-color: #0e4429; }}
+  .lvl-2 {{ background-color: #006d32; }}
+  .lvl-3 {{ background-color: #26a641; }}
+  .lvl-4 {{ background-color: #39d353; }}
+  .month-labels {{
+    display: flex;
+    font-size: 10px;
+    color: #7d8590;
+    margin-bottom: 4px;
+    padding-left: 0;
+  }}
+  .month-label {{
+    text-align: left;
+  }}
+  .day-labels {{
+    display: inline-grid;
+    grid-template-rows: repeat(7, 13px);
+    gap: 3px;
+    margin-right: 6px;
+    font-size: 10px;
+    color: #7d8590;
+    vertical-align: top;
+  }}
+  .day-label {{
+    height: 13px;
+    line-height: 13px;
+  }}
+  .legend {{
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-top: 12px;
+    font-size: 11px;
+    color: #7d8590;
+  }}
+  .legend .day {{
+    outline: none;
+  }}
+  .tooltip {{
+    position: fixed;
+    background: #1c2128;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 12px;
+    color: #c9d1d9;
+    pointer-events: none;
+    z-index: 1000;
+    display: none;
+    white-space: nowrap;
+  }}
+  .tooltip strong {{
+    color: #e6edf3;
+  }}
+  .heatmap-wrapper {{
+    display: flex;
+    align-items: flex-start;
+  }}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Activity</h1>
+  <div class="subtitle" id="subtitle"></div>
+  <div class="stats" id="stats"></div>
+  <div class="month-labels" id="month-labels"></div>
+  <div class="heatmap-wrapper">
+    <div class="day-labels" id="day-labels"></div>
+    <div class="heatmap-scroll">
+      <div class="heatmap" id="heatmap"></div>
+    </div>
+  </div>
+  <div class="legend">
+    <span>Less</span>
+    <div class="day lvl-0"></div>
+    <div class="day lvl-1"></div>
+    <div class="day lvl-2"></div>
+    <div class="day lvl-3"></div>
+    <div class="day lvl-4"></div>
+    <span>More</span>
+  </div>
+</div>
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+const DATA = {data_json};
+const DAYS = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+function getLevel(hours) {{
+  if (!hours || hours < 0.1) return 0;
+  if (hours < 2) return 1;
+  if (hours < 4) return 2;
+  if (hours < 6) return 3;
+  return 4;
+}}
+
+function formatDate(d) {{
+  return d.toLocaleDateString('en-US', {{ weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }});
+}}
+
+function formatHours(h) {{
+  if (!h || h < 0.01) return 'No activity';
+  const hrs = Math.floor(h);
+  const mins = Math.round((h - hrs) * 60);
+  if (hrs === 0) return mins + ' min';
+  if (mins === 0) return hrs + 'h';
+  return hrs + 'h ' + mins + 'm';
+}}
+
+function render() {{
+  const heatmap = document.getElementById('heatmap');
+  const monthLabels = document.getElementById('month-labels');
+  const dayLabels = document.getElementById('day-labels');
+  const statsEl = document.getElementById('stats');
+  const subtitleEl = document.getElementById('subtitle');
+  const tooltip = document.getElementById('tooltip');
+
+  // Calculate date range: go back ~52 weeks from today
+  const today = new Date();
+  today.setHours(0,0,0,0);
+  const todayDay = (today.getDay() + 6) % 7; // Mon=0
+
+  // Start from the Monday ~52 weeks ago
+  const start = new Date(today);
+  start.setDate(start.getDate() - (52 * 7) - todayDay);
+
+  // Day labels
+  DAYS.forEach((d, i) => {{
+    const el = document.createElement('div');
+    el.className = 'day-label';
+    el.textContent = (i % 2 === 0) ? d : '';
+    dayLabels.appendChild(el);
+  }});
+
+  // Build grid
+  let totalHours = 0;
+  let activeDays = 0;
+  let todayHours = 0;
+  let weekHours = 0;
+  let streak = 0;
+  let countingStreak = true;
+  const cells = [];
+
+  const cursor = new Date(start);
+  const weekStartMonth = [];
+  let lastMonth = -1;
+
+  while (cursor <= today) {{
+    const dayOfWeek = (cursor.getDay() + 6) % 7; // Mon=0
+    const dateStr = cursor.toISOString().split('T')[0];
+    const hours = DATA[dateStr] || 0;
+
+    // Track stats
+    totalHours += hours;
+    if (hours > 0.1) activeDays++;
+
+    // Today
+    const diffDays = Math.round((today - cursor) / 86400000);
+    if (diffDays === 0) todayHours = hours;
+    if (diffDays < 7) weekHours += hours;
+
+    // Streak (count backwards from today)
+    if (countingStreak) {{
+      if (diffDays <= streak + 1 && hours > 0.1) {{
+        if (diffDays === streak || diffDays === streak + 1) streak = diffDays + 1;
+      }} else if (diffDays > 0) {{
+        countingStreak = false;
+      }}
+    }}
+
+    // Track month boundaries
+    if (dayOfWeek === 0) {{
+      weekStartMonth.push({{ month: cursor.getMonth(), date: new Date(cursor) }});
+    }}
+
+    const el = document.createElement('div');
+    el.className = 'day lvl-' + getLevel(hours);
+    el.dataset.date = dateStr;
+    el.dataset.hours = hours;
+    heatmap.appendChild(el);
+
+    cursor.setDate(cursor.getDate() + 1);
+  }}
+
+  // Fill remaining days in the last week with empty cells
+  const lastDayOfWeek = (today.getDay() + 6) % 7;
+  for (let i = lastDayOfWeek + 1; i < 7; i++) {{
+    const el = document.createElement('div');
+    el.className = 'day lvl-0';
+    el.style.visibility = 'hidden';
+    heatmap.appendChild(el);
+  }}
+
+  // Month labels
+  let monthHTML = '';
+  let prevMonth = -1;
+  const weekWidth = 16; // 13px + 3px gap
+  weekStartMonth.forEach((w, i) => {{
+    if (w.month !== prevMonth) {{
+      const left = i * weekWidth;
+      monthHTML += '<span class="month-label" style="position:absolute;left:' + left + 'px">' + MONTHS[w.month] + '</span>';
+      prevMonth = w.month;
+    }}
+  }});
+  monthLabels.style.position = 'relative';
+  monthLabels.style.height = '16px';
+  monthLabels.style.marginLeft = (dayLabels.offsetWidth + 6) + 'px';
+  monthLabels.innerHTML = monthHTML;
+
+  // Streak recalc (simple: count consecutive days back from today with activity)
+  streak = 0;
+  for (let i = 0; i <= 365; i++) {{
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    const ds = d.toISOString().split('T')[0];
+    if ((DATA[ds] || 0) > 0.1) streak++;
+    else break;
+  }}
+
+  // Stats
+  const dateKeys = Object.keys(DATA).sort();
+  const totalDays = dateKeys.length;
+  subtitleEl.textContent = totalDays + ' days of tracking';
+
+  statsEl.innerHTML = `
+    <div class="stat"><div class="stat-value">${{formatHours(todayHours)}}</div><div class="stat-label">Today</div></div>
+    <div class="stat"><div class="stat-value">${{formatHours(weekHours)}}</div><div class="stat-label">This Week</div></div>
+    <div class="stat"><div class="stat-value">${{formatHours(totalHours / (totalDays || 1))}}</div><div class="stat-label">Daily Avg</div></div>
+    <div class="stat"><div class="stat-value">${{streak}}d</div><div class="stat-label">Streak</div></div>
+    <div class="stat"><div class="stat-value">${{activeDays}}</div><div class="stat-label">Active Days</div></div>
+  `;
+
+  // Tooltips
+  heatmap.addEventListener('mouseover', (e) => {{
+    if (e.target.classList.contains('day') && e.target.dataset.date) {{
+      const d = new Date(e.target.dataset.date + 'T00:00:00');
+      const h = parseFloat(e.target.dataset.hours) || 0;
+      tooltip.innerHTML = '<strong>' + formatHours(h) + '</strong> on ' + formatDate(d);
+      tooltip.style.display = 'block';
+    }}
+  }});
+  heatmap.addEventListener('mousemove', (e) => {{
+    tooltip.style.left = (e.clientX + 12) + 'px';
+    tooltip.style.top = (e.clientY - 30) + 'px';
+  }});
+  heatmap.addEventListener('mouseout', () => {{
+    tooltip.style.display = 'none';
+  }});
+}}
+
+render();
+</script>
+</body>
+</html>"""
+
+    return HTMLResponse(content=html)
