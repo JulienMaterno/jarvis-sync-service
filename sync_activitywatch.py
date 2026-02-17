@@ -15,6 +15,9 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
 from collections import defaultdict
 
+# User's local timezone for day boundary calculations
+SGT = timezone(timedelta(hours=8))
+
 from lib.activitywatch_client import (
     ActivityWatchClient,
     parse_window_event,
@@ -110,16 +113,28 @@ class ActivityWatchSync:
             
             now = datetime.now(timezone.utc)
             default_start = now - timedelta(hours=hours)
-            
+
+            # Always fetch from start of current SGT day to avoid
+            # AW truncating in-progress events at the time window boundary
+            sgt_today_start = datetime.combine(
+                now.astimezone(SGT).date(),
+                datetime.min.time(),
+                tzinfo=SGT,
+            )
+
             for bucket_id, bucket_info in buckets.items():
                 bucket_type = bucket_info.get("type", "unknown")
                 hostname = bucket_info.get("hostname", "unknown")
-                
-                # Determine start time for this bucket
-                start_time = last_sync_times.get(bucket_id, default_start)
-                if full_sync:
-                    start_time = default_start
-                
+
+                # Use the earlier of: start-of-SGT-day or default_start
+                # This ensures we always re-fetch today's events untruncated
+                start_time = min(sgt_today_start, default_start)
+                if not full_sync:
+                    last_sync = last_sync_times.get(bucket_id)
+                    if last_sync and last_sync < sgt_today_start:
+                        # Haven't synced today yet — use last_sync to catch yesterday's tail
+                        start_time = last_sync
+
                 logger.info(f"Syncing bucket {bucket_id} from {start_time}")
                 
                 try:
@@ -135,8 +150,12 @@ class ActivityWatchSync:
                         new_sync_times[bucket_id] = now
                         continue
                     
+                    # Deduplicate AFK events (AW has a known bug creating dupes)
+                    if bucket_type == "afkstatus":
+                        events = self._deduplicate_events(events)
+
                     logger.info(f"Found {len(events)} events in {bucket_id}")
-                    
+
                     # Process events based on bucket type
                     records = []
                     for event in events:
@@ -159,8 +178,9 @@ class ActivityWatchSync:
             # Save sync times
             await self.save_last_sync_times(new_sync_times)
             
-            # Generate daily summary
-            await self._update_daily_summary(now.date())
+            # Generate daily summary using local (SGT) date
+            local_now = now.astimezone(SGT)
+            await self._update_daily_summary(local_now.date())
             
             await log_sync_event(
                 "activitywatch_sync",
@@ -181,6 +201,25 @@ class ActivityWatchSync:
             await log_sync_event("activitywatch_sync", "error", str(e))
             raise
     
+    @staticmethod
+    def _deduplicate_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Deduplicate AFK events from AW's heartbeat merging bug.
+
+        AW creates multiple events at the same timestamp with different IDs.
+        Keep only the event with the longest duration per (timestamp, status).
+        """
+        best: Dict[tuple, Dict[str, Any]] = {}
+        for e in events:
+            ts = e.get("timestamp", "")[:19]
+            status = e.get("data", {}).get("status", "")
+            key = (ts, status)
+            if key not in best or e.get("duration", 0) > best[key].get("duration", 0):
+                best[key] = e
+        deduped = list(best.values())
+        if len(deduped) < len(events):
+            logger.info(f"Deduplicated AFK events: {len(events)} -> {len(deduped)}")
+        return deduped
+
     def _process_event(
         self,
         event: Dict[str, Any],
@@ -242,22 +281,31 @@ class ActivityWatchSync:
                 logger.error(f"Failed to upsert batch {i}: {e}")
     
     async def _update_daily_summary(self, date: datetime.date):
-        """Update or create daily summary for the given date."""
+        """Update or create daily summary for the given date (in SGT)."""
         try:
-            # Query events for the date
-            start = datetime.combine(date, datetime.min.time(), tzinfo=timezone.utc)
+            # Query events for the date using SGT day boundaries
+            start = datetime.combine(date, datetime.min.time(), tzinfo=SGT)
             end = start + timedelta(days=1)
             
-            result = supabase.table("activity_events").select("*").gte(
-                "timestamp", start.isoformat()
-            ).lt(
-                "timestamp", end.isoformat()
-            ).execute()
-            
-            if not result.data:
+            # Fetch all events for the day (paginate to avoid 1000-row default limit)
+            events = []
+            page_size = 1000
+            offset = 0
+            while True:
+                result = supabase.table("activity_events").select("*").gte(
+                    "timestamp", start.isoformat()
+                ).lt(
+                    "timestamp", end.isoformat()
+                ).range(offset, offset + page_size - 1).execute()
+                if not result.data:
+                    break
+                events.extend(result.data)
+                if len(result.data) < page_size:
+                    break
+                offset += page_size
+
+            if not events:
                 return
-            
-            events = result.data
             
             # Get unique hostnames
             hostnames = set(e.get("hostname") for e in events if e.get("hostname"))
@@ -288,17 +336,54 @@ class ActivityWatchSync:
             afk_events = [e for e in events if e.get("bucket_type") == "afkstatus"]
             web_events = [e for e in events if e.get("bucket_type") == "web.tab.current"]
             
-            # Calculate AFK time
+            # Deduplicate AFK events from Supabase (in case old dupes exist)
+            seen_afk: Dict[tuple, Dict[str, Any]] = {}
+            for e in afk_events:
+                ts = e.get("timestamp", "")[:19]
+                status = e.get("afk_status", "")
+                key = (ts, status)
+                if key not in seen_afk or e.get("duration", 0) > seen_afk[key].get("duration", 0):
+                    seen_afk[key] = e
+            afk_events = list(seen_afk.values())
+
+            # Calculate raw AFK/active time
             total_afk = sum(
-                e.get("duration", 0) 
-                for e in afk_events 
+                e.get("duration", 0)
+                for e in afk_events
                 if e.get("afk_status") == "afk"
             )
-            total_active_from_afk = sum(
+            raw_active = sum(
                 e.get("duration", 0)
                 for e in afk_events
                 if e.get("afk_status") == "not-afk"
             )
+
+            # Calculate merged sessions: bridge short AFK gaps (<15 min)
+            # This gives "working time" that includes reading/thinking
+            SESSION_GAP = 15 * 60  # 15 minutes
+            not_afk_events = sorted(
+                [e for e in afk_events if e.get("afk_status") == "not-afk"],
+                key=lambda e: e.get("timestamp", ""),
+            )
+            total_active_from_afk = 0.0
+            session_start = None
+            session_end = None
+            for e in not_afk_events:
+                ts = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
+                end = ts + timedelta(seconds=e.get("duration", 0))
+                if session_start is None:
+                    session_start = ts
+                    session_end = end
+                else:
+                    gap = (ts - session_end).total_seconds()
+                    if gap <= SESSION_GAP:
+                        session_end = max(session_end, end)
+                    else:
+                        total_active_from_afk += (session_end - session_start).total_seconds()
+                        session_start = ts
+                        session_end = end
+            if session_start is not None:
+                total_active_from_afk += (session_end - session_start).total_seconds()
             
             # Calculate app usage
             app_time = defaultdict(float)
@@ -360,11 +445,11 @@ class ActivityWatchSync:
                     distracting_time += duration
                 # Note: neutral web time not added to avoid double-counting
             
-            # Calculate hourly breakdown
+            # Calculate hourly breakdown (in local time)
             hourly = defaultdict(lambda: {"active": 0, "afk": 0})
             for e in afk_events:
                 ts = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
-                hour = ts.hour
+                hour = ts.astimezone(SGT).hour
                 if e.get("afk_status") == "afk":
                     hourly[hour]["afk"] += e.get("duration", 0)
                 else:
@@ -394,8 +479,8 @@ class ActivityWatchSync:
             return None
     
     async def get_today_summary(self) -> Optional[Dict[str, Any]]:
-        """Get or generate summary for today."""
-        today = datetime.now(timezone.utc).date()
+        """Get or generate summary for today (SGT)."""
+        today = datetime.now(SGT).date()
         
         # Try to get existing summary
         result = supabase.table("activity_summaries").select("*").eq(
