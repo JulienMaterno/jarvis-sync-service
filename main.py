@@ -4006,54 +4006,53 @@ async def activity_heatmap():
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
     background: #191919;
     color: #c9d1d9;
-    padding: 20px;
-    min-height: 100vh;
+    padding: 12px 16px;
   }}
   .container {{ max-width: 960px; margin: 0 auto; }}
-  .section {{ margin-bottom: 32px; }}
+  .section {{ margin-bottom: 18px; }}
   h1 {{
-    font-size: 16px;
+    font-size: 13px;
     font-weight: 600;
-    margin-bottom: 4px;
+    margin-bottom: 2px;
     color: #e6edf3;
   }}
   .subtitle {{
-    font-size: 12px;
+    font-size: 10px;
     color: #7d8590;
-    margin-bottom: 16px;
+    margin-bottom: 6px;
   }}
   .stats {{
     display: flex;
-    gap: 24px;
-    margin-bottom: 16px;
+    gap: 20px;
+    margin-bottom: 8px;
     flex-wrap: wrap;
   }}
   .stat {{ text-align: center; }}
   .stat-value {{
-    font-size: 24px;
+    font-size: 18px;
     font-weight: 700;
     color: #e6edf3;
   }}
   .stat-label {{
-    font-size: 11px;
+    font-size: 9px;
     color: #7d8590;
     text-transform: uppercase;
     letter-spacing: 0.5px;
   }}
   .heatmap-scroll {{
     overflow-x: auto;
-    padding-bottom: 8px;
+    padding-bottom: 4px;
   }}
   .heatmap {{
     display: inline-grid;
-    grid-template-rows: repeat(7, 13px);
+    grid-template-rows: repeat(7, 10px);
     grid-auto-flow: column;
-    grid-auto-columns: 13px;
-    gap: 3px;
+    grid-auto-columns: 10px;
+    gap: 2px;
   }}
   .day {{
-    width: 13px;
-    height: 13px;
+    width: 10px;
+    height: 10px;
     border-radius: 2px;
     outline: 1px solid rgba(27, 31, 35, 0.06);
     outline-offset: -1px;
@@ -4083,34 +4082,34 @@ async def activity_heatmap():
   .orange .lvl-4 {{ background-color: #f0883e; }}
   .month-labels {{
     display: flex;
-    font-size: 10px;
+    font-size: 9px;
     color: #7d8590;
-    margin-bottom: 4px;
+    margin-bottom: 2px;
     padding-left: 0;
   }}
   .month-label {{ text-align: left; }}
   .day-labels {{
     display: inline-grid;
-    grid-template-rows: repeat(7, 13px);
-    gap: 3px;
-    margin-right: 6px;
-    font-size: 10px;
+    grid-template-rows: repeat(7, 10px);
+    gap: 2px;
+    margin-right: 4px;
+    font-size: 9px;
     color: #7d8590;
     vertical-align: top;
   }}
   .day-label {{
-    height: 13px;
-    line-height: 13px;
+    height: 10px;
+    line-height: 10px;
   }}
   .legend {{
     display: flex;
     align-items: center;
-    gap: 4px;
-    margin-top: 12px;
-    font-size: 11px;
+    gap: 3px;
+    margin-top: 6px;
+    font-size: 9px;
     color: #7d8590;
   }}
-  .legend .day {{ outline: none; }}
+  .legend .day {{ outline: none; width: 10px; height: 10px; }}
   .tooltip {{
     position: fixed;
     background: #1c2128;
@@ -4304,7 +4303,7 @@ function renderHeatmap(config) {{
 
   let monthHTML = '';
   let prevMonth = -1;
-  const weekWidth = 16;
+  const weekWidth = 12;
   weekStartMonth.forEach((w, i) => {{
     if (w.month !== prevMonth) {{
       const left = i * weekWidth;
