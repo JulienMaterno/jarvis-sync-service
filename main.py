@@ -4128,6 +4128,180 @@ async def activity_heatmap():
     display: flex;
     align-items: flex-start;
   }}
+  /* Day detail modal */
+  .modal-overlay {{
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.6);
+    z-index: 2000;
+    display: none;
+    align-items: center;
+    justify-content: center;
+  }}
+  .modal-overlay.active {{ display: flex; }}
+  .modal {{
+    background: #1c2128;
+    border: 1px solid #30363d;
+    border-radius: 10px;
+    padding: 20px 24px;
+    width: 90%;
+    max-width: 520px;
+    max-height: 85vh;
+    overflow-y: auto;
+    color: #c9d1d9;
+  }}
+  .modal-header {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+  }}
+  .modal-header h2 {{
+    font-size: 16px;
+    color: #e6edf3;
+    font-weight: 600;
+  }}
+  .modal-close {{
+    background: none;
+    border: none;
+    color: #7d8590;
+    font-size: 20px;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 4px;
+  }}
+  .modal-close:hover {{ background: #30363d; color: #e6edf3; }}
+  .modal-stats {{
+    display: flex;
+    gap: 16px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }}
+  .modal-stat {{
+    background: #161b22;
+    border-radius: 6px;
+    padding: 8px 12px;
+    flex: 1;
+    min-width: 80px;
+    text-align: center;
+  }}
+  .modal-stat-value {{
+    font-size: 18px;
+    font-weight: 700;
+    color: #e6edf3;
+  }}
+  .modal-stat-label {{
+    font-size: 9px;
+    color: #7d8590;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }}
+  .modal h3 {{
+    font-size: 12px;
+    color: #7d8590;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin: 14px 0 8px;
+  }}
+  .hourly-chart {{
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+    height: 80px;
+    padding: 0 2px;
+  }}
+  .hourly-bar-wrap {{
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    height: 100%;
+    justify-content: flex-end;
+  }}
+  .hourly-bar {{
+    width: 100%;
+    min-width: 8px;
+    border-radius: 2px 2px 0 0;
+    background: #238636;
+    transition: background 0.15s;
+  }}
+  .hourly-bar:hover {{ background: #39d353; }}
+  .hourly-label {{
+    font-size: 8px;
+    color: #7d8590;
+    margin-top: 2px;
+  }}
+  .app-row {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+  }}
+  .app-name {{
+    font-size: 12px;
+    color: #c9d1d9;
+    width: 100px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }}
+  .app-bar-bg {{
+    flex: 1;
+    height: 14px;
+    background: #161b22;
+    border-radius: 3px;
+    overflow: hidden;
+  }}
+  .app-bar-fill {{
+    height: 100%;
+    border-radius: 3px;
+    background: #238636;
+  }}
+  .app-pct {{
+    font-size: 11px;
+    color: #7d8590;
+    width: 36px;
+    text-align: right;
+    flex-shrink: 0;
+  }}
+  .app-dur {{
+    font-size: 11px;
+    color: #7d8590;
+    width: 48px;
+    text-align: right;
+    flex-shrink: 0;
+  }}
+  .site-row {{ display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }}
+  .site-name {{
+    font-size: 12px;
+    color: #c9d1d9;
+    width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }}
+  .site-bar-bg {{
+    flex: 1;
+    height: 12px;
+    background: #161b22;
+    border-radius: 3px;
+    overflow: hidden;
+  }}
+  .site-bar-fill {{
+    height: 100%;
+    border-radius: 3px;
+    background: #1a7af8;
+  }}
+  .site-dur {{
+    font-size: 11px;
+    color: #7d8590;
+    width: 48px;
+    text-align: right;
+    flex-shrink: 0;
+  }}
+  .no-data {{ color: #7d8590; font-size: 13px; text-align: center; padding: 20px; }}
 </style>
 </head>
 <body>
@@ -4204,6 +4378,15 @@ async def activity_heatmap():
 
 </div>
 <div class="tooltip" id="tooltip"></div>
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal" id="modal">
+    <div class="modal-header">
+      <h2 id="modal-title">Loading...</h2>
+      <button class="modal-close" id="modal-close">&times;</button>
+    </div>
+    <div id="modal-body"></div>
+  </div>
+</div>
 
 <script>
 const ACTIVITY_DATA = {activity_json};
@@ -4446,8 +4629,155 @@ renderHeatmap({{
   }},
   formatValue: formatMeetings,
 }});
+
+// ---- Day detail modal ----
+const overlay = document.getElementById('modal-overlay');
+const modalTitle = document.getElementById('modal-title');
+const modalBody = document.getElementById('modal-body');
+
+document.getElementById('modal-close').addEventListener('click', () => {{
+  overlay.classList.remove('active');
+}});
+overlay.addEventListener('click', (e) => {{
+  if (e.target === overlay) overlay.classList.remove('active');
+}});
+
+function fmtSec(s) {{
+  if (!s || s < 60) return '<1m';
+  const h = Math.floor(s / 3600);
+  const m = Math.round((s % 3600) / 60);
+  if (h === 0) return m + 'm';
+  if (m === 0) return h + 'h';
+  return h + 'h ' + m + 'm';
+}}
+
+function cleanApp(name) {{
+  return name.replace('.exe', '').replace('.Root', '');
+}}
+
+function showDayDetail(dateStr) {{
+  const d = new Date(dateStr + 'T00:00:00');
+  modalTitle.textContent = formatDate(d);
+  modalBody.innerHTML = '<div class="no-data">Loading...</div>';
+  overlay.classList.add('active');
+
+  const baseUrl = window.location.origin;
+  fetch(baseUrl + '/api/dashboard/day-detail?date=' + dateStr)
+    .then(r => r.json())
+    .then(data => {{
+      if (!data.found) {{
+        modalBody.innerHTML = '<div class="no-data">No activity data for this day.</div>';
+        return;
+      }}
+
+      let html = '';
+
+      // Summary stats
+      html += '<div class="modal-stats">';
+      html += '<div class="modal-stat"><div class="modal-stat-value">' + fmtSec(data.total_active_time) + '</div><div class="modal-stat-label">Working Time</div></div>';
+      html += '<div class="modal-stat"><div class="modal-stat-value">' + fmtSec(data.productive_time) + '</div><div class="modal-stat-label">Productive</div></div>';
+      html += '<div class="modal-stat"><div class="modal-stat-value">' + fmtSec(data.distracting_time) + '</div><div class="modal-stat-label">Distracting</div></div>';
+      html += '</div>';
+
+      // Hourly breakdown chart
+      const hourly = data.hourly_breakdown || [];
+      if (hourly.length > 0) {{
+        html += '<h3>Hours of the Day</h3>';
+        const maxActive = Math.max(...hourly.map(h => h.active || 0), 1);
+        // Fill all 24 hours
+        const byHour = {{}};
+        hourly.forEach(h => {{ byHour[h.hour] = h; }});
+        // Find range of active hours
+        const activeHours = hourly.filter(h => (h.active || 0) > 0).map(h => h.hour);
+        const minH = Math.max(0, Math.min(...activeHours) - 1);
+        const maxH = Math.min(23, Math.max(...activeHours) + 1);
+
+        html += '<div class="hourly-chart">';
+        for (let i = minH; i <= maxH; i++) {{
+          const h = byHour[i] || {{ active: 0, afk: 0 }};
+          const pct = Math.max(2, (h.active / maxActive) * 100);
+          const barH = h.active > 0 ? pct : 0;
+          html += '<div class="hourly-bar-wrap">';
+          html += '<div class="hourly-bar" style="height:' + barH + '%" title="' + i + ':00 — ' + fmtSec(h.active) + '"></div>';
+          html += '<div class="hourly-label">' + (i % 2 === 0 ? i : '') + '</div>';
+          html += '</div>';
+        }}
+        html += '</div>';
+      }}
+
+      // Top apps
+      const apps = (data.top_apps || []).filter(a => a.app !== 'LockApp.exe').slice(0, 8);
+      if (apps.length > 0) {{
+        html += '<h3>Applications</h3>';
+        const maxApp = apps[0].duration || 1;
+        apps.forEach(a => {{
+          const pct = Math.round((a.duration / maxApp) * 100);
+          html += '<div class="app-row">';
+          html += '<div class="app-name" title="' + a.app + '">' + cleanApp(a.app) + '</div>';
+          html += '<div class="app-bar-bg"><div class="app-bar-fill" style="width:' + pct + '%"></div></div>';
+          html += '<div class="app-dur">' + fmtSec(a.duration) + '</div>';
+          html += '</div>';
+        }});
+      }}
+
+      // Top sites
+      const sites = (data.top_sites || []).filter(s => s.domain !== 'newtab').slice(0, 8);
+      if (sites.length > 0) {{
+        html += '<h3>Websites</h3>';
+        const maxSite = sites[0].duration || 1;
+        sites.forEach(s => {{
+          const pct = Math.round((s.duration / maxSite) * 100);
+          html += '<div class="site-row">';
+          html += '<div class="site-name" title="' + s.domain + '">' + s.domain + '</div>';
+          html += '<div class="site-bar-bg"><div class="site-bar-fill" style="width:' + pct + '%"></div></div>';
+          html += '<div class="site-dur">' + fmtSec(s.duration) + '</div>';
+          html += '</div>';
+        }});
+      }}
+
+      modalBody.innerHTML = html;
+    }})
+    .catch(() => {{
+      modalBody.innerHTML = '<div class="no-data">Failed to load details.</div>';
+    }});
+}}
+
+// Click handler on activity heatmap cells only
+document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
+  if (e.target.classList.contains('day') && e.target.dataset.date) {{
+    showDayDetail(e.target.dataset.date);
+  }}
+}});
 </script>
 </body>
 </html>"""
 
     return HTMLResponse(content=html)
+
+
+@app.get("/api/dashboard/day-detail")
+async def day_detail(date: str):
+    """Return activity summary detail for a single date (YYYY-MM-DD)."""
+    try:
+        result = supabase.table("activity_summaries").select("*").eq(
+            "date", date
+        ).limit(1).execute()
+
+        if not result.data:
+            return {"date": date, "found": False}
+
+        row = result.data[0]
+        return {
+            "date": date,
+            "found": True,
+            "total_active_time": row.get("total_active_time", 0),
+            "total_afk_time": row.get("total_afk_time", 0),
+            "productive_time": row.get("productive_time", 0),
+            "distracting_time": row.get("distracting_time", 0),
+            "top_apps": row.get("top_apps", []),
+            "top_sites": row.get("top_sites", []),
+            "hourly_breakdown": row.get("hourly_breakdown", []),
+        }
+    except Exception as e:
+        logger.error(f"Day detail error: {e}")
+        return {"date": date, "found": False, "error": str(e)}
