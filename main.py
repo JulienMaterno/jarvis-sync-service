@@ -3952,16 +3952,22 @@ async def activity_heatmap():
     # --- Fetch activity data ---
     try:
         result = supabase.table("activity_summaries").select(
-            "date, total_active_time, productive_time, distracting_time"
+            "date, total_active_time, productive_time, distracting_time, hourly_breakdown"
         ).order("date", desc=False).limit(365).execute()
         activity_data = {}
+        hourly_by_date = {}
         for row in result.data:
             active_seconds = row.get("total_active_time") or 0
             activity_data[row["date"]] = round(active_seconds / 3600, 2)
+            hb = row.get("hourly_breakdown")
+            if hb:
+                hourly_by_date[row["date"]] = hb
         activity_json = _json.dumps(activity_data)
+        hourly_json = _json.dumps(hourly_by_date)
     except Exception as e:
         logger.error(f"Failed to fetch activity data for heatmap: {e}")
         activity_json = "{}"
+        hourly_json = "{}"
 
     # --- Fetch meditation data ---
     try:
@@ -4302,6 +4308,21 @@ async def activity_heatmap():
     flex-shrink: 0;
   }}
   .no-data {{ color: #7d8590; font-size: 13px; text-align: center; padding: 20px; }}
+  .viz-option {{ background: #161b22; border-radius: 8px; padding: 12px 14px; }}
+  .viz-label {{
+    font-size: 11px;
+    font-weight: 600;
+    color: #7d8590;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 8px;
+  }}
+  .tl-row {{ display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }}
+  .tl-label {{ font-size: 10px; color: #7d8590; width: 36px; text-align: right; flex-shrink: 0; }}
+  .tl-strip {{ display: flex; gap: 1px; flex: 1; height: 14px; }}
+  .tl-cell {{ flex: 1; border-radius: 2px; }}
+  .tl-hours-label {{ font-size: 9px; color: #484f58; display: flex; gap: 1px; margin-left: 42px; }}
+  .tl-hours-label span {{ flex: 1; text-align: center; }}
 </style>
 </head>
 <body>
@@ -4376,6 +4397,41 @@ async def activity_heatmap():
     </div>
   </div>
 
+  <!-- Today's Work Curve — Visualization Options -->
+  <div class="section" id="curve-section" style="margin-top:24px;">
+    <h1>Today's Work Curve</h1>
+    <div class="subtitle">Comparing today to your recent pattern (past 4 weeks)</div>
+
+    <!-- Option A: Cumulative Line Chart -->
+    <div class="viz-option" style="margin-top:14px;">
+      <div class="viz-label">A — Cumulative Hours</div>
+      <canvas id="viz-cumulative" height="120" style="width:100%;"></canvas>
+    </div>
+
+    <!-- Option B: Hourly Bars (today vs average) -->
+    <div class="viz-option" style="margin-top:18px;">
+      <div class="viz-label">B — Hourly Bars (Today vs Avg)</div>
+      <div id="viz-bars" style="display:flex;align-items:flex-end;gap:1px;height:90px;padding:0 2px;"></div>
+      <div id="viz-bars-labels" style="display:flex;gap:1px;padding:0 2px;"></div>
+      <div style="display:flex;gap:12px;margin-top:4px;font-size:9px;color:#7d8590;">
+        <span><span style="color:#39d353;">&#9632;</span> Today</span>
+        <span><span style="color:#484f58;">&#9632;</span> 4-week avg</span>
+      </div>
+    </div>
+
+    <!-- Option C: Pace Line -->
+    <div class="viz-option" style="margin-top:18px;">
+      <div class="viz-label">C — Pace Tracker</div>
+      <canvas id="viz-pace" height="110" style="width:100%;"></canvas>
+    </div>
+
+    <!-- Option D: Recent Days Timeline -->
+    <div class="viz-option" style="margin-top:18px;">
+      <div class="viz-label">D — Weekly Timeline</div>
+      <div id="viz-timeline"></div>
+    </div>
+  </div>
+
 </div>
 <div class="tooltip" id="tooltip"></div>
 <div class="modal-overlay" id="modal-overlay">
@@ -4390,6 +4446,7 @@ async def activity_heatmap():
 
 <script>
 const ACTIVITY_DATA = {activity_json};
+const HOURLY_DATA = {hourly_json};
 const MEDITATION_DATA = {meditation_json};
 const MEETINGS_DATA = {meetings_json};
 const DAYS = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
@@ -4534,8 +4591,21 @@ function renderHeatmap(config) {{
   const totalDays = dateKeys.length;
   subtitleEl.textContent = totalDays + ' days of tracking';
 
-  // Daily average from past 4 weeks
+  // Daily average and median from past 4 weeks
   const avgValue = last28Days > 0 ? last28Value / last28Days : 0;
+  const last28Values = [];
+  for (let i = 0; i < 28; i++) {{
+    const d2 = new Date(today);
+    d2.setDate(d2.getDate() - i);
+    const v = data[localDateStr(d2)] || 0;
+    if (v > 0) last28Values.push(v);
+  }}
+  last28Values.sort((a, b) => a - b);
+  const medianValue = last28Values.length > 0
+    ? (last28Values.length % 2 === 0
+      ? (last28Values[last28Values.length / 2 - 1] + last28Values[last28Values.length / 2]) / 2
+      : last28Values[Math.floor(last28Values.length / 2)])
+    : 0;
 
   // Week trend: compare daily avg this week vs daily avg prev week
   let weekDelta = '';
@@ -4551,7 +4621,8 @@ function renderHeatmap(config) {{
   statsEl.innerHTML = `
     <div class="stat"><div class="stat-value">${{formatValue(todayValue)}}</div><div class="stat-label">Today</div></div>
     <div class="stat"><div class="stat-value">${{formatValue(thisWeekValue)}}${{weekDelta}}</div><div class="stat-label">This Week (trend)</div></div>
-    <div class="stat"><div class="stat-value">${{formatValue(avgValue)}}</div><div class="stat-label">Daily Avg (4w)</div></div>
+    <div class="stat"><div class="stat-value">${{formatValue(avgValue)}}</div><div class="stat-label">Avg (4w)</div></div>
+    <div class="stat"><div class="stat-value">${{formatValue(medianValue)}}</div><div class="stat-label">Median (4w)</div></div>
     <div class="stat"><div class="stat-value">${{streak}}d</div><div class="stat-label">Streak</div></div>
     <div class="stat"><div class="stat-value">${{activeDays}}</div><div class="stat-label">Active Days</div></div>
   `;
@@ -4753,6 +4824,296 @@ document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
     showDayDetail(e.target.dataset.date);
   }}
 }});
+
+// ============================================================
+// Today's Work Curve — 4 Visualization Options
+// ============================================================
+(function() {{
+  const today = new Date();
+  today.setHours(0,0,0,0);
+  const todayStr = localDateStr(today);
+  const START_H = 5, END_H = 22;
+
+  // Build hourly arrays: hour -> active seconds
+  function getHourlyMap(dateStr) {{
+    const hb = HOURLY_DATA[dateStr] || [];
+    const m = {{}};
+    hb.forEach(h => {{ m[h.hour] = (h.active || 0); }});
+    return m;
+  }}
+
+  // Collect past 28 days of hourly data
+  const pastDays = [];
+  for (let i = 1; i <= 28; i++) {{
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    const ds = localDateStr(d);
+    if (HOURLY_DATA[ds]) pastDays.push(getHourlyMap(ds));
+  }}
+  const todayHours = getHourlyMap(todayStr);
+  const nowHour = new Date().getHours();
+
+  // Average hourly for past days
+  function avgAtHour(h) {{
+    if (pastDays.length === 0) return 0;
+    return pastDays.reduce((s, d) => s + (d[h] || 0), 0) / pastDays.length;
+  }}
+
+  // ---- Option A: Cumulative Line Chart (canvas) ----
+  const canvasA = document.getElementById('viz-cumulative');
+  if (canvasA) {{
+    const ctx = canvasA.getContext('2d');
+    const W = canvasA.offsetWidth;
+    const H = 120;
+    canvasA.width = W * 2; canvasA.height = H * 2;
+    ctx.scale(2, 2);
+    const hours = END_H - START_H;
+    const pad = {{ l: 30, r: 10, t: 10, b: 20 }};
+    const cw = W - pad.l - pad.r;
+    const ch = H - pad.t - pad.b;
+
+    // Build cumulative arrays
+    let cumToday = [], cumAvg = [], cumMin = [], cumMax = [];
+    let tSum = 0, aSum = 0;
+    let mins = new Array(hours + 1).fill(Infinity);
+    let maxs = new Array(hours + 1).fill(0);
+
+    for (let i = 0; i <= hours; i++) {{
+      const h = START_H + i;
+      tSum += (todayHours[h] || 0) / 3600;
+      aSum += avgAtHour(h) / 3600;
+      cumToday.push(tSum);
+      cumAvg.push(aSum);
+      // min/max band
+      let pMin = Infinity, pMax = 0;
+      pastDays.forEach(pd => {{
+        let s = 0;
+        for (let j = 0; j <= i; j++) s += (pd[START_H + j] || 0) / 3600;
+        if (s < pMin) pMin = s;
+        if (s > pMax) pMax = s;
+      }});
+      cumMin.push(pastDays.length > 0 ? pMin : 0);
+      cumMax.push(pastDays.length > 0 ? pMax : 0);
+    }}
+
+    const maxVal = Math.max(...cumMax, ...cumToday, 1);
+    const xOf = (i) => pad.l + (i / hours) * cw;
+    const yOf = (v) => pad.t + ch - (v / maxVal) * ch;
+
+    // Shaded band (min–max)
+    ctx.fillStyle = 'rgba(35,134,54,0.1)';
+    ctx.beginPath();
+    for (let i = 0; i <= hours; i++) ctx.lineTo(xOf(i), yOf(cumMax[i]));
+    for (let i = hours; i >= 0; i--) ctx.lineTo(xOf(i), yOf(cumMin[i]));
+    ctx.closePath(); ctx.fill();
+
+    // Avg line (dashed grey)
+    ctx.strokeStyle = '#484f58'; ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    cumAvg.forEach((v, i) => {{ i === 0 ? ctx.moveTo(xOf(i), yOf(v)) : ctx.lineTo(xOf(i), yOf(v)); }});
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Today line (solid green, only up to current hour)
+    const todayEnd = Math.min(nowHour - START_H, hours);
+    if (todayEnd >= 0) {{
+      ctx.strokeStyle = '#39d353'; ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (let i = 0; i <= todayEnd; i++) {{
+        i === 0 ? ctx.moveTo(xOf(i), yOf(cumToday[i])) : ctx.lineTo(xOf(i), yOf(cumToday[i]));
+      }}
+      ctx.stroke();
+      // Dot at current position
+      ctx.fillStyle = '#39d353';
+      ctx.beginPath();
+      ctx.arc(xOf(todayEnd), yOf(cumToday[todayEnd]), 3, 0, Math.PI * 2);
+      ctx.fill();
+    }}
+
+    // X axis labels
+    ctx.fillStyle = '#7d8590'; ctx.font = '9px sans-serif'; ctx.textAlign = 'center';
+    for (let i = 0; i <= hours; i += 2) {{
+      ctx.fillText((START_H + i) + '', xOf(i), H - 4);
+    }}
+    // Y axis labels
+    ctx.textAlign = 'right';
+    const yStep = maxVal > 8 ? 4 : maxVal > 4 ? 2 : 1;
+    for (let v = 0; v <= maxVal; v += yStep) {{
+      ctx.fillText(v + 'h', pad.l - 4, yOf(v) + 3);
+      ctx.strokeStyle = '#21262d'; ctx.lineWidth = 0.5;
+      ctx.beginPath(); ctx.moveTo(pad.l, yOf(v)); ctx.lineTo(W - pad.r, yOf(v)); ctx.stroke();
+    }}
+
+    // Legend
+    ctx.font = '9px sans-serif'; ctx.textAlign = 'left';
+    ctx.fillStyle = '#39d353'; ctx.fillText('Today', pad.l + 4, pad.t + 10);
+    ctx.fillStyle = '#484f58'; ctx.fillText('Avg', pad.l + 44, pad.t + 10);
+    ctx.fillStyle = 'rgba(35,134,54,0.3)'; ctx.fillRect(pad.l + 62, pad.t + 4, 16, 8);
+    ctx.fillStyle = '#484f58'; ctx.fillText('Range', pad.l + 82, pad.t + 10);
+  }}
+
+  // ---- Option B: Hourly Bars ----
+  const barsEl = document.getElementById('viz-bars');
+  const barsLabels = document.getElementById('viz-bars-labels');
+  if (barsEl) {{
+    const maxBar = Math.max(
+      ...Array.from({{length: END_H - START_H}}, (_, i) => Math.max(todayHours[START_H + i] || 0, avgAtHour(START_H + i))),
+      1
+    );
+    for (let h = START_H; h < END_H; h++) {{
+      const tv = todayHours[h] || 0;
+      const av = avgAtHour(h);
+      const tPct = Math.max(0, (tv / maxBar) * 100);
+      const aPct = Math.max(0, (av / maxBar) * 100);
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'flex:1;display:flex;gap:1px;align-items:flex-end;height:100%';
+      const showToday = h <= nowHour;
+      wrap.innerHTML =
+        '<div style="flex:1;border-radius:2px 2px 0 0;background:' + (showToday ? '#39d353' : '#1a3a1a') + ';height:' + (showToday ? tPct : 0) + '%;min-height:' + (showToday && tv > 0 ? '2px' : '0') + '"></div>' +
+        '<div style="flex:1;border-radius:2px 2px 0 0;background:#484f58;height:' + aPct + '%;min-height:' + (av > 0 ? '2px' : '0') + '"></div>';
+      barsEl.appendChild(wrap);
+      // Label
+      const lbl = document.createElement('div');
+      lbl.style.cssText = 'flex:1;text-align:center;font-size:8px;color:#484f58;';
+      lbl.textContent = h % 2 === 0 ? h : '';
+      barsLabels.appendChild(lbl);
+    }}
+  }}
+
+  // ---- Option C: Pace Tracker (canvas) ----
+  const canvasC = document.getElementById('viz-pace');
+  if (canvasC) {{
+    const ctx = canvasC.getContext('2d');
+    const W = canvasC.offsetWidth;
+    const H = 110;
+    canvasC.width = W * 2; canvasC.height = H * 2;
+    ctx.scale(2, 2);
+    const hours = END_H - START_H;
+    const pad = {{ l: 30, r: 10, t: 10, b: 20 }};
+    const cw = W - pad.l - pad.r;
+    const ch = H - pad.t - pad.b;
+
+    // Build pace: for each hour, what fraction of daily total is done
+    const avgTotal = cumAvg ? cumAvg[cumAvg.length - 1] : 0;
+    // Pace as percentage of expected daily total
+    let paceToday = [], paceAvg = [];
+    let tRun = 0, aRun = 0;
+    const expectedTotal = avgTotal || 6; // fallback 6h
+    for (let i = 0; i <= hours; i++) {{
+      const h = START_H + i;
+      tRun += (todayHours[h] || 0) / 3600;
+      aRun += avgAtHour(h) / 3600;
+      paceToday.push(tRun);
+      paceAvg.push(aRun);
+    }}
+
+    const maxP = Math.max(expectedTotal, ...paceToday, 1);
+    const xOf = (i) => pad.l + (i / hours) * cw;
+    const yOf = (v) => pad.t + ch - (v / maxP) * ch;
+
+    // Expected end line
+    ctx.strokeStyle = '#30363d'; ctx.lineWidth = 1;
+    ctx.setLineDash([2, 2]);
+    ctx.beginPath(); ctx.moveTo(pad.l, yOf(expectedTotal)); ctx.lineTo(W - pad.r, yOf(expectedTotal)); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#484f58'; ctx.font = '9px sans-serif'; ctx.textAlign = 'left';
+    ctx.fillText('avg day total: ' + expectedTotal.toFixed(1) + 'h', pad.l + 4, yOf(expectedTotal) - 4);
+
+    // Average pace (grey fill)
+    ctx.fillStyle = 'rgba(72,79,88,0.2)';
+    ctx.beginPath(); ctx.moveTo(xOf(0), yOf(0));
+    paceAvg.forEach((v, i) => ctx.lineTo(xOf(i), yOf(v)));
+    ctx.lineTo(xOf(hours), yOf(0)); ctx.closePath(); ctx.fill();
+
+    // Average pace line
+    ctx.strokeStyle = '#484f58'; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    paceAvg.forEach((v, i) => {{ i === 0 ? ctx.moveTo(xOf(i), yOf(v)) : ctx.lineTo(xOf(i), yOf(v)); }});
+    ctx.stroke();
+
+    // Today pace (green)
+    const todayEnd = Math.min(nowHour - START_H, hours);
+    if (todayEnd >= 0) {{
+      ctx.fillStyle = 'rgba(57,211,83,0.15)';
+      ctx.beginPath(); ctx.moveTo(xOf(0), yOf(0));
+      for (let i = 0; i <= todayEnd; i++) ctx.lineTo(xOf(i), yOf(paceToday[i]));
+      ctx.lineTo(xOf(todayEnd), yOf(0)); ctx.closePath(); ctx.fill();
+
+      ctx.strokeStyle = '#39d353'; ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (let i = 0; i <= todayEnd; i++) {{
+        i === 0 ? ctx.moveTo(xOf(i), yOf(paceToday[i])) : ctx.lineTo(xOf(i), yOf(paceToday[i]));
+      }}
+      ctx.stroke();
+
+      ctx.fillStyle = '#39d353';
+      ctx.beginPath();
+      ctx.arc(xOf(todayEnd), yOf(paceToday[todayEnd]), 3, 0, Math.PI * 2);
+      ctx.fill();
+    }}
+
+    // Axes
+    ctx.fillStyle = '#7d8590'; ctx.font = '9px sans-serif'; ctx.textAlign = 'center';
+    for (let i = 0; i <= hours; i += 2) ctx.fillText((START_H + i) + '', xOf(i), H - 4);
+    ctx.textAlign = 'right';
+    for (let v = 0; v <= maxP; v += 2) {{
+      ctx.fillText(v + 'h', pad.l - 4, yOf(v) + 3);
+      ctx.strokeStyle = '#21262d'; ctx.lineWidth = 0.5;
+      ctx.beginPath(); ctx.moveTo(pad.l, yOf(v)); ctx.lineTo(W - pad.r, yOf(v)); ctx.stroke();
+    }}
+  }}
+
+  // ---- Option D: Weekly Timeline (mini heatmap rows) ----
+  const tlEl = document.getElementById('viz-timeline');
+  if (tlEl) {{
+    const dayNames = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+    const rows = [];
+    // Today + past 6 days = 7 rows
+    for (let i = 6; i >= 0; i--) {{
+      const d = new Date(today);
+      d.setDate(d.getDate() - i);
+      rows.push({{ date: d, label: i === 0 ? 'Today' : dayNames[d.getDay()], ds: localDateStr(d) }});
+    }}
+
+    // Find max hour value across these days for color scaling
+    let tlMax = 1;
+    rows.forEach(r => {{
+      const hm = getHourlyMap(r.ds);
+      for (let h = START_H; h < END_H; h++) if ((hm[h] || 0) > tlMax) tlMax = hm[h];
+    }});
+
+    // Hour labels row
+    let hlHtml = '<div class="tl-hours-label">';
+    for (let h = START_H; h < END_H; h++) hlHtml += '<span>' + (h % 2 === 0 ? h : '') + '</span>';
+    hlHtml += '</div>';
+    tlEl.innerHTML = hlHtml;
+
+    rows.forEach(r => {{
+      const hm = getHourlyMap(r.ds);
+      const isToday = r.ds === todayStr;
+      let cellsHtml = '';
+      for (let h = START_H; h < END_H; h++) {{
+        const v = hm[h] || 0;
+        const intensity = v / tlMax;
+        let color;
+        if (v === 0) color = '#161b22';
+        else if (isToday) {{
+          const g = Math.round(100 + intensity * 155);
+          color = 'rgb(14,' + g + ',50)';
+        }} else {{
+          const g = Math.round(60 + intensity * 100);
+          color = 'rgb(14,' + g + ',50)';
+        }}
+        cellsHtml += '<div class="tl-cell" style="background:' + color + '" title="' + r.ds + ' ' + h + ':00 — ' + Math.round(v / 60) + 'min"></div>';
+      }}
+      const row = document.createElement('div');
+      row.className = 'tl-row';
+      row.innerHTML = '<div class="tl-label"' + (isToday ? ' style="color:#39d353;font-weight:600"' : '') + '>' + r.label + '</div><div class="tl-strip">' + cellsHtml + '</div>';
+      tlEl.appendChild(row);
+    }});
+  }}
+}})();
 </script>
 </body>
 </html>"""
