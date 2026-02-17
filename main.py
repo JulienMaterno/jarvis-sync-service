@@ -4790,17 +4790,67 @@ document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
     // Today pace (green solid) + projection (green dotted)
     const todayEnd = Math.min(nowHour - START_H, hours);
 
-    // Build projection: from current position, use avg incremental gains for remaining hours
+    // Smart projection: find most similar past days and use their trajectories
     let projected = [];
-    if (todayEnd >= 0) {{
-      const todaySoFar = paceToday[todayEnd] || 0;
+    if (todayEnd >= 0 && pastDays.length > 0) {{
+      const todayCum = paceToday[todayEnd] || 0;
+
+      // Build cumulative curves for each past day
+      const pastCurves = pastDays.map(pd => {{
+        let cum = [];
+        let s = 0;
+        for (let i = 0; i <= hours; i++) {{
+          s += (pd[START_H + i] || 0) / 3600;
+          cum.push(s);
+        }}
+        return cum;
+      }});
+
+      // Score each past day by similarity to today up to todayEnd
+      // Uses cumulative value at current hour + shape similarity
+      const scored = pastCurves.map((curve, idx) => {{
+        const pastCum = curve[todayEnd] || 0;
+        // Primary: how close is their cumulative total at this hour?
+        const cumDiff = Math.abs(pastCum - todayCum);
+        // Secondary: shape similarity (sum of squared diffs for hours so far)
+        let shapeDiff = 0;
+        for (let i = 0; i <= todayEnd; i++) {{
+          const d = (paceToday[i] || 0) - (curve[i] || 0);
+          shapeDiff += d * d;
+        }}
+        return {{ idx, score: cumDiff + Math.sqrt(shapeDiff) * 0.3, curve }};
+      }});
+
+      scored.sort((a, b) => a.score - b.score);
+
+      // Take top K most similar days (or all if fewer)
+      const K = Math.min(5, scored.length);
+      const topDays = scored.slice(0, K);
+
+      // Build projection: up to todayEnd use actual, then blend similar days
+      // Anchor the projection to today's actual value at todayEnd
       for (let i = 0; i <= hours; i++) {{
         if (i <= todayEnd) {{
           projected.push(paceToday[i]);
         }} else {{
-          // Add avg hourly increment from this hour onward
-          const avgIncrement = avgAtHour(START_H + i) / 3600;
-          projected.push((projected[i - 1] || todaySoFar) + avgIncrement);
+          // Average the incremental gain from similar days (from todayEnd onward)
+          let sum = 0;
+          topDays.forEach(d => {{
+            const gain = (d.curve[i] || 0) - (d.curve[todayEnd] || 0);
+            sum += gain;
+          }});
+          const avgGain = sum / K;
+          projected.push(todayCum + avgGain);
+        }}
+      }}
+    }} else if (todayEnd >= 0) {{
+      // Fallback: no past data, use average increments
+      for (let i = 0; i <= hours; i++) {{
+        if (i <= todayEnd) {{
+          projected.push(paceToday[i]);
+        }} else {{
+          const avgInc = avgAtHour(START_H + i) / 3600;
+          projected.push((projected[i - 1] || 0) + avgInc);
         }}
       }}
     }}
