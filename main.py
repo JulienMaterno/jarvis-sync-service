@@ -4909,6 +4909,80 @@ document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
       ctx.strokeStyle = '#21262d'; ctx.lineWidth = 0.5;
       ctx.beginPath(); ctx.moveTo(pad.l, yOf(v)); ctx.lineTo(W - pad.r, yOf(v)); ctx.stroke();
     }}
+
+    // Save base image for hover redraw
+    const baseImage = ctx.getImageData(0, 0, canvasC.width, canvasC.height);
+
+    // Hover tooltip
+    canvasC.style.cursor = 'crosshair';
+    canvasC.addEventListener('mousemove', function(e) {{
+      const rect = canvasC.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const i = Math.round((mx - pad.l) / cw * hours);
+      if (i < 0 || i > hours) {{ ctx.putImageData(baseImage, 0, 0); return; }}
+
+      ctx.putImageData(baseImage, 0, 0);
+      const h = START_H + i;
+      const tVal = paceToday[i] || 0;
+      const aVal = paceAvg[i] || 0;
+      const x = xOf(i);
+
+      // Vertical crosshair line
+      ctx.save();
+      ctx.scale(2, 2);
+      ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, H - pad.b); ctx.stroke();
+
+      // Dots on both lines
+      if (h <= nowHour) {{
+        ctx.fillStyle = '#39d353';
+        ctx.beginPath(); ctx.arc(x, yOf(tVal), 4, 0, Math.PI * 2); ctx.fill();
+      }}
+      ctx.fillStyle = '#484f58';
+      ctx.beginPath(); ctx.arc(x, yOf(aVal), 4, 0, Math.PI * 2); ctx.fill();
+
+      // Tooltip box
+      const fmtH = (v) => {{ const hrs = Math.floor(v); const m = Math.round((v - hrs) * 60); return hrs > 0 ? hrs + 'h ' + m + 'm' : m + 'm'; }};
+      const diff = tVal - aVal;
+      const diffStr = (diff >= 0 ? '+' : '') + fmtH(Math.abs(diff));
+      const line1 = h + ':00';
+      const line2 = 'Today: ' + fmtH(tVal);
+      const line3 = 'Avg: ' + fmtH(aVal);
+      const line4 = (h <= nowHour) ? (diff >= 0 ? '▲ ' : '▼ ') + diffStr : '';
+
+      ctx.font = 'bold 10px sans-serif';
+      const tw = Math.max(ctx.measureText(line2).width, ctx.measureText(line3).width, ctx.measureText(line4).width) + 16;
+      const th = line4 ? 54 : 42;
+      let tx = x + 8;
+      if (tx + tw > W - pad.r) tx = x - tw - 8;
+      let ty = pad.t + 4;
+
+      ctx.fillStyle = 'rgba(22,27,34,0.92)';
+      ctx.strokeStyle = '#30363d';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.roundRect(tx, ty, tw, th, 4);
+      ctx.fill(); ctx.stroke();
+
+      ctx.fillStyle = '#e6edf3'; ctx.font = 'bold 10px sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText(line1, tx + 6, ty + 13);
+      ctx.fillStyle = '#39d353'; ctx.font = '10px sans-serif';
+      ctx.fillText(line2, tx + 6, ty + 26);
+      ctx.fillStyle = '#7d8590';
+      ctx.fillText(line3, tx + 6, ty + 38);
+      if (line4) {{
+        ctx.fillStyle = diff >= 0 ? '#39d353' : '#f85149';
+        ctx.font = 'bold 10px sans-serif';
+        ctx.fillText(line4, tx + 6, ty + 50);
+      }}
+      ctx.restore();
+    }});
+
+    canvasC.addEventListener('mouseleave', function() {{
+      ctx.putImageData(baseImage, 0, 0);
+    }});
   }}
 
 }})();
