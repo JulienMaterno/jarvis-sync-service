@@ -4859,6 +4859,28 @@ document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
     return pastDays.reduce((s, d) => s + (d[h] || 0), 0) / pastDays.length;
   }}
 
+  // Build cumulative arrays (shared by Options A and C)
+  const hours = END_H - START_H;
+  let cumToday = [], cumAvg = [], cumMin = [], cumMax = [];
+  let tSum = 0, aSum = 0;
+
+  for (let i = 0; i <= hours; i++) {{
+    const h = START_H + i;
+    tSum += (todayHours[h] || 0) / 3600;
+    aSum += avgAtHour(h) / 3600;
+    cumToday.push(tSum);
+    cumAvg.push(aSum);
+    let pMin = Infinity, pMax = 0;
+    pastDays.forEach(pd => {{
+      let s = 0;
+      for (let j = 0; j <= i; j++) s += (pd[START_H + j] || 0) / 3600;
+      if (s < pMin) pMin = s;
+      if (s > pMax) pMax = s;
+    }});
+    cumMin.push(pastDays.length > 0 ? pMin : 0);
+    cumMax.push(pastDays.length > 0 ? pMax : 0);
+  }}
+
   // ---- Option A: Cumulative Line Chart (canvas) ----
   const canvasA = document.getElementById('viz-cumulative');
   if (canvasA) {{
@@ -4867,34 +4889,9 @@ document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
     const H = 120;
     canvasA.width = W * 2; canvasA.height = H * 2;
     ctx.scale(2, 2);
-    const hours = END_H - START_H;
     const pad = {{ l: 30, r: 10, t: 10, b: 20 }};
     const cw = W - pad.l - pad.r;
     const ch = H - pad.t - pad.b;
-
-    // Build cumulative arrays
-    let cumToday = [], cumAvg = [], cumMin = [], cumMax = [];
-    let tSum = 0, aSum = 0;
-    let mins = new Array(hours + 1).fill(Infinity);
-    let maxs = new Array(hours + 1).fill(0);
-
-    for (let i = 0; i <= hours; i++) {{
-      const h = START_H + i;
-      tSum += (todayHours[h] || 0) / 3600;
-      aSum += avgAtHour(h) / 3600;
-      cumToday.push(tSum);
-      cumAvg.push(aSum);
-      // min/max band
-      let pMin = Infinity, pMax = 0;
-      pastDays.forEach(pd => {{
-        let s = 0;
-        for (let j = 0; j <= i; j++) s += (pd[START_H + j] || 0) / 3600;
-        if (s < pMin) pMin = s;
-        if (s > pMax) pMax = s;
-      }});
-      cumMin.push(pastDays.length > 0 ? pMin : 0);
-      cumMax.push(pastDays.length > 0 ? pMax : 0);
-    }}
 
     const maxVal = Math.max(...cumMax, ...cumToday, 1);
     const xOf = (i) => pad.l + (i / hours) * cw;
@@ -4989,7 +4986,6 @@ document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
     const H = 110;
     canvasC.width = W * 2; canvasC.height = H * 2;
     ctx.scale(2, 2);
-    const hours = END_H - START_H;
     const pad = {{ l: 30, r: 10, t: 10, b: 20 }};
     const cw = W - pad.l - pad.r;
     const ch = H - pad.t - pad.b;
