@@ -4239,9 +4239,10 @@ function formatMins(m) {{
 }}
 
 function formatMeetings(n) {{
-  if (!n || n < 1) return 'No meetings';
-  if (n === 1) return '1 meeting';
-  return n + ' meetings';
+  if (!n || n < 0.05) return 'No meetings';
+  const r = Math.round(n * 10) / 10;
+  if (r === 1) return '1 meeting';
+  return r + ' meetings';
 }}
 
 function renderHeatmap(config) {{
