@@ -4692,6 +4692,8 @@ function showDayDetail(dateStr) {{
         const minH = Math.max(0, Math.min(...activeHours) - 1);
         const maxH = Math.min(23, Math.max(...activeHours) + 1);
 
+        const hourSpan = maxH - minH + 1;
+        const labelEvery = hourSpan > 14 ? 3 : hourSpan > 8 ? 2 : 1;
         html += '<div class="hourly-chart">';
         for (let i = minH; i <= maxH; i++) {{
           const h = byHour[i] || {{ active: 0, afk: 0 }};
@@ -4699,7 +4701,7 @@ function showDayDetail(dateStr) {{
           const barH = h.active > 0 ? pct : 0;
           html += '<div class="hourly-bar-wrap">';
           html += '<div class="hourly-bar" style="height:' + barH + '%" title="' + i + ':00 — ' + fmtSec(h.active) + '"></div>';
-          html += '<div class="hourly-label">' + (i % 2 === 0 ? i : '') + '</div>';
+          html += '<div class="hourly-label">' + ((i - minH) % labelEvery === 0 ? i : '') + '</div>';
           html += '</div>';
         }}
         html += '</div>';

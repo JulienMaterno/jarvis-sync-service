@@ -424,11 +424,20 @@ class ActivityWatchSync:
                 )
             
             # Calculate productivity breakdown
-            productive_time = 0
-            distracting_time = 0
-            neutral_time = 0
-            
+            # Use web events for browser time (more granular than chrome.exe window)
+            # and app events for non-browser apps (to avoid double-counting)
+            productive_time = 0.0
+            distracting_time = 0.0
+            neutral_time = 0.0
+
+            browser_apps = {"chrome.exe", "firefox.exe", "msedge.exe", "brave.exe",
+                            "safari", "opera.exe", "arc.exe", "vivaldi.exe"}
+
             for app, duration in app_time.items():
+                if app.lower() in {b.lower() for b in browser_apps}:
+                    continue  # Skip browsers — counted via web events below
+                if app.lower() == "lockapp.exe":
+                    continue  # Lock screen is idle, not productive or distracting
                 category = categorize_app(app)
                 if category == "productive":
                     productive_time += duration
@@ -436,14 +445,15 @@ class ActivityWatchSync:
                     distracting_time += duration
                 else:
                     neutral_time += duration
-            
+
             for domain, duration in site_time.items():
                 category = categorize_website(domain)
                 if category == "productive":
                     productive_time += duration
                 elif category == "distracting":
                     distracting_time += duration
-                # Note: neutral web time not added to avoid double-counting
+                else:
+                    neutral_time += duration
             
             # Calculate hourly breakdown (in local time)
             hourly = defaultdict(lambda: {"active": 0, "afk": 0})

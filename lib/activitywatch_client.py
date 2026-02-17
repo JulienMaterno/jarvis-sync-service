@@ -166,6 +166,9 @@ def categorize_app(app_name: str) -> str:
         "github", "gitlab", "bitbucket",  # Version control
         "postman", "insomnia",  # API tools
         "datagrip", "dbeaver", "tableplus",  # Database
+        "claude", "chatgpt",  # AI assistants
+        "beeper",  # Unified messaging (work comms)
+        "acrobat", "pdf",  # Document viewers
     ]
     
     # Distracting apps/sites
@@ -209,6 +212,12 @@ def categorize_website(domain: str) -> str:
         "supabase.com", "vercel.com", "netlify.com",
         "medium.com", "dev.to", "hashnode.com",
         "udemy.com", "coursera.org", "linkedin.com/learning",
+        "mail.google.com", "calendar.google.com",
+        "mail.notion.so", "calendar.notion.so",
+        "linkedin.com",
+        "luma.com", "cal.com", "app.cal.com",
+        "meet.google.com",
+        "hunter.io",
     ]
     
     # Distracting domains
@@ -220,6 +229,10 @@ def categorize_website(domain: str) -> str:
         "news.ycombinator.com",  # HN can be a time sink
     ]
     
+    # Localhost is always productive (local dev/tools)
+    if domain_lower.startswith("localhost") or domain_lower.startswith("127.0.0.1"):
+        return "productive"
+
     for prod in productive_domains:
         if domain_lower == prod or domain_lower.endswith("." + prod):
             return "productive"
