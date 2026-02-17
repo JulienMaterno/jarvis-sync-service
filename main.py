@@ -4317,12 +4317,6 @@ async def activity_heatmap():
     letter-spacing: 0.5px;
     margin-bottom: 8px;
   }}
-  .tl-row {{ display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }}
-  .tl-label {{ font-size: 10px; color: #7d8590; width: 36px; text-align: right; flex-shrink: 0; }}
-  .tl-strip {{ display: flex; gap: 1px; flex: 1; height: 14px; }}
-  .tl-cell {{ flex: 1; border-radius: 2px; }}
-  .tl-hours-label {{ font-size: 9px; color: #484f58; display: flex; gap: 1px; margin-left: 42px; }}
-  .tl-hours-label span {{ flex: 1; text-align: center; }}
 </style>
 </head>
 <body>
@@ -4397,38 +4391,12 @@ async def activity_heatmap():
     </div>
   </div>
 
-  <!-- Today's Work Curve — Visualization Options -->
+  <!-- Today's Work Curve — Pace Tracker -->
   <div class="section" id="curve-section" style="margin-top:24px;">
     <h1>Today's Work Curve</h1>
     <div class="subtitle">Comparing today to your recent pattern (past 4 weeks)</div>
-
-    <!-- Option A: Cumulative Line Chart -->
     <div class="viz-option" style="margin-top:14px;">
-      <div class="viz-label">A — Cumulative Hours</div>
-      <canvas id="viz-cumulative" height="120" style="width:100%;"></canvas>
-    </div>
-
-    <!-- Option B: Hourly Bars (today vs average) -->
-    <div class="viz-option" style="margin-top:18px;">
-      <div class="viz-label">B — Hourly Bars (Today vs Avg)</div>
-      <div id="viz-bars" style="display:flex;align-items:flex-end;gap:1px;height:90px;padding:0 2px;"></div>
-      <div id="viz-bars-labels" style="display:flex;gap:1px;padding:0 2px;"></div>
-      <div style="display:flex;gap:12px;margin-top:4px;font-size:9px;color:#7d8590;">
-        <span><span style="color:#39d353;">&#9632;</span> Today</span>
-        <span><span style="color:#484f58;">&#9632;</span> 4-week avg</span>
-      </div>
-    </div>
-
-    <!-- Option C: Pace Line -->
-    <div class="viz-option" style="margin-top:18px;">
-      <div class="viz-label">C — Pace Tracker</div>
       <canvas id="viz-pace" height="110" style="width:100%;"></canvas>
-    </div>
-
-    <!-- Option D: Recent Days Timeline -->
-    <div class="viz-option" style="margin-top:18px;">
-      <div class="viz-label">D — Weekly Timeline</div>
-      <div id="viz-timeline"></div>
     </div>
   </div>
 
@@ -4859,126 +4827,9 @@ document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
     return pastDays.reduce((s, d) => s + (d[h] || 0), 0) / pastDays.length;
   }}
 
-  // Build cumulative arrays (shared by Options A and C)
   const hours = END_H - START_H;
-  let cumToday = [], cumAvg = [], cumMin = [], cumMax = [];
-  let tSum = 0, aSum = 0;
 
-  for (let i = 0; i <= hours; i++) {{
-    const h = START_H + i;
-    tSum += (todayHours[h] || 0) / 3600;
-    aSum += avgAtHour(h) / 3600;
-    cumToday.push(tSum);
-    cumAvg.push(aSum);
-    let pMin = Infinity, pMax = 0;
-    pastDays.forEach(pd => {{
-      let s = 0;
-      for (let j = 0; j <= i; j++) s += (pd[START_H + j] || 0) / 3600;
-      if (s < pMin) pMin = s;
-      if (s > pMax) pMax = s;
-    }});
-    cumMin.push(pastDays.length > 0 ? pMin : 0);
-    cumMax.push(pastDays.length > 0 ? pMax : 0);
-  }}
-
-  // ---- Option A: Cumulative Line Chart (canvas) ----
-  const canvasA = document.getElementById('viz-cumulative');
-  if (canvasA) {{
-    const ctx = canvasA.getContext('2d');
-    const W = canvasA.offsetWidth;
-    const H = 120;
-    canvasA.width = W * 2; canvasA.height = H * 2;
-    ctx.scale(2, 2);
-    const pad = {{ l: 30, r: 10, t: 10, b: 20 }};
-    const cw = W - pad.l - pad.r;
-    const ch = H - pad.t - pad.b;
-
-    const maxVal = Math.max(...cumMax, ...cumToday, 1);
-    const xOf = (i) => pad.l + (i / hours) * cw;
-    const yOf = (v) => pad.t + ch - (v / maxVal) * ch;
-
-    // Shaded band (min–max)
-    ctx.fillStyle = 'rgba(35,134,54,0.1)';
-    ctx.beginPath();
-    for (let i = 0; i <= hours; i++) ctx.lineTo(xOf(i), yOf(cumMax[i]));
-    for (let i = hours; i >= 0; i--) ctx.lineTo(xOf(i), yOf(cumMin[i]));
-    ctx.closePath(); ctx.fill();
-
-    // Avg line (dashed grey)
-    ctx.strokeStyle = '#484f58'; ctx.lineWidth = 1.5;
-    ctx.setLineDash([4, 3]);
-    ctx.beginPath();
-    cumAvg.forEach((v, i) => {{ i === 0 ? ctx.moveTo(xOf(i), yOf(v)) : ctx.lineTo(xOf(i), yOf(v)); }});
-    ctx.stroke();
-    ctx.setLineDash([]);
-
-    // Today line (solid green, only up to current hour)
-    const todayEnd = Math.min(nowHour - START_H, hours);
-    if (todayEnd >= 0) {{
-      ctx.strokeStyle = '#39d353'; ctx.lineWidth = 2;
-      ctx.beginPath();
-      for (let i = 0; i <= todayEnd; i++) {{
-        i === 0 ? ctx.moveTo(xOf(i), yOf(cumToday[i])) : ctx.lineTo(xOf(i), yOf(cumToday[i]));
-      }}
-      ctx.stroke();
-      // Dot at current position
-      ctx.fillStyle = '#39d353';
-      ctx.beginPath();
-      ctx.arc(xOf(todayEnd), yOf(cumToday[todayEnd]), 3, 0, Math.PI * 2);
-      ctx.fill();
-    }}
-
-    // X axis labels
-    ctx.fillStyle = '#7d8590'; ctx.font = '9px sans-serif'; ctx.textAlign = 'center';
-    for (let i = 0; i <= hours; i += 2) {{
-      ctx.fillText((START_H + i) + '', xOf(i), H - 4);
-    }}
-    // Y axis labels
-    ctx.textAlign = 'right';
-    const yStep = maxVal > 8 ? 4 : maxVal > 4 ? 2 : 1;
-    for (let v = 0; v <= maxVal; v += yStep) {{
-      ctx.fillText(v + 'h', pad.l - 4, yOf(v) + 3);
-      ctx.strokeStyle = '#21262d'; ctx.lineWidth = 0.5;
-      ctx.beginPath(); ctx.moveTo(pad.l, yOf(v)); ctx.lineTo(W - pad.r, yOf(v)); ctx.stroke();
-    }}
-
-    // Legend
-    ctx.font = '9px sans-serif'; ctx.textAlign = 'left';
-    ctx.fillStyle = '#39d353'; ctx.fillText('Today', pad.l + 4, pad.t + 10);
-    ctx.fillStyle = '#484f58'; ctx.fillText('Avg', pad.l + 44, pad.t + 10);
-    ctx.fillStyle = 'rgba(35,134,54,0.3)'; ctx.fillRect(pad.l + 62, pad.t + 4, 16, 8);
-    ctx.fillStyle = '#484f58'; ctx.fillText('Range', pad.l + 82, pad.t + 10);
-  }}
-
-  // ---- Option B: Hourly Bars ----
-  const barsEl = document.getElementById('viz-bars');
-  const barsLabels = document.getElementById('viz-bars-labels');
-  if (barsEl) {{
-    const maxBar = Math.max(
-      ...Array.from({{length: END_H - START_H}}, (_, i) => Math.max(todayHours[START_H + i] || 0, avgAtHour(START_H + i))),
-      1
-    );
-    for (let h = START_H; h < END_H; h++) {{
-      const tv = todayHours[h] || 0;
-      const av = avgAtHour(h);
-      const tPct = Math.max(0, (tv / maxBar) * 100);
-      const aPct = Math.max(0, (av / maxBar) * 100);
-      const wrap = document.createElement('div');
-      wrap.style.cssText = 'flex:1;display:flex;gap:1px;align-items:flex-end;height:100%';
-      const showToday = h <= nowHour;
-      wrap.innerHTML =
-        '<div style="flex:1;border-radius:2px 2px 0 0;background:' + (showToday ? '#39d353' : '#1a3a1a') + ';height:' + (showToday ? tPct : 0) + '%;min-height:' + (showToday && tv > 0 ? '2px' : '0') + '"></div>' +
-        '<div style="flex:1;border-radius:2px 2px 0 0;background:#484f58;height:' + aPct + '%;min-height:' + (av > 0 ? '2px' : '0') + '"></div>';
-      barsEl.appendChild(wrap);
-      // Label
-      const lbl = document.createElement('div');
-      lbl.style.cssText = 'flex:1;text-align:center;font-size:8px;color:#484f58;';
-      lbl.textContent = h % 2 === 0 ? h : '';
-      barsLabels.appendChild(lbl);
-    }}
-  }}
-
-  // ---- Option C: Pace Tracker (canvas) ----
+  // ---- Pace Tracker (canvas) ----
   const canvasC = document.getElementById('viz-pace');
   if (canvasC) {{
     const ctx = canvasC.getContext('2d');
@@ -4990,9 +4841,9 @@ document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
     const cw = W - pad.l - pad.r;
     const ch = H - pad.t - pad.b;
 
-    // Build pace: for each hour, what fraction of daily total is done
-    const avgTotal = cumAvg ? cumAvg[cumAvg.length - 1] : 0;
-    // Pace as percentage of expected daily total
+    // Build pace curves
+    let avgTotal = 0;
+    for (let i = 0; i <= hours; i++) avgTotal += avgAtHour(START_H + i) / 3600;
     let paceToday = [], paceAvg = [];
     let tRun = 0, aRun = 0;
     const expectedTotal = avgTotal || 6; // fallback 6h
@@ -5060,55 +4911,6 @@ document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
     }}
   }}
 
-  // ---- Option D: Weekly Timeline (mini heatmap rows) ----
-  const tlEl = document.getElementById('viz-timeline');
-  if (tlEl) {{
-    const dayNames = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-    const rows = [];
-    // Today + past 6 days = 7 rows
-    for (let i = 6; i >= 0; i--) {{
-      const d = new Date(today);
-      d.setDate(d.getDate() - i);
-      rows.push({{ date: d, label: i === 0 ? 'Today' : dayNames[d.getDay()], ds: localDateStr(d) }});
-    }}
-
-    // Find max hour value across these days for color scaling
-    let tlMax = 1;
-    rows.forEach(r => {{
-      const hm = getHourlyMap(r.ds);
-      for (let h = START_H; h < END_H; h++) if ((hm[h] || 0) > tlMax) tlMax = hm[h];
-    }});
-
-    // Hour labels row
-    let hlHtml = '<div class="tl-hours-label">';
-    for (let h = START_H; h < END_H; h++) hlHtml += '<span>' + (h % 2 === 0 ? h : '') + '</span>';
-    hlHtml += '</div>';
-    tlEl.innerHTML = hlHtml;
-
-    rows.forEach(r => {{
-      const hm = getHourlyMap(r.ds);
-      const isToday = r.ds === todayStr;
-      let cellsHtml = '';
-      for (let h = START_H; h < END_H; h++) {{
-        const v = hm[h] || 0;
-        const intensity = v / tlMax;
-        let color;
-        if (v === 0) color = '#161b22';
-        else if (isToday) {{
-          const g = Math.round(100 + intensity * 155);
-          color = 'rgb(14,' + g + ',50)';
-        }} else {{
-          const g = Math.round(60 + intensity * 100);
-          color = 'rgb(14,' + g + ',50)';
-        }}
-        cellsHtml += '<div class="tl-cell" style="background:' + color + '" title="' + r.ds + ' ' + h + ':00 — ' + Math.round(v / 60) + 'min"></div>';
-      }}
-      const row = document.createElement('div');
-      row.className = 'tl-row';
-      row.innerHTML = '<div class="tl-label"' + (isToday ? ' style="color:#39d353;font-weight:600"' : '') + '>' + r.label + '</div><div class="tl-strip">' + cellsHtml + '</div>';
-      tlEl.appendChild(row);
-    }});
-  }}
 }})();
 </script>
 </body>
