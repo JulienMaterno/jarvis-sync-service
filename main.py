@@ -3943,9 +3943,9 @@ async def list_summary_book_projects():
 @app.get("/dashboard/activity-heatmap", response_class=HTMLResponse)
 async def activity_heatmap():
     """
-    GitHub-style contribution heatmaps for activity and meditation.
+    GitHub-style contribution heatmaps for activity, meditation, and meetings.
     Embeddable in Notion via /embed block.
-    Green = screen time (ActivityWatch), Blue = meditation (Insight Timer).
+    Green = screen time, Blue = meditation, Orange = meetings.
     """
     import json as _json
 
@@ -3968,7 +3968,6 @@ async def activity_heatmap():
         med_result = supabase.table("meditation_sessions").select(
             "date, duration_seconds, practice_type"
         ).order("date", desc=False).execute()
-        # Aggregate: date → total minutes
         med_data = {}
         for row in med_result.data:
             d = row["date"]
@@ -3978,6 +3977,22 @@ async def activity_heatmap():
     except Exception as e:
         logger.error(f"Failed to fetch meditation data for heatmap: {e}")
         meditation_json = "{}"
+
+    # --- Fetch meetings data ---
+    try:
+        meet_result = supabase.table("meetings").select(
+            "date, audio_duration_seconds"
+        ).is_("deleted_at", "null").order("date", desc=False).execute()
+        # Aggregate: date → count of meetings
+        meet_data = {}
+        for row in meet_result.data:
+            d = row.get("date")
+            if d:
+                meet_data[d] = meet_data.get(d, 0) + 1
+        meetings_json = _json.dumps(meet_data)
+    except Exception as e:
+        logger.error(f"Failed to fetch meetings data for heatmap: {e}")
+        meetings_json = "{}"
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -3989,7 +4004,7 @@ async def activity_heatmap():
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-    background: #0d1117;
+    background: #191919;
     color: #c9d1d9;
     padding: 20px;
     min-height: 100vh;
@@ -4060,6 +4075,12 @@ async def activity_heatmap():
   .blue .lvl-2 {{ background-color: #0550ae; }}
   .blue .lvl-3 {{ background-color: #1a7af8; }}
   .blue .lvl-4 {{ background-color: #58a6ff; }}
+  /* Orange scale (meetings) */
+  .orange .lvl-0 {{ background-color: #161b22; }}
+  .orange .lvl-1 {{ background-color: #5a1e02; }}
+  .orange .lvl-2 {{ background-color: #8b3103; }}
+  .orange .lvl-3 {{ background-color: #d4560e; }}
+  .orange .lvl-4 {{ background-color: #f0883e; }}
   .month-labels {{
     display: flex;
     font-size: 10px;
@@ -4159,12 +4180,36 @@ async def activity_heatmap():
     </div>
   </div>
 
+  <!-- Meetings Heatmap (orange) -->
+  <div class="section orange" id="meetings-section">
+    <h1>Meetings</h1>
+    <div class="subtitle" id="meetings-subtitle"></div>
+    <div class="stats" id="meetings-stats"></div>
+    <div class="month-labels" id="meetings-months"></div>
+    <div class="heatmap-wrapper">
+      <div class="day-labels" id="meetings-daylabels"></div>
+      <div class="heatmap-scroll">
+        <div class="heatmap" id="meetings-heatmap"></div>
+      </div>
+    </div>
+    <div class="legend">
+      <span>Less</span>
+      <div class="day lvl-0"></div>
+      <div class="day lvl-1"></div>
+      <div class="day lvl-2"></div>
+      <div class="day lvl-3"></div>
+      <div class="day lvl-4"></div>
+      <span>More</span>
+    </div>
+  </div>
+
 </div>
 <div class="tooltip" id="tooltip"></div>
 
 <script>
 const ACTIVITY_DATA = {activity_json};
 const MEDITATION_DATA = {meditation_json};
+const MEETINGS_DATA = {meetings_json};
 const DAYS = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
@@ -4188,6 +4233,12 @@ function formatMins(m) {{
   const mins = Math.round(m % 60);
   if (mins === 0) return hrs + 'h';
   return hrs + 'h ' + mins + 'm';
+}}
+
+function formatMeetings(n) {{
+  if (!n || n < 1) return 'No meetings';
+  if (n === 1) return '1 meeting';
+  return n + ' meetings';
 }}
 
 function renderHeatmap(config) {{
@@ -4342,6 +4393,24 @@ renderHeatmap({{
     return 4;
   }},
   formatValue: formatMins,
+}});
+
+// Render Meetings heatmap (orange, count)
+renderHeatmap({{
+  data: MEETINGS_DATA,
+  heatmapId: 'meetings-heatmap',
+  monthsId: 'meetings-months',
+  dayLabelsId: 'meetings-daylabels',
+  statsId: 'meetings-stats',
+  subtitleId: 'meetings-subtitle',
+  getLevel: (n) => {{
+    if (!n || n < 1) return 0;
+    if (n === 1) return 1;
+    if (n === 2) return 2;
+    if (n <= 3) return 3;
+    return 4;
+  }},
+  formatValue: formatMeetings,
 }});
 </script>
 </body>
