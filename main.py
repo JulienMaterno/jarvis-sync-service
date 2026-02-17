@@ -4045,14 +4045,14 @@ async def activity_heatmap():
   }}
   .heatmap {{
     display: inline-grid;
-    grid-template-rows: repeat(7, 10px);
+    grid-template-rows: repeat(7, 13px);
     grid-auto-flow: column;
-    grid-auto-columns: 10px;
-    gap: 2px;
+    grid-auto-columns: 13px;
+    gap: 3px;
   }}
   .day {{
-    width: 10px;
-    height: 10px;
+    width: 13px;
+    height: 13px;
     border-radius: 2px;
     outline: 1px solid rgba(27, 31, 35, 0.06);
     outline-offset: -1px;
@@ -4090,16 +4090,16 @@ async def activity_heatmap():
   .month-label {{ text-align: left; }}
   .day-labels {{
     display: inline-grid;
-    grid-template-rows: repeat(7, 10px);
-    gap: 2px;
-    margin-right: 4px;
+    grid-template-rows: repeat(7, 13px);
+    gap: 3px;
+    margin-right: 6px;
     font-size: 9px;
     color: #7d8590;
     vertical-align: top;
   }}
   .day-label {{
-    height: 10px;
-    line-height: 10px;
+    height: 13px;
+    line-height: 13px;
   }}
   .legend {{
     display: flex;
@@ -4109,7 +4109,7 @@ async def activity_heatmap():
     font-size: 9px;
     color: #7d8590;
   }}
-  .legend .day {{ outline: none; width: 10px; height: 10px; }}
+  .legend .day {{ outline: none; width: 13px; height: 13px; }}
   .tooltip {{
     position: fixed;
     background: #1c2128;
@@ -4303,7 +4303,7 @@ function renderHeatmap(config) {{
 
   let monthHTML = '';
   let prevMonth = -1;
-  const weekWidth = 12;
+  const weekWidth = 16;
   weekStartMonth.forEach((w, i) => {{
     if (w.month !== prevMonth) {{
       const left = i * weekWidth;
