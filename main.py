@@ -4662,7 +4662,7 @@ function showDayDetail(dateStr) {{
   overlay.classList.add('active');
 
   const baseUrl = window.location.origin;
-  fetch(baseUrl + '/api/dashboard/day-detail?date=' + dateStr)
+  fetch(baseUrl + '/dashboard/day-detail?date=' + dateStr)
     .then(r => r.json())
     .then(data => {{
       if (!data.found) {{
@@ -4755,7 +4755,7 @@ document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
     return HTMLResponse(content=html)
 
 
-@app.get("/api/dashboard/day-detail")
+@app.get("/dashboard/day-detail")
 async def day_detail(date: str):
     """Return activity summary detail for a single date (YYYY-MM-DD).
 
