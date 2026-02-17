@@ -4270,6 +4270,8 @@ function renderHeatmap(config) {{
   let todayValue = 0;
   let thisWeekValue = 0;
   let prevWeekValue = 0;
+  let last28Value = 0;
+  let last28Days = 0;
   const weekStartMonth = [];
 
   // Monday of current week (Mon-Sun)
@@ -4279,6 +4281,11 @@ function renderHeatmap(config) {{
   prevMonday.setDate(prevMonday.getDate() - 7);
   const prevSunday = new Date(thisMonday);
   prevSunday.setDate(prevSunday.getDate() - 1);
+  const fourWeeksAgo = new Date(today);
+  fourWeeksAgo.setDate(fourWeeksAgo.getDate() - 28);
+
+  // Days elapsed this week (Mon=1 day, Tue=2, ..., Sun=7)
+  const daysThisWeek = todayDay + 1;
 
   const cursor = new Date(start);
   while (cursor <= today) {{
@@ -4292,6 +4299,7 @@ function renderHeatmap(config) {{
     if (localDateStr(cursor) === localDateStr(today)) todayValue = val;
     if (cursor >= thisMonday && cursor <= today) thisWeekValue += val;
     if (cursor >= prevMonday && cursor <= prevSunday) prevWeekValue += val;
+    if (cursor >= fourWeeksAgo && cursor <= today) {{ last28Value += val; last28Days++; }}
 
     if (dayOfWeek === 0) {{
       weekStartMonth.push({{ month: cursor.getMonth() }});
@@ -4342,12 +4350,15 @@ function renderHeatmap(config) {{
   const totalDays = dateKeys.length;
   subtitleEl.textContent = totalDays + ' days of tracking';
 
-  const avgValue = totalDays > 0 ? totalValue / totalDays : 0;
+  // Daily average from past 4 weeks
+  const avgValue = last28Days > 0 ? last28Value / last28Days : 0;
 
-  // Week comparison
+  // Week trend: compare daily avg this week vs daily avg prev week
   let weekDelta = '';
   if (prevWeekValue > 0) {{
-    const pct = Math.round(((thisWeekValue - prevWeekValue) / prevWeekValue) * 100);
+    const thisAvgPerDay = thisWeekValue / daysThisWeek;
+    const prevAvgPerDay = prevWeekValue / 7;
+    const pct = Math.round(((thisAvgPerDay - prevAvgPerDay) / prevAvgPerDay) * 100);
     if (pct > 0) weekDelta = ' <span style="color:#3fb950;font-size:10px">&#9650; ' + pct + '%</span>';
     else if (pct < 0) weekDelta = ' <span style="color:#f85149;font-size:10px">&#9660; ' + Math.abs(pct) + '%</span>';
     else weekDelta = ' <span style="color:#7d8590;font-size:10px">=</span>';
@@ -4355,8 +4366,8 @@ function renderHeatmap(config) {{
 
   statsEl.innerHTML = `
     <div class="stat"><div class="stat-value">${{formatValue(todayValue)}}</div><div class="stat-label">Today</div></div>
-    <div class="stat"><div class="stat-value">${{formatValue(thisWeekValue)}}${{weekDelta}}</div><div class="stat-label">This Week (vs prev)</div></div>
-    <div class="stat"><div class="stat-value">${{formatValue(avgValue)}}</div><div class="stat-label">Daily Avg</div></div>
+    <div class="stat"><div class="stat-value">${{formatValue(thisWeekValue)}}${{weekDelta}}</div><div class="stat-label">This Week (trend)</div></div>
+    <div class="stat"><div class="stat-value">${{formatValue(avgValue)}}</div><div class="stat-label">Daily Avg (4w)</div></div>
     <div class="stat"><div class="stat-value">${{streak}}d</div><div class="stat-label">Streak</div></div>
     <div class="stat"><div class="stat-value">${{activeDays}}</div><div class="stat-label">Active Days</div></div>
   `;
@@ -4372,7 +4383,8 @@ function renderHeatmap(config) {{
     }}
   }});
   heatmap.addEventListener('mousemove', (e) => {{
-    tooltip.style.left = (e.clientX + 12) + 'px';
+    const tw = tooltip.offsetWidth || 120;
+    tooltip.style.left = (e.clientX - tw - 12) + 'px';
     tooltip.style.top = (e.clientY - 30) + 'px';
   }});
   heatmap.addEventListener('mouseout', () => {{
