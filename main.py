@@ -4767,7 +4767,7 @@ document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
     const W = canvasC.offsetWidth;
     const H = 110;
     canvasC.width = W * 2; canvasC.height = H * 2;
-    const pad = {{ l: 30, r: 10, t: 10, b: 20 }};
+    const pad = {{ l: 30, r: 40, t: 10, b: 20 }};
     const cw = W - pad.l - pad.r;
     const ch = H - pad.t - pad.b;
 
@@ -4910,10 +4910,12 @@ document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
         ctx.stroke();
         ctx.setLineDash([]);
 
-        // Projected end-of-day label
+        // Projected end-of-day label (placed above the endpoint, left-aligned to stay in view)
         const projEnd = projected[hours];
-        ctx.fillStyle = 'rgba(57,211,83,0.6)'; ctx.font = '9px sans-serif'; ctx.textAlign = 'right';
-        ctx.fillText('~' + projEnd.toFixed(1) + 'h', W - pad.r - 2, yOf2(projEnd) - 5);
+        ctx.fillStyle = 'rgba(57,211,83,0.7)'; ctx.font = 'bold 9px sans-serif'; ctx.textAlign = 'right';
+        const projLabelX = xOf(hours) - 2;
+        const projLabelY = yOf2(projEnd) - 6;
+        ctx.fillText('~' + projEnd.toFixed(1) + 'h', projLabelX, Math.max(projLabelY, pad.t + 8));
       }}
 
       // Dot at current position
