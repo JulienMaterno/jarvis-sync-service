@@ -4757,10 +4757,23 @@ document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
 
 @app.get("/api/dashboard/day-detail")
 async def day_detail(date: str):
-    """Return activity summary detail for a single date (YYYY-MM-DD)."""
+    """Return activity summary detail for a single date (YYYY-MM-DD).
+
+    Dates in activity_summaries are stored as timestamptz (SGT midnight = UTC-8h),
+    so we query with a range instead of exact match.
+    """
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
     try:
-        result = supabase.table("activity_summaries").select("*").eq(
-            "date", date
+        sgt = _tz(_td(hours=8))
+        day = _dt.strptime(date, "%Y-%m-%d").replace(tzinfo=sgt)
+        day_start = day.isoformat()
+        day_end = (day + _td(days=1)).isoformat()
+
+        result = supabase.table("activity_summaries").select("*").gte(
+            "date", day_start
+        ).lt(
+            "date", day_end
         ).limit(1).execute()
 
         if not result.data:
