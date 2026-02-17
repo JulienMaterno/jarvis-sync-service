@@ -472,11 +472,14 @@ class JournalsSyncService(TwoWaySyncService):
                             except Exception as e:
                                 self.logger.warning(f"Failed to update content blocks: {e}")
                         
-                        # Update Supabase with new Notion timestamp to prevent re-sync loops
-                        # This is CRITICAL: without this, `last_sync_source` stays 'supabase'
-                        # and future Notion edits would be skipped!
+                        # Update Supabase with sync metadata to prevent re-sync loops.
+                        # IMPORTANT: Use the current UTC time for notion_updated_at rather than
+                        # Notion's last_edited_time (which is rounded to the minute). This avoids
+                        # a loop where updated_at (millisecond precision) > notion_updated_at
+                        # (minute precision), causing the record to look "changed" every cycle.
+                        now_utc = datetime.now(timezone.utc).isoformat()
                         self.supabase.update(record['id'], {
-                            'notion_updated_at': updated_page.get('last_edited_time'),
+                            'notion_updated_at': now_utc,
                             'last_sync_source': 'notion'
                         })
                         
