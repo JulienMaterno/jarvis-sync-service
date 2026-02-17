@@ -361,10 +361,22 @@ class ActivityWatchSync:
             # Calculate merged sessions: bridge short AFK gaps (<15 min)
             # This gives "working time" that includes reading/thinking
             SESSION_GAP = 15 * 60  # 15 minutes
+            MIN_AFK_EVENTS_THRESHOLD = 5  # Below this, AFK watcher likely crashed
             not_afk_events = sorted(
                 [e for e in afk_events if e.get("afk_status") == "not-afk"],
                 key=lambda e: e.get("timestamp", ""),
             )
+
+            # Fallback: if AFK watcher crashed (very few not-afk events) but
+            # window watcher kept running, use window foreground time instead
+            afk_watcher_healthy = len(not_afk_events) >= MIN_AFK_EVENTS_THRESHOLD
+            if not afk_watcher_healthy and len(window_events) > 50:
+                logger.warning(
+                    f"AFK watcher likely crashed: only {len(not_afk_events)} not-afk "
+                    f"events but {len(window_events)} window events. "
+                    f"Falling back to window foreground time."
+                )
+
             total_active_from_afk = 0.0
             session_start = None
             session_end = None
@@ -384,6 +396,20 @@ class ActivityWatchSync:
                         session_end = end
             if session_start is not None:
                 total_active_from_afk += (session_end - session_start).total_seconds()
+
+            # If AFK watcher was unhealthy, use window foreground time (minus LockApp)
+            if not afk_watcher_healthy and len(window_events) > 50:
+                window_fg_time = sum(
+                    e.get("duration", 0)
+                    for e in window_events
+                    if (e.get("app_name") or "").lower() != "lockapp.exe"
+                )
+                if window_fg_time > total_active_from_afk:
+                    logger.info(
+                        f"Using window fallback: {window_fg_time/3600:.1f}h "
+                        f"vs AFK-based {total_active_from_afk/3600:.1f}h"
+                    )
+                    total_active_from_afk = window_fg_time
             
             # Calculate app usage
             app_time = defaultdict(float)
