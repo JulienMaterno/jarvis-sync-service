@@ -329,131 +329,45 @@ class ActivityWatchSync:
         date: datetime.date,
         hostname: str
     ) -> Optional[Dict[str, Any]]:
-        """Calculate summary statistics from events."""
+        """Calculate summary statistics from events.
+
+        Working time = screen unlocked (any non-LockApp window in foreground).
+        This counts reading, meetings, watching agents run, etc.
+        AFK watcher data is kept for reference but not used as primary metric.
+        """
         try:
             # Separate by type
             window_events = [e for e in events if e.get("bucket_type") == "currentwindow"]
             afk_events = [e for e in events if e.get("bucket_type") == "afkstatus"]
             web_events = [e for e in events if e.get("bucket_type") == "web.tab.current"]
-            
-            # Deduplicate AFK events from Supabase (in case old dupes exist)
-            seen_afk: Dict[tuple, Dict[str, Any]] = {}
-            for e in afk_events:
-                ts = e.get("timestamp", "")[:19]
-                status = e.get("afk_status", "")
-                key = (ts, status)
-                if key not in seen_afk or e.get("duration", 0) > seen_afk[key].get("duration", 0):
-                    seen_afk[key] = e
-            afk_events = list(seen_afk.values())
 
-            # Calculate raw AFK/active time
-            total_afk = sum(
-                e.get("duration", 0)
-                for e in afk_events
-                if e.get("afk_status") == "afk"
-            )
-            raw_active = sum(
-                e.get("duration", 0)
-                for e in afk_events
-                if e.get("afk_status") == "not-afk"
-            )
-
-            # Calculate merged sessions: bridge short AFK gaps (<15 min)
-            # This gives "working time" that includes reading/thinking
-            SESSION_GAP = 15 * 60  # 15 minutes
-            MIN_AFK_EVENTS_THRESHOLD = 5  # Below this, AFK watcher likely crashed
-            not_afk_events = sorted(
-                [e for e in afk_events if e.get("afk_status") == "not-afk"],
-                key=lambda e: e.get("timestamp", ""),
-            )
-
-            # Fallback: if AFK watcher crashed (very few not-afk events) but
-            # window watcher kept running, use window foreground time instead
-            afk_watcher_healthy = len(not_afk_events) >= MIN_AFK_EVENTS_THRESHOLD
-            if not afk_watcher_healthy and len(window_events) > 50:
-                logger.warning(
-                    f"AFK watcher likely crashed: only {len(not_afk_events)} not-afk "
-                    f"events but {len(window_events)} window events. "
-                    f"Falling back to window foreground time."
-                )
-
-            total_active_from_afk = 0.0
-            session_start = None
-            session_end = None
-            for e in not_afk_events:
-                ts = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
-                end = ts + timedelta(seconds=e.get("duration", 0))
-                if session_start is None:
-                    session_start = ts
-                    session_end = end
-                else:
-                    gap = (ts - session_end).total_seconds()
-                    if gap <= SESSION_GAP:
-                        session_end = max(session_end, end)
-                    else:
-                        total_active_from_afk += (session_end - session_start).total_seconds()
-                        session_start = ts
-                        session_end = end
-            if session_start is not None:
-                total_active_from_afk += (session_end - session_start).total_seconds()
-
-            # If AFK watcher was unhealthy, use window foreground time (minus LockApp)
-            if not afk_watcher_healthy and len(window_events) > 50:
-                window_fg_time = sum(
-                    e.get("duration", 0)
-                    for e in window_events
-                    if (e.get("app_name") or "").lower() != "lockapp.exe"
-                )
-                if window_fg_time > total_active_from_afk:
-                    logger.info(
-                        f"Using window fallback: {window_fg_time/3600:.1f}h "
-                        f"vs AFK-based {total_active_from_afk/3600:.1f}h"
-                    )
-                    total_active_from_afk = window_fg_time
-            
-            # Build sorted not-afk intervals for intersecting with window/web events.
-            # This ensures we only count app/site time when the user was actually present.
-            active_intervals = []
-            for e in afk_events:
-                if e.get("afk_status") == "not-afk":
-                    iv_start = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
-                    iv_end = iv_start + timedelta(seconds=e.get("duration", 0))
-                    active_intervals.append((iv_start, iv_end))
-            active_intervals.sort()
-
-            def _interval_overlap(ev_start: datetime, ev_end: datetime,
-                                   intervals: list) -> float:
-                """Seconds of [ev_start, ev_end] overlapping with sorted intervals."""
-                total = 0.0
-                for iv_start, iv_end in intervals:
-                    if iv_start >= ev_end:
-                        break
-                    ov_start = max(ev_start, iv_start)
-                    ov_end = min(ev_end, iv_end)
-                    if ov_start < ov_end:
-                        total += (ov_end - ov_start).total_seconds()
-                return total
-
-            # Build browser-foreground intervals from window events.
-            # Web events are only valid when a browser is the active window.
+            # --- Working time from window events ---
+            # Screen unlocked = any app except LockApp.exe
+            # Screen locked = LockApp.exe (PC still on but user away)
+            # PC off/sleeping = gaps in window events
+            total_working = 0.0
+            total_locked = 0.0
+            app_time = defaultdict(float)
             browser_apps = {"chrome.exe", "firefox.exe", "msedge.exe", "brave.exe",
                             "safari", "opera.exe", "arc.exe", "vivaldi.exe"}
             browser_intervals = []
-            for e in window_events:
-                if (e.get("app_name") or "").lower() in {b.lower() for b in browser_apps}:
-                    b_start = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
-                    b_end = b_start + timedelta(seconds=e.get("duration", 0))
-                    browser_intervals.append((b_start, b_end))
-            browser_intervals.sort()
 
-            # Calculate app usage (only during not-afk periods)
-            app_time = defaultdict(float)
             for e in window_events:
                 app = e.get("app_name") or "Unknown"
-                ev_start = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
-                ev_end = ev_start + timedelta(seconds=e.get("duration", 0))
-                app_time[app] += _interval_overlap(ev_start, ev_end, active_intervals)
+                dur = e.get("duration", 0)
+                if app.lower() == "lockapp.exe":
+                    total_locked += dur
+                else:
+                    total_working += dur
+                    app_time[app] += dur
+                    if app.lower() in {b.lower() for b in browser_apps}:
+                        b_start = datetime.fromisoformat(
+                            e["timestamp"].replace("Z", "+00:00"))
+                        b_end = b_start + timedelta(seconds=dur)
+                        browser_intervals.append((b_start, b_end))
+            browser_intervals.sort()
 
+            # --- Top apps (by foreground time, excluding LockApp) ---
             top_apps = sorted(
                 [{"app": k, "duration": v} for k, v in app_time.items() if v > 0],
                 key=lambda x: x["duration"],
@@ -467,24 +381,27 @@ class ActivityWatchSync:
                     1
                 )
 
-            # Calculate website usage (only when not-afk AND browser is foreground)
-            # This prevents web events from overlapping with non-browser window events.
+            # --- Website usage (clipped to browser foreground) ---
+            def _interval_overlap(ev_start: datetime, ev_end: datetime,
+                                   intervals: list) -> float:
+                """Seconds of [ev_start, ev_end] overlapping with sorted intervals."""
+                total = 0.0
+                for iv_start, iv_end in intervals:
+                    if iv_start >= ev_end:
+                        break
+                    ov_start = max(ev_start, iv_start)
+                    ov_end = min(ev_end, iv_end)
+                    if ov_start < ov_end:
+                        total += (ov_end - ov_start).total_seconds()
+                return total
+
             site_time = defaultdict(float)
             for e in web_events:
                 domain = e.get("site_domain") or "Unknown"
                 ev_start = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
                 ev_end = ev_start + timedelta(seconds=e.get("duration", 0))
-                # Clip to browser foreground first, then to not-afk
-                browser_clipped = 0.0
-                for b_start, b_end in browser_intervals:
-                    if b_start >= ev_end:
-                        break
-                    clip_start = max(ev_start, b_start)
-                    clip_end = min(ev_end, b_end)
-                    if clip_start < clip_end:
-                        browser_clipped += _interval_overlap(clip_start, clip_end,
-                                                             active_intervals)
-                site_time[domain] += browser_clipped
+                site_time[domain] += _interval_overlap(ev_start, ev_end,
+                                                       browser_intervals)
 
             top_sites = sorted(
                 [{"domain": k, "duration": v} for k, v in site_time.items() if v > 0],
@@ -499,20 +416,15 @@ class ActivityWatchSync:
                     1
                 )
 
-            # Calculate productivity breakdown
-            # Use web events for browser time (more granular than chrome.exe window)
-            # and app events for non-browser apps (to avoid double-counting)
+            # --- Productivity breakdown (all screen-unlocked time) ---
             productive_time = 0.0
             distracting_time = 0.0
             neutral_time = 0.0
-
             browser_apps_lower = {b.lower() for b in browser_apps}
 
             for app, duration in app_time.items():
                 if app.lower() in browser_apps_lower:
                     continue  # Skip browsers — counted via web events below
-                if app.lower() == "lockapp.exe":
-                    continue  # Lock screen is idle, not productive or distracting
                 category = categorize_app(app)
                 if category == "productive":
                     productive_time += duration
@@ -529,20 +441,20 @@ class ActivityWatchSync:
                     distracting_time += duration
                 else:
                     neutral_time += duration
-            
-            # Calculate hourly breakdown (in local time)
-            # Split events that span hour boundaries so each hour gets accurate time
+
+            # --- Hourly breakdown from window events ---
+            # "active" = screen unlocked, "afk" = screen locked or PC off
             hourly = defaultdict(lambda: {"active": 0, "afk": 0})
-            for e in afk_events:
+            for e in window_events:
                 ts = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
                 ts_local = ts.astimezone(SGT)
                 remaining = e.get("duration", 0)
-                key = "afk" if e.get("afk_status") == "afk" else "active"
+                key = "afk" if (e.get("app_name") or "").lower() == "lockapp.exe" else "active"
 
                 cursor = ts_local
                 while remaining > 0:
-                    # Time until the next hour boundary
-                    next_hour = cursor.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+                    next_hour = cursor.replace(
+                        minute=0, second=0, microsecond=0) + timedelta(hours=1)
                     secs_to_boundary = (next_hour - cursor).total_seconds()
                     chunk = min(remaining, secs_to_boundary)
                     hourly[cursor.hour][key] += chunk
@@ -553,12 +465,12 @@ class ActivityWatchSync:
                 {"hour": h, **data}
                 for h, data in sorted(hourly.items())
             ]
-            
+
             return {
                 "date": str(date),
                 "hostname": hostname,
-                "total_active_time": total_active_from_afk,
-                "total_afk_time": total_afk,
+                "total_active_time": total_working,
+                "total_afk_time": total_locked,
                 "top_apps": top_apps,
                 "top_sites": top_sites,
                 "productive_time": productive_time,
@@ -567,7 +479,7 @@ class ActivityWatchSync:
                 "hourly_breakdown": hourly_breakdown,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
-            
+
         except Exception as e:
             logger.error(f"Failed to calculate summary: {e}")
             return None
