@@ -482,17 +482,26 @@ class ActivityWatchSync:
                     neutral_time += duration
             
             # Calculate hourly breakdown (in local time)
+            # Split events that span hour boundaries so each hour gets accurate time
             hourly = defaultdict(lambda: {"active": 0, "afk": 0})
             for e in afk_events:
                 ts = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
-                hour = ts.astimezone(SGT).hour
-                if e.get("afk_status") == "afk":
-                    hourly[hour]["afk"] += e.get("duration", 0)
-                else:
-                    hourly[hour]["active"] += e.get("duration", 0)
-            
+                ts_local = ts.astimezone(SGT)
+                remaining = e.get("duration", 0)
+                key = "afk" if e.get("afk_status") == "afk" else "active"
+
+                cursor = ts_local
+                while remaining > 0:
+                    # Time until the next hour boundary
+                    next_hour = cursor.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+                    secs_to_boundary = (next_hour - cursor).total_seconds()
+                    chunk = min(remaining, secs_to_boundary)
+                    hourly[cursor.hour][key] += chunk
+                    remaining -= chunk
+                    cursor = next_hour
+
             hourly_breakdown = [
-                {"hour": h, **data} 
+                {"hour": h, **data}
                 for h, data in sorted(hourly.items())
             ]
             
