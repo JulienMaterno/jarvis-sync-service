@@ -421,10 +421,11 @@ class ActivityWatchSync:
                     active_intervals.append((iv_start, iv_end))
             active_intervals.sort()
 
-            def _active_overlap(ev_start: datetime, ev_end: datetime) -> float:
-                """Seconds of [ev_start, ev_end] overlapping with not-afk intervals."""
+            def _interval_overlap(ev_start: datetime, ev_end: datetime,
+                                   intervals: list) -> float:
+                """Seconds of [ev_start, ev_end] overlapping with sorted intervals."""
                 total = 0.0
-                for iv_start, iv_end in active_intervals:
+                for iv_start, iv_end in intervals:
                     if iv_start >= ev_end:
                         break
                     ov_start = max(ev_start, iv_start)
@@ -433,13 +434,25 @@ class ActivityWatchSync:
                         total += (ov_end - ov_start).total_seconds()
                 return total
 
+            # Build browser-foreground intervals from window events.
+            # Web events are only valid when a browser is the active window.
+            browser_apps = {"chrome.exe", "firefox.exe", "msedge.exe", "brave.exe",
+                            "safari", "opera.exe", "arc.exe", "vivaldi.exe"}
+            browser_intervals = []
+            for e in window_events:
+                if (e.get("app_name") or "").lower() in {b.lower() for b in browser_apps}:
+                    b_start = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
+                    b_end = b_start + timedelta(seconds=e.get("duration", 0))
+                    browser_intervals.append((b_start, b_end))
+            browser_intervals.sort()
+
             # Calculate app usage (only during not-afk periods)
             app_time = defaultdict(float)
             for e in window_events:
                 app = e.get("app_name") or "Unknown"
                 ev_start = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
                 ev_end = ev_start + timedelta(seconds=e.get("duration", 0))
-                app_time[app] += _active_overlap(ev_start, ev_end)
+                app_time[app] += _interval_overlap(ev_start, ev_end, active_intervals)
 
             top_apps = sorted(
                 [{"app": k, "duration": v} for k, v in app_time.items() if v > 0],
@@ -454,13 +467,24 @@ class ActivityWatchSync:
                     1
                 )
 
-            # Calculate website usage (only during not-afk periods)
+            # Calculate website usage (only when not-afk AND browser is foreground)
+            # This prevents web events from overlapping with non-browser window events.
             site_time = defaultdict(float)
             for e in web_events:
                 domain = e.get("site_domain") or "Unknown"
                 ev_start = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
                 ev_end = ev_start + timedelta(seconds=e.get("duration", 0))
-                site_time[domain] += _active_overlap(ev_start, ev_end)
+                # Clip to browser foreground first, then to not-afk
+                browser_clipped = 0.0
+                for b_start, b_end in browser_intervals:
+                    if b_start >= ev_end:
+                        break
+                    clip_start = max(ev_start, b_start)
+                    clip_end = min(ev_end, b_end)
+                    if clip_start < clip_end:
+                        browser_clipped += _interval_overlap(clip_start, clip_end,
+                                                             active_intervals)
+                site_time[domain] += browser_clipped
 
             top_sites = sorted(
                 [{"domain": k, "duration": v} for k, v in site_time.items() if v > 0],
@@ -482,11 +506,10 @@ class ActivityWatchSync:
             distracting_time = 0.0
             neutral_time = 0.0
 
-            browser_apps = {"chrome.exe", "firefox.exe", "msedge.exe", "brave.exe",
-                            "safari", "opera.exe", "arc.exe", "vivaldi.exe"}
+            browser_apps_lower = {b.lower() for b in browser_apps}
 
             for app, duration in app_time.items():
-                if app.lower() in {b.lower() for b in browser_apps}:
+                if app.lower() in browser_apps_lower:
                     continue  # Skip browsers — counted via web events below
                 if app.lower() == "lockapp.exe":
                     continue  # Lock screen is idle, not productive or distracting
