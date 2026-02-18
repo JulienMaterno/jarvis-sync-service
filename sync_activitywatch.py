@@ -411,44 +411,70 @@ class ActivityWatchSync:
                     )
                     total_active_from_afk = window_fg_time
             
-            # Calculate app usage
+            # Build sorted not-afk intervals for intersecting with window/web events.
+            # This ensures we only count app/site time when the user was actually present.
+            active_intervals = []
+            for e in afk_events:
+                if e.get("afk_status") == "not-afk":
+                    iv_start = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
+                    iv_end = iv_start + timedelta(seconds=e.get("duration", 0))
+                    active_intervals.append((iv_start, iv_end))
+            active_intervals.sort()
+
+            def _active_overlap(ev_start: datetime, ev_end: datetime) -> float:
+                """Seconds of [ev_start, ev_end] overlapping with not-afk intervals."""
+                total = 0.0
+                for iv_start, iv_end in active_intervals:
+                    if iv_start >= ev_end:
+                        break
+                    ov_start = max(ev_start, iv_start)
+                    ov_end = min(ev_end, iv_end)
+                    if ov_start < ov_end:
+                        total += (ov_end - ov_start).total_seconds()
+                return total
+
+            # Calculate app usage (only during not-afk periods)
             app_time = defaultdict(float)
             for e in window_events:
                 app = e.get("app_name") or "Unknown"
-                app_time[app] += e.get("duration", 0)
-            
+                ev_start = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
+                ev_end = ev_start + timedelta(seconds=e.get("duration", 0))
+                app_time[app] += _active_overlap(ev_start, ev_end)
+
             top_apps = sorted(
-                [{"app": k, "duration": v} for k, v in app_time.items()],
+                [{"app": k, "duration": v} for k, v in app_time.items() if v > 0],
                 key=lambda x: x["duration"],
                 reverse=True
             )[:10]
-            
-            total_app_time = sum(app_time.values())
+
+            total_app_time = sum(a["duration"] for a in top_apps)
             for app in top_apps:
                 app["percentage"] = round(
                     (app["duration"] / total_app_time * 100) if total_app_time > 0 else 0,
                     1
                 )
-            
-            # Calculate website usage
+
+            # Calculate website usage (only during not-afk periods)
             site_time = defaultdict(float)
             for e in web_events:
                 domain = e.get("site_domain") or "Unknown"
-                site_time[domain] += e.get("duration", 0)
-            
+                ev_start = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
+                ev_end = ev_start + timedelta(seconds=e.get("duration", 0))
+                site_time[domain] += _active_overlap(ev_start, ev_end)
+
             top_sites = sorted(
-                [{"domain": k, "duration": v} for k, v in site_time.items()],
+                [{"domain": k, "duration": v} for k, v in site_time.items() if v > 0],
                 key=lambda x: x["duration"],
                 reverse=True
             )[:10]
-            
-            total_site_time = sum(site_time.values())
+
+            total_site_time = sum(s["duration"] for s in top_sites)
             for site in top_sites:
                 site["percentage"] = round(
                     (site["duration"] / total_site_time * 100) if total_site_time > 0 else 0,
                     1
                 )
-            
+
             # Calculate productivity breakdown
             # Use web events for browser time (more granular than chrome.exe window)
             # and app events for non-browser apps (to avoid double-counting)
