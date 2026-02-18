@@ -404,7 +404,11 @@ class JournalsSyncService(TwoWaySyncService):
                     needs_sync = True
                 elif r.get('last_sync_source') == 'supabase':
                     needs_sync = True
-                else:
+                elif r.get('last_sync_source') != 'notion':
+                    # Only use timestamp comparison if last_sync_source is NOT 'notion'.
+                    # After syncing to Notion, we set last_sync_source='notion', but the
+                    # Supabase updated_at trigger makes updated_at slightly later than
+                    # notion_updated_at, causing a false positive every cycle.
                     comparison = self.compare_timestamps(
                         r.get('updated_at'),
                         r.get('notion_updated_at')
