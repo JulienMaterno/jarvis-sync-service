@@ -54,8 +54,8 @@ logger = logging.getLogger('HighlightsSync')
 NOTION_API_TOKEN = os.environ.get('NOTION_API_TOKEN')
 # Highlights database ID - discovered from Notion
 NOTION_HIGHLIGHTS_DB_ID = os.environ.get(
-    'NOTION_HIGHLIGHTS_DB_ID', 
-    '16a068b5-e624-81e9-a7ef-ecbf84c577ef'
+    'NOTION_HIGHLIGHTS_DB_ID',
+    '2feb4bd3-9e07-816a-8ed5-d08245bd2831'
 )
 
 SUPABASE_URL = os.environ.get('SUPABASE_URL', '').strip()
