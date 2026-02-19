@@ -13,7 +13,7 @@ from lib.sync_service import sync_contacts
 from lib.notion_sync import sync_notion_to_supabase, sync_supabase_to_notion
 from lib.telegram_client import notify_error, reset_failure_count
 from lib.health_monitor import check_sync_health, get_sync_statistics, run_health_check, SystemHealthMonitor
-from reports import generate_daily_report, generate_evening_journal_prompt
+from reports import generate_daily_report, generate_evening_journal_prompt, generate_morning_task_digest, check_overdue_task_alerts
 from backup import backup_contacts
 import logging
 
@@ -1050,6 +1050,39 @@ async def evening_journal_prompt(background_tasks: BackgroundTasks):
     try:
         background_tasks.add_task(generate_evening_journal_prompt)
         return {"status": "queued", "message": "Evening journal prompt generation started"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/report/morning-tasks")
+async def morning_tasks_digest(background_tasks: BackgroundTasks):
+    """
+    Generates and sends a morning task digest via Telegram.
+
+    Shows overdue tasks, tasks due today, high-priority items,
+    and tasks due this week.
+
+    Schedule this at 8am SGT via Cloud Scheduler.
+    """
+    try:
+        background_tasks.add_task(generate_morning_task_digest)
+        return {"status": "queued", "message": "Morning task digest generation started"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/report/overdue-alerts")
+async def overdue_task_alerts(background_tasks: BackgroundTasks):
+    """
+    Check for newly overdue tasks and send alerts via Telegram.
+
+    Tracks which tasks have already been notified to avoid spam.
+
+    Schedule this every 4 hours via Cloud Scheduler.
+    """
+    try:
+        background_tasks.add_task(check_overdue_task_alerts)
+        return {"status": "queued", "message": "Overdue task alert check started"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -3949,24 +3982,34 @@ async def activity_heatmap():
     """
     import json as _json
 
-    # --- Fetch activity data ---
+    # --- Fetch activity data (heatmap: lightweight, no hourly_breakdown) ---
     try:
         result = supabase.table("activity_summaries").select(
-            "date, total_active_time, productive_time, distracting_time, hourly_breakdown"
+            "date, total_active_time, productive_time, distracting_time"
         ).order("date", desc=False).limit(365).execute()
         activity_data = {}
-        hourly_by_date = {}
         for row in result.data:
             active_seconds = row.get("total_active_time") or 0
             activity_data[row["date"]] = round(active_seconds / 3600, 2)
-            hb = row.get("hourly_breakdown")
-            if hb:
-                hourly_by_date[row["date"]] = hb
         activity_json = _json.dumps(activity_data)
-        hourly_json = _json.dumps(hourly_by_date)
     except Exception as e:
         logger.error(f"Failed to fetch activity data for heatmap: {e}")
         activity_json = "{}"
+
+    # --- Fetch hourly breakdown (only last 30 days for pace chart) ---
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+        hourly_result = supabase.table("activity_summaries").select(
+            "date, hourly_breakdown"
+        ).gte("date", cutoff).order("date", desc=False).execute()
+        hourly_by_date = {}
+        for row in hourly_result.data:
+            hb = row.get("hourly_breakdown")
+            if hb:
+                hourly_by_date[row["date"]] = hb
+        hourly_json = _json.dumps(hourly_by_date)
+    except Exception as e:
+        logger.error(f"Failed to fetch hourly data for heatmap: {e}")
         hourly_json = "{}"
 
     # --- Fetch meditation data ---
@@ -5012,7 +5055,10 @@ document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
 </body>
 </html>"""
 
-    return HTMLResponse(content=html)
+    return HTMLResponse(
+        content=html,
+        headers={"Cache-Control": "public, max-age=300"},
+    )
 
 
 @app.get("/dashboard/day-detail")

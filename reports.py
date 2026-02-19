@@ -169,6 +169,7 @@ async def generate_evening_journal_prompt():
             "tasks_completed": [],
             "tasks_created": [],
             "tasks_due_today": [],  # Tasks scheduled for today (may have been set earlier)
+            "tasks_overdue": [],  # Tasks past due date, still pending
             "reflections": [],
             "highlights": [],  # Book highlights
             "reading": None,
@@ -235,6 +236,16 @@ async def generate_evening_journal_prompt():
             .is_("deleted_at", "null") \
             .execute()
         activity_data["tasks_due_today"] = tasks_due_today_resp.data or []
+
+        # Overdue tasks (due before today, still pending - critical for awareness)
+        tasks_overdue_resp = supabase.table("tasks") \
+            .select("id, title, description, priority, due_date, status, created_at") \
+            .eq("status", "pending") \
+            .lt("due_date", today.isoformat()) \
+            .is_("deleted_at", "null") \
+            .order("due_date") \
+            .execute()
+        activity_data["tasks_overdue"] = tasks_overdue_resp.data or []
         
         # Reflections (today)
         reflections_resp = supabase.table("reflections") \
@@ -287,6 +298,7 @@ async def generate_evening_journal_prompt():
             "tasks_completed_count": len(activity_data["tasks_completed"]),
             "tasks_created_count": len(activity_data["tasks_created"]),
             "tasks_due_today_count": len(activity_data["tasks_due_today"]),
+            "tasks_overdue_count": len(activity_data["tasks_overdue"]),
             "reflections_count": len(activity_data["reflections"]),
             "calendar_events_count": len(activity_data["calendar_events"]),
             "emails_count": len(activity_data["emails"]),
@@ -563,4 +575,219 @@ _{yesterday.strftime('%Y-%m-%d')} to {datetime.now(timezone.utc).strftime('%Y-%m
     except Exception as e:
         logger.error(f"Failed to generate report: {e}")
         # Don't notify error about the report itself to avoid loops, just log it
+        raise e
+
+
+async def generate_morning_task_digest():
+    """
+    Generate and send a morning task digest via Telegram.
+
+    Shows:
+    - Overdue tasks (past due date, still pending)
+    - Tasks due today
+    - High-priority pending tasks (no due date or future)
+    - Tasks due this week
+
+    Triggered daily at 8am SGT via Cloud Scheduler.
+    """
+    try:
+        import pytz
+        logger.info("Generating morning task digest...")
+
+        # Get user timezone
+        user_tz_str = "Asia/Singapore"
+        try:
+            tz_result = supabase.table("sync_state").select("value").eq("key", "user_timezone").execute()
+            if tz_result.data:
+                user_tz_str = tz_result.data[0]["value"]
+        except Exception as e:
+            logger.warning(f"Could not fetch user timezone: {e}")
+
+        user_tz = pytz.timezone(user_tz_str)
+        now_local = datetime.now(user_tz)
+        today = now_local.date()
+        end_of_week = today + timedelta(days=(6 - today.weekday()))  # Sunday
+
+        # Fetch overdue tasks
+        overdue_resp = supabase.table("tasks") \
+            .select("id, title, priority, due_date") \
+            .eq("status", "pending") \
+            .lt("due_date", today.isoformat()) \
+            .is_("deleted_at", "null") \
+            .order("due_date") \
+            .execute()
+        overdue_tasks = overdue_resp.data or []
+
+        # Fetch tasks due today
+        today_resp = supabase.table("tasks") \
+            .select("id, title, priority, due_date") \
+            .eq("status", "pending") \
+            .eq("due_date", today.isoformat()) \
+            .is_("deleted_at", "null") \
+            .execute()
+        today_tasks = today_resp.data or []
+
+        # Fetch tasks due rest of week (tomorrow through Sunday)
+        tomorrow = today + timedelta(days=1)
+        week_resp = supabase.table("tasks") \
+            .select("id, title, priority, due_date") \
+            .eq("status", "pending") \
+            .gte("due_date", tomorrow.isoformat()) \
+            .lte("due_date", end_of_week.isoformat()) \
+            .is_("deleted_at", "null") \
+            .order("due_date") \
+            .execute()
+        week_tasks = week_resp.data or []
+
+        # Fetch high-priority tasks without near due date (not already in above lists)
+        high_resp = supabase.table("tasks") \
+            .select("id, title, priority, due_date") \
+            .eq("status", "pending") \
+            .eq("priority", "high") \
+            .is_("deleted_at", "null") \
+            .execute()
+        # Filter out tasks already shown in overdue/today/week
+        shown_ids = {t["id"] for t in overdue_tasks + today_tasks + week_tasks}
+        high_tasks = [t for t in (high_resp.data or []) if t["id"] not in shown_ids]
+
+        # If nothing to report, send a brief "all clear"
+        total = len(overdue_tasks) + len(today_tasks) + len(week_tasks) + len(high_tasks)
+        if total == 0:
+            await send_telegram_message(
+                f"*Good morning!* _{now_local.strftime('%A, %B %d')}_\n\n"
+                "No pending tasks. Enjoy your day!"
+            )
+            return {"status": "success", "tasks_count": 0}
+
+        # Build the digest message
+        lines = []
+        lines.append(f"*Morning Task Digest*")
+        lines.append(f"_{now_local.strftime('%A, %B %d, %Y')}_")
+        lines.append("")
+
+        def _format_task(task, show_due=False):
+            priority = task.get("priority", "")
+            icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(priority, "⚪")
+            line = f"  {icon} {task['title']}"
+            if show_due and task.get("due_date"):
+                line += f" (due {task['due_date']})"
+            return line
+
+        if overdue_tasks:
+            lines.append(f"*⚠️ Overdue ({len(overdue_tasks)}):*")
+            for t in overdue_tasks:
+                lines.append(_format_task(t, show_due=True))
+            lines.append("")
+
+        if today_tasks:
+            lines.append(f"*📅 Due Today ({len(today_tasks)}):*")
+            for t in today_tasks:
+                lines.append(_format_task(t))
+            lines.append("")
+
+        if high_tasks:
+            lines.append(f"*🔴 High Priority:*")
+            for t in high_tasks[:5]:
+                lines.append(_format_task(t, show_due=True))
+            lines.append("")
+
+        if week_tasks:
+            lines.append(f"*📆 This Week ({len(week_tasks)}):*")
+            for t in week_tasks[:7]:
+                lines.append(_format_task(t, show_due=True))
+            lines.append("")
+
+        lines.append("_Reply to update tasks or add new ones._")
+
+        message = "\n".join(lines)
+        await send_telegram_message(message)
+        logger.info(f"Morning task digest sent: {total} tasks")
+        return {"status": "success", "tasks_count": total}
+
+    except Exception as e:
+        logger.error(f"Failed to generate morning task digest: {e}")
+        raise e
+
+
+async def check_overdue_task_alerts():
+    """
+    Check for newly overdue tasks and send a Telegram alert.
+
+    Tracks which tasks have already been notified via sync_state
+    to avoid spamming the same overdue task repeatedly.
+
+    Called periodically (every 4 hours) by Cloud Scheduler.
+    """
+    try:
+        import pytz
+        logger.info("Checking for overdue task alerts...")
+
+        user_tz_str = "Asia/Singapore"
+        try:
+            tz_result = supabase.table("sync_state").select("value").eq("key", "user_timezone").execute()
+            if tz_result.data:
+                user_tz_str = tz_result.data[0]["value"]
+        except Exception:
+            pass
+
+        user_tz = pytz.timezone(user_tz_str)
+        today = datetime.now(user_tz).date()
+
+        # Get overdue tasks
+        overdue_resp = supabase.table("tasks") \
+            .select("id, title, priority, due_date") \
+            .eq("status", "pending") \
+            .lt("due_date", today.isoformat()) \
+            .is_("deleted_at", "null") \
+            .order("due_date") \
+            .execute()
+        overdue_tasks = overdue_resp.data or []
+
+        if not overdue_tasks:
+            logger.info("No overdue tasks found.")
+            return {"status": "success", "alerted": 0}
+
+        # Get previously notified task IDs from sync_state
+        notified_ids = set()
+        try:
+            state_resp = supabase.table("sync_state").select("value").eq("key", "overdue_tasks_notified").execute()
+            if state_resp.data and state_resp.data[0].get("value"):
+                import json
+                notified_ids = set(json.loads(state_resp.data[0]["value"]))
+        except Exception:
+            pass
+
+        # Find newly overdue tasks
+        new_overdue = [t for t in overdue_tasks if t["id"] not in notified_ids]
+
+        if not new_overdue:
+            logger.info(f"{len(overdue_tasks)} overdue tasks, all previously notified.")
+            return {"status": "success", "alerted": 0}
+
+        # Send alert for new overdue tasks
+        lines = [f"*⚠️ {len(new_overdue)} task{'s' if len(new_overdue) > 1 else ''} just went overdue:*", ""]
+        for t in new_overdue:
+            priority_icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(t.get("priority", ""), "⚪")
+            lines.append(f"  {priority_icon} {t['title']} (due {t.get('due_date', '?')})")
+        lines.append("")
+        lines.append("_Reply to complete or reschedule._")
+
+        await send_telegram_message("\n".join(lines))
+
+        # Update notified set (keep all current overdue IDs)
+        import json
+        all_overdue_ids = [t["id"] for t in overdue_tasks]
+        try:
+            supabase.table("sync_state").upsert({
+                "key": "overdue_tasks_notified",
+                "value": json.dumps(all_overdue_ids)
+            }).execute()
+        except Exception as e:
+            logger.warning(f"Failed to update overdue notified state: {e}")
+
+        logger.info(f"Overdue alert sent for {len(new_overdue)} new tasks")
+        return {"status": "success", "alerted": len(new_overdue)}
+
+    except Exception as e:
+        logger.error(f"Failed to check overdue tasks: {e}")
         raise e
