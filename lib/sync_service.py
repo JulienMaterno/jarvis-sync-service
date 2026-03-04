@@ -157,46 +157,52 @@ async def sync_contacts():
                     
                     # Timestamps
                     sb_updated_at = sb_contact.get("updated_at")
-                    google_updated_at = current_google_data.get("_google_updated_at")
-                    
-                    # Determine winner
-                    update_direction = None # None, 'to_google', 'to_supabase'
-                    
-                    if sb_updated_at and google_updated_at:
-                        # Parse timestamps safely
-                        def parse_iso(ts):
-                            if not ts: return None
-                            if ts.endswith('Z'):
-                                ts = ts[:-1] + '+00:00'
-                            return datetime.fromisoformat(ts)
+                    google_api_updated = current_google_data.get("_google_updated_at")
+                    last_synced_at = sb_contact.get("google_updated_at")  # Our sync watermark
 
-                        sb_dt = parse_iso(sb_updated_at)
-                        google_dt = parse_iso(google_updated_at)
-                        
-                        # Buffer for self-updates (5 seconds)
-                        last_source = sb_contact.get("last_sync_source")
-                        
-                        if last_source == "google":
-                            # Last update came from Google. Only update Google if Supabase is significantly newer
-                            if sb_dt > google_dt + timedelta(seconds=5):
-                                update_direction = 'to_google'
-                            elif google_dt > sb_dt:
-                                # Google is newer (user edit in Google)
+                    # Determine winner using watermark-based comparison.
+                    # google_updated_at tracks when WE last synced with Google.
+                    # Only act if either side changed SINCE that watermark.
+                    # This prevents ping-pong where pushing makes Google "newer",
+                    # causing a pull, which makes Supabase "newer", causing a push...
+                    update_direction = None # None, 'to_google', 'to_supabase'
+
+                    def parse_iso(ts):
+                        if not ts: return None
+                        if ts.endswith('Z'):
+                            ts = ts[:-1] + '+00:00'
+                        return datetime.fromisoformat(ts)
+
+                    sb_dt = parse_iso(sb_updated_at)
+                    google_dt = parse_iso(google_api_updated)
+                    synced_dt = parse_iso(last_synced_at)
+
+                    buffer = timedelta(seconds=5)
+
+                    if synced_dt:
+                        # We have a watermark - compare against it
+                        google_changed = google_dt and google_dt > synced_dt + buffer
+                        supabase_changed = sb_dt and sb_dt > synced_dt + buffer
+
+                        if google_changed and supabase_changed:
+                            # Both changed since last sync - last write wins
+                            if google_dt > sb_dt:
                                 update_direction = 'to_supabase'
-                        else:
-                            # Last update came from Supabase/Notion. Only update Supabase if Google is significantly newer
-                            if google_dt > sb_dt + timedelta(seconds=5):
-                                update_direction = 'to_supabase'
-                            elif sb_dt > google_dt:
+                            else:
                                 update_direction = 'to_google'
-                    elif not google_updated_at:
+                        elif google_changed:
+                            update_direction = 'to_supabase'
+                        elif supabase_changed:
+                            update_direction = 'to_google'
+                        # else: neither changed since last sync → content comparison only
+                    elif sb_dt and google_dt:
+                        # No watermark yet - first sync, use direct comparison
+                        if google_dt > sb_dt + buffer:
+                            update_direction = 'to_supabase'
+                        elif sb_dt > google_dt:
+                            update_direction = 'to_google'
+                    elif not google_dt:
                         update_direction = 'to_google'
-                    
-                    # If timestamps are close or inconclusive, check content equality to avoid unnecessary writes
-                    if not update_direction:
-                        # Fallback: Check content. If different, default to Supabase (Hub) -> Google
-                        # But only if we didn't decide 'to_supabase' already
-                        pass
 
                     # Execute Update
                     if update_direction == 'to_supabase':
@@ -204,9 +210,10 @@ async def sync_contacts():
                         # Remove internal fields
                         update_data = {k: v for k, v in current_google_data.items() if not k.startswith('_')}
                         update_data["last_sync_source"] = "google"
-                        update_data["google_updated_at"] = current_google_data.get("_google_updated_at")
-                        # Explicitly update updated_at to prevent infinite loops if no DB trigger exists
-                        update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+                        # Set watermark to NOW so the next cycle knows we just synced
+                        now_utc = datetime.now(timezone.utc).isoformat()
+                        update_data["google_updated_at"] = now_utc
+                        update_data["updated_at"] = now_utc
 
                         supabase.table("contacts").update(update_data).eq("id", sb_contact["id"]).execute()
                         await log_sync_event("update_supabase", "success", f"Updated {sb_contact.get('email')} from Google")
