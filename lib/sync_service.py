@@ -245,7 +245,7 @@ async def sync_contacts():
                                 if field == "subscribed" and (not sb_val) and (not google_val):
                                     continue
                                 needs_update = True
-                                logger.debug(f"Content diff for {sb_contact.get('email')}: {field} sb={sb_val!r} vs google={google_val!r}")
+                                logger.info(f"Content diff for {sb_contact.get('email', sb_contact.get('first_name'))}: {field} sb={sb_val!r} vs google={google_val!r}")
                                 break
                         
                         # Also check if contact needs to be added to My Contacts
