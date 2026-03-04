@@ -28,12 +28,12 @@ logger = logging.getLogger(__name__)
 # Notion API
 NOTION_API_TOKEN = os.environ.get('NOTION_API_TOKEN')
 
-# Database IDs (same as in sync modules)
+# Database IDs - MUST match the respective sync service modules exactly
 NOTION_DB_IDS = {
     'meetings': os.environ.get('NOTION_MEETING_DB_ID', '297cd3f1-eb28-810f-86f0-f142f7e3a5ca'),
-    'tasks': os.environ.get('NOTION_TASK_DB_ID', '1f7cd3f1-eb28-80ec-85b9-dc9f5e3e50ac'),
-    'reflections': os.environ.get('NOTION_REFLECTIONS_DB_ID', '1f7cd3f1-eb28-8062-8bf6-de95f57f39ef'),
-    'journals': os.environ.get('NOTION_JOURNALS_DB_ID', '1f7cd3f1-eb28-8032-9a5c-f91afab45c6b'),
+    'tasks': os.environ.get('NOTION_TASKS_DB_ID', '2b3cd3f1-eb28-8004-a33a-d26b8bb3fa58'),
+    'reflections': os.environ.get('NOTION_REFLECTIONS_DB_ID', '2cacd3f1-eb28-80d9-903a-ee73d2f84b59'),
+    'journals': os.environ.get('NOTION_JOURNAL_DB_ID', '2cecd3f1-eb28-8098-bf5e-d49ae4a68f6b'),
     'contacts': os.environ.get('NOTION_CRM_DATABASE_ID', '2d1068b5-e624-81e8-9c1c-f1d45c33e420'),
 }
 
@@ -187,10 +187,14 @@ def check_for_changes(supabase_client, entity: str) -> ChangeCheckResult:
     
     # Determine if sync needed
     # -1 means error/unknown - sync to be safe
+    # Contacts always sync: Google changes (new phone contacts, edits) are
+    # undetectable from Supabase alone since they don't exist here yet.
+    # With ~200 contacts the overhead is negligible (~5-10s per cycle).
     has_changes = (
-        notion_changes != 0 or 
-        supabase_changes != 0 or 
-        notion_changes == -1 or 
+        entity == 'contacts' or
+        notion_changes != 0 or
+        supabase_changes != 0 or
+        notion_changes == -1 or
         supabase_changes == -1
     )
     
