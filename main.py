@@ -11,6 +11,7 @@ from starlette.responses import JSONResponse
 from pydantic import BaseModel
 from lib.sync_service import sync_contacts
 from lib.notion_sync import sync_notion_to_supabase, sync_supabase_to_notion
+from lib.logging_service import log_sync_event
 from lib.telegram_client import notify_error, reset_failure_count
 from lib.health_monitor import check_sync_health, get_sync_statistics, run_health_check, SystemHealthMonitor
 from reports import generate_daily_report, generate_evening_journal_prompt, generate_morning_task_digest, check_overdue_task_alerts
@@ -672,6 +673,19 @@ async def sync_everything(background_tasks: BackgroundTasks):
             await run_step("notion_to_supabase", sync_notion_to_supabase, entity_name='contacts')
             await run_step("google_sync", sync_contacts)
             await run_step("supabase_to_notion", sync_supabase_to_notion)
+
+            # Log contacts sync completion (consistent with other entity *Sync_complete events)
+            contacts_status = "success" if all(
+                results.get(k, {}).get("status") == "success"
+                for k in ["notion_to_supabase", "google_sync", "supabase_to_notion"]
+            ) else "partial"
+            google_stats = results.get("google_sync", {}).get("data", {})
+            synced = google_stats.get("synced", 0) if isinstance(google_stats, dict) else 0
+            errors = google_stats.get("errors", 0) if isinstance(google_stats, dict) else 0
+            await log_sync_event(
+                "ContactsSync_complete", contacts_status,
+                f"Contacts sync: {synced} synced, {errors} errors (Notion+Google+Notion)"
+            )
         else:
             results["contacts_sync"] = {"status": "skipped", "reason": "no_changes"}
         

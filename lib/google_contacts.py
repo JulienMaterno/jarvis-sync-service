@@ -397,8 +397,6 @@ def calculate_memberships(
             
     # 3. Add new Location label
     if target_location:
-        # If we have a mapping for this location, add it.
-        # If not, the caller should have created it and updated the map!
         group_id = name_to_id_map.get(target_location)
         if group_id:
             new_memberships.append({
@@ -406,6 +404,8 @@ def calculate_memberships(
                     "contactGroupResourceName": group_id
                 }
             })
+        else:
+            logger.warning(f"Location group '{target_location}' not found in Google Contacts groups")
             
     # 4. Add Subscribed label
     if target_subscribed:
@@ -416,7 +416,13 @@ def calculate_memberships(
                     "contactGroupResourceName": group_id
                 }
             })
-            
+        else:
+            logger.warning(
+                "Contact marked as subscribed but 'Subscribed' group not found in Google Contacts. "
+                f"Available groups: {list(name_to_id_map.keys())}. "
+                "The group may have been deleted — it will be auto-created on next sync."
+            )
+
     return new_memberships
 
 @retry_with_backoff(

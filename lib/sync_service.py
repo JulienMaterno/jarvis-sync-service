@@ -58,7 +58,10 @@ async def sync_contacts():
         group_mapping = await get_contact_groups(token)
         # Invert mapping for writing (Name -> ID)
         name_to_id_map = {v: k for k, v in group_mapping.items()}
-        
+
+        # Ensure "Subscribed" group exists (auto-create like location groups)
+        await ensure_group_exists(token, "Subscribed", name_to_id_map)
+
         # 2. Fetch all from Google
         google_contacts_list = await get_all_contacts(token)
         # Map by resourceName for easy lookup
@@ -132,11 +135,13 @@ async def sync_contacts():
 
                     new_contact = await retry_async(create_contact, token, sb_contact, name_to_id_map)
                     new_resource_name = new_contact["resourceName"]
-                    
-                    # Update Supabase with the new ID
+
+                    # Update Supabase with the new ID and sync state
+                    now_utc = datetime.now(timezone.utc).isoformat()
                     supabase.table("contacts").update({
                         "google_resource_name": new_resource_name,
-                        "last_sync_source": "google"
+                        "last_sync_source": "google",
+                        "google_updated_at": now_utc
                     }).eq("id", sb_contact["id"]).execute()
                     
                     await log_sync_event("create_google", "success", f"Created {sb_contact.get('email')} in Google")
@@ -199,30 +204,41 @@ async def sync_contacts():
                         # Remove internal fields
                         update_data = {k: v for k, v in current_google_data.items() if not k.startswith('_')}
                         update_data["last_sync_source"] = "google"
+                        update_data["google_updated_at"] = current_google_data.get("_google_updated_at")
                         # Explicitly update updated_at to prevent infinite loops if no DB trigger exists
                         update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
-                        
+
                         supabase.table("contacts").update(update_data).eq("id", sb_contact["id"]).execute()
                         await log_sync_event("update_supabase", "success", f"Updated {sb_contact.get('email')} from Google")
                         synced_count += 1
                         
                     elif update_direction == 'to_google' or update_direction is None:
                         # Check if content actually changed before pushing to Google
+                        # NOTE: We compare profile_content (not notes) because profile_content
+                        # is the canonical field. Google biographies are set from profile_content
+                        # via transform_to_google_body, but transform_contact reads them back
+                        # into both notes AND profile_content. Comparing notes would cause
+                        # false positives when Supabase notes=None but profile_content has data.
                         fields_to_check = [
                             "first_name", "last_name", "email", "phone", "phone_secondary",
-                            "company", "job_title", "notes", "birthday", "linkedin_url", 
+                            "company", "job_title", "profile_content", "birthday", "linkedin_url",
                             "location", "subscribed"
                         ]
-                        
+
                         needs_update = False
                         for field in fields_to_check:
                             sb_val = sb_contact.get(field)
                             google_val = current_google_data.get(field)
-                            
+
                             if sb_val != google_val:
+                                # Treat None and empty string as equivalent
                                 if (sb_val is None and google_val == "") or (sb_val == "" and google_val is None):
                                     continue
+                                # Treat False and None as equivalent for boolean fields
+                                if field == "subscribed" and (not sb_val) and (not google_val):
+                                    continue
                                 needs_update = True
+                                logger.debug(f"Content diff for {sb_contact.get('email')}: {field} sb={sb_val!r} vs google={google_val!r}")
                                 break
                         
                         # Also check if contact needs to be added to My Contacts
@@ -235,11 +251,22 @@ async def sync_contacts():
                         
                         if needs_update:
                             logger.info(f"Updating Google contact {resource_name} (Supabase is newer/different)")
-                            
+
                             # Ensure group exists
                             await ensure_group_exists(token, sb_contact.get("location"), name_to_id_map)
 
                             await retry_async(update_contact, token, resource_name, sb_contact, etag, google_contact, name_to_id_map)
+
+                            # Write back google_updated_at to prevent redundant pushes on next cycle.
+                            # NOTE: We intentionally do NOT set last_sync_source here. The change
+                            # detection in sync_cursor.py filters for last_sync_source='supabase'
+                            # to detect manual edits. Setting it to 'google' would make future
+                            # Supabase edits invisible to change detection.
+                            now_utc = datetime.now(timezone.utc).isoformat()
+                            supabase.table("contacts").update({
+                                "google_updated_at": now_utc
+                            }).eq("id", sb_contact["id"]).execute()
+
                             await log_sync_event("update_google", "success", f"Updated {sb_contact.get('email')} in Google")
                             synced_count += 1
                     
@@ -283,6 +310,7 @@ async def sync_contacts():
                 # Filter out internal fields (starting with _)
                 contact_data = {k: v for k, v in raw_data.items() if not k.startswith('_')}
                 contact_data["last_sync_source"] = "google"
+                contact_data["google_updated_at"] = raw_data.get("_google_updated_at")
                 
                 # Insert into Supabase
                 # We use upsert here just in case, but insert is fine too
