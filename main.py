@@ -670,7 +670,7 @@ async def sync_everything(background_tasks: BackgroundTasks):
         
         # === CONTACTS SYNC (conditional - checks Notion CRM + Supabase changes) ===
         if 'contacts' in synced_entities:
-            await run_step("notion_to_supabase", sync_notion_to_supabase, entity_name='contacts')
+            await run_step("notion_to_supabase", lambda: sync_notion_to_supabase(check_deletions=True), entity_name='contacts')
             await run_step("google_sync", sync_contacts)
             await run_step("supabase_to_notion", sync_supabase_to_notion)
 

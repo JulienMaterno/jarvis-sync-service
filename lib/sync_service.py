@@ -311,18 +311,29 @@ async def sync_contacts():
         #    - These are in Google but NOT in Supabase (or at least not linked)
         for resource_name, google_contact in google_contacts_map.items():
             try:
+                # Check if this contact was previously soft-deleted in Supabase.
+                # If so, skip re-ingestion — the deletion was intentional (e.g., from Notion).
+                existing_deleted = supabase.table("contacts").select("id")\
+                    .eq("google_resource_name", resource_name)\
+                    .not_.is_("deleted_at", "null")\
+                    .execute()
+                if existing_deleted.data:
+                    logger.info(f"Skipping re-ingestion of soft-deleted contact {resource_name} — deleting from Google instead")
+                    await retry_async(delete_contact, token, resource_name)
+                    synced_count += 1
+                    continue
+
                 logger.info(f"Ingesting new contact from Google: {resource_name}")
                 raw_data = transform_contact(google_contact, group_mapping)
-                
+
                 # Filter out internal fields (starting with _)
                 contact_data = {k: v for k, v in raw_data.items() if not k.startswith('_')}
                 contact_data["last_sync_source"] = "google"
                 contact_data["google_updated_at"] = raw_data.get("_google_updated_at")
-                
+
                 # Insert into Supabase
-                # We use upsert here just in case, but insert is fine too
                 supabase.table("contacts").upsert(
-                    contact_data, 
+                    contact_data,
                     on_conflict="google_resource_name"
                 ).execute()
                 await log_sync_event("create_supabase", "success", f"Ingested {contact_data.get('email')} from Google")
