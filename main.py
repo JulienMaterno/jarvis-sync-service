@@ -1101,6 +1101,72 @@ async def overdue_task_alerts(background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/deliver-reminder/{task_id}")
+async def deliver_reminder(task_id: str):
+    """
+    Deliver a scheduled reminder notification via Telegram.
+
+    Called by Google Cloud Tasks at the exact remind_at time.
+    Sends a Telegram message and marks the task as reminded.
+    """
+    from lib.supabase_client import supabase
+    from lib.telegram_client import send_telegram_message
+    from reports import _store_automated_message
+
+    try:
+        # Fetch the task
+        result = supabase.table("tasks").select(
+            "id, title, description, priority, status, remind_at, reminded_at"
+        ).eq("id", task_id).is_("deleted_at", "null").execute()
+
+        if not result.data:
+            logger.warning(f"Reminder delivery: task {task_id} not found or deleted")
+            return {"status": "skipped", "reason": "task not found"}
+
+        task = result.data[0]
+
+        # Skip if already reminded or completed
+        if task.get("reminded_at"):
+            logger.info(f"Reminder delivery: task {task_id} already reminded")
+            return {"status": "skipped", "reason": "already reminded"}
+        if task.get("status") == "completed":
+            logger.info(f"Reminder delivery: task {task_id} already completed")
+            return {"status": "skipped", "reason": "task completed"}
+
+        # Build notification message
+        priority_icon = {"high": "\U0001f534", "medium": "\U0001f7e1", "low": "\U0001f7e2"}.get(
+            task.get("priority", ""), "\u26aa"
+        )
+        lines = [f"\u23f0 *Reminder*", ""]
+        lines.append(f"{priority_icon} *{task['title']}*")
+        if task.get("description"):
+            lines.append(f"_{task['description']}_")
+        lines.append("")
+        lines.append("_Reply to complete, reschedule, or snooze._")
+
+        message = "\n".join(lines)
+        await send_telegram_message(message)
+
+        # Store in chat history so AI has context
+        _store_automated_message(message, {
+            "notification_type": "scheduled_reminder",
+            "task_id": task_id,
+            "task_title": task["title"],
+        })
+
+        # Mark as reminded
+        supabase.table("tasks").update({
+            "reminded_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", task_id).execute()
+
+        logger.info(f"Reminder delivered for task: {task['title']} (id={task_id})")
+        return {"status": "delivered", "task_id": task_id, "title": task["title"]}
+
+    except Exception as e:
+        logger.error(f"Failed to deliver reminder for task {task_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/backup")
 async def trigger_backup():
     """
@@ -3997,6 +4063,8 @@ async def activity_heatmap():
     import json as _json
 
     # --- Fetch activity data (heatmap: lightweight, no hourly_breakdown) ---
+    # NOTE: Multiple hostnames can exist for the same date (e.g. "Laptop" + "unknown"),
+    # so we SUM across hostnames rather than overwriting.
     try:
         result = supabase.table("activity_summaries").select(
             "date, total_active_time, productive_time, distracting_time"
@@ -4004,13 +4072,15 @@ async def activity_heatmap():
         activity_data = {}
         for row in result.data:
             active_seconds = row.get("total_active_time") or 0
-            activity_data[row["date"]] = round(active_seconds / 3600, 2)
+            date_key = row["date"]
+            activity_data[date_key] = round(activity_data.get(date_key, 0) + active_seconds / 3600, 2)
         activity_json = _json.dumps(activity_data)
     except Exception as e:
         logger.error(f"Failed to fetch activity data for heatmap: {e}")
         activity_json = "{}"
 
     # --- Fetch hourly breakdown (only last 30 days for pace chart) ---
+    # Merge hourly breakdowns across hostnames for the same date.
     try:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
         hourly_result = supabase.table("activity_summaries").select(
@@ -4019,8 +4089,22 @@ async def activity_heatmap():
         hourly_by_date = {}
         for row in hourly_result.data:
             hb = row.get("hourly_breakdown")
-            if hb:
-                hourly_by_date[row["date"]] = hb
+            if not hb:
+                continue
+            date_key = row["date"]
+            if date_key not in hourly_by_date:
+                hourly_by_date[date_key] = hb
+            else:
+                # Merge: sum active/afk per hour across hostnames
+                existing = {h["hour"]: h for h in hourly_by_date[date_key]}
+                for entry in hb:
+                    hr = entry["hour"]
+                    if hr in existing:
+                        existing[hr]["active"] = existing[hr].get("active", 0) + entry.get("active", 0)
+                        existing[hr]["afk"] = existing[hr].get("afk", 0) + entry.get("afk", 0)
+                    else:
+                        existing[hr] = entry
+                hourly_by_date[date_key] = sorted(existing.values(), key=lambda x: x["hour"])
         hourly_json = _json.dumps(hourly_by_date)
     except Exception as e:
         logger.error(f"Failed to fetch hourly data for heatmap: {e}")
@@ -4040,6 +4124,35 @@ async def activity_heatmap():
     except Exception as e:
         logger.error(f"Failed to fetch meditation data for heatmap: {e}")
         meditation_json = "{}"
+
+    # --- Fetch Anki review data (aggregated by date, Singapore timezone) ---
+    try:
+        from zoneinfo import ZoneInfo
+        sg_tz = ZoneInfo("Asia/Singapore")
+        # Fetch all review timestamps (lightweight - just one column)
+        anki_data = {}
+        page_size = 1000
+        offset = 0
+        while True:
+            anki_result = supabase.table("anki_review_logs").select(
+                "reviewed_at"
+            ).order("reviewed_at", desc=False).range(offset, offset + page_size - 1).execute()
+            if not anki_result.data:
+                break
+            for row in anki_result.data:
+                ts = row.get("reviewed_at")
+                if ts:
+                    dt = datetime.fromisoformat(ts).astimezone(sg_tz)
+                    d = dt.strftime("%Y-%m-%d")
+                    anki_data[d] = anki_data.get(d, 0) + 1
+            if len(anki_result.data) < page_size:
+                break
+            offset += page_size
+        anki_json = _json.dumps(anki_data)
+        logger.info(f"Anki heatmap: {len(anki_data)} days, {sum(anki_data.values())} reviews")
+    except Exception as e:
+        logger.error(f"Failed to fetch Anki review data for heatmap: {e}")
+        anki_json = "{}"
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -4121,7 +4234,12 @@ async def activity_heatmap():
   .blue .lvl-2 {{ background-color: #0550ae; }}
   .blue .lvl-3 {{ background-color: #1a7af8; }}
   .blue .lvl-4 {{ background-color: #58a6ff; }}
-  /* Orange scale (meetings) */
+  /* Amber scale (Anki reviews) */
+  .amber .lvl-0 {{ background-color: #161b22; }}
+  .amber .lvl-1 {{ background-color: #5c3d0e; }}
+  .amber .lvl-2 {{ background-color: #8a5a0e; }}
+  .amber .lvl-3 {{ background-color: #c47f11; }}
+  .amber .lvl-4 {{ background-color: #f5a623; }}
   .month-labels {{
     display: flex;
     font-size: 9px;
@@ -4266,8 +4384,25 @@ async def activity_heatmap():
     border-radius: 2px 2px 0 0;
     background: #238636;
     transition: background 0.15s;
+    position: relative;
   }}
-  .hourly-bar:hover {{ background: #39d353; }}
+  .hourly-bar[data-label]:hover {{ background: #39d353; }}
+  .hourly-bar[data-label]:hover::before {{
+    content: attr(data-label);
+    position: absolute;
+    bottom: calc(100% + 5px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: #161b22;
+    color: #e6edf3;
+    padding: 3px 7px;
+    border-radius: 5px;
+    font-size: 10px;
+    white-space: nowrap;
+    z-index: 200;
+    border: 1px solid #30363d;
+    pointer-events: none;
+  }}
   .hourly-label {{
     font-size: 8px;
     color: #7d8590;
@@ -4405,12 +4540,39 @@ async def activity_heatmap():
   </div>
 
 
-  <!-- Today's Work Curve — Pace Tracker -->
+  <!-- Anki Reviews Heatmap (amber) -->
+  <div class="section amber" id="anki-section">
+    <h1>Anki Reviews</h1>
+    <div class="subtitle" id="anki-subtitle"></div>
+    <div class="stats" id="anki-stats"></div>
+    <div class="month-labels" id="anki-months"></div>
+    <div class="heatmap-wrapper">
+      <div class="day-labels" id="anki-daylabels"></div>
+      <div class="heatmap-scroll">
+        <div class="heatmap" id="anki-heatmap"></div>
+      </div>
+    </div>
+    <div class="legend">
+      <span>Less</span>
+      <div class="day lvl-0"></div>
+      <div class="day lvl-1"></div>
+      <div class="day lvl-2"></div>
+      <div class="day lvl-3"></div>
+      <div class="day lvl-4"></div>
+      <span>More</span>
+    </div>
+  </div>
+
+  <!-- Today's Work Curve — Pace Tracker (collapsed by default) -->
   <div class="section" id="curve-section" style="margin-top:24px;">
-    <h1>Today's Work Curve</h1>
-    <div class="subtitle">Comparing today to your recent pattern (past 4 weeks)</div>
-    <div class="viz-option" style="margin-top:14px;">
-      <canvas id="viz-pace" height="110" style="width:100%;"></canvas>
+    <h1 id="curve-toggle" style="cursor:pointer;user-select:none;">
+      <span id="curve-arrow" style="display:inline-block;transition:transform 0.2s;font-size:10px;margin-right:4px;">&#9654;</span>Today's Work Curve
+    </h1>
+    <div id="curve-content" style="display:none;">
+      <div class="subtitle">Comparing today to your recent pattern (past 4 weeks)</div>
+      <div class="viz-option" style="margin-top:14px;">
+        <canvas id="viz-pace" height="110" style="width:100%;"></canvas>
+      </div>
     </div>
   </div>
 
@@ -4430,6 +4592,7 @@ async def activity_heatmap():
 const ACTIVITY_DATA = {activity_json};
 const HOURLY_DATA = {hourly_json};
 const MEDITATION_DATA = {meditation_json};
+const ANKI_DATA = {anki_json};
 const DAYS = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
@@ -4657,6 +4820,30 @@ renderHeatmap({{
   formatValue: formatMins,
 }});
 
+// Render Anki heatmap (amber, review count)
+function formatReviews(n) {{
+  if (!n || n < 1) return 'No reviews';
+  const r = Math.round(n);
+  return r + (r === 1 ? ' review' : ' reviews');
+}}
+
+renderHeatmap({{
+  data: ANKI_DATA,
+  heatmapId: 'anki-heatmap',
+  monthsId: 'anki-months',
+  dayLabelsId: 'anki-daylabels',
+  statsId: 'anki-stats',
+  subtitleId: 'anki-subtitle',
+  getLevel: (n) => {{
+    if (!n || n < 1) return 0;
+    if (n < 20) return 1;
+    if (n < 50) return 2;
+    if (n < 100) return 3;
+    return 4;
+  }},
+  formatValue: formatReviews,
+}});
+
 // ---- Day detail modal ----
 const overlay = document.getElementById('modal-overlay');
 const modalTitle = document.getElementById('modal-title');
@@ -4719,19 +4906,23 @@ function showDayDetail(dateStr) {{
         const minH = Math.max(0, Math.min(...activeHours) - 1);
         const maxH = Math.min(23, Math.max(...activeHours) + 1);
 
-        const hourSpan = maxH - minH + 1;
-        const labelEvery = hourSpan > 14 ? 3 : hourSpan > 8 ? 2 : 1;
         html += '<div class="hourly-chart">';
         for (let i = minH; i <= maxH; i++) {{
           const h = byHour[i] || {{ active: 0, afk: 0 }};
           const pct = Math.max(4, (h.active / maxActive) * 100);
-          const barH = h.active > 0 ? pct : 0;
-          const barStyle = barH > 0
-            ? 'height:' + barH + '%;background:#238636'
-            : 'height:3px;background:#30363d';
+          const hasActivity = h.active > 0;
+          const barStyle = hasActivity
+            ? 'height:' + pct + '%;background:#238636'
+            : 'height:0';
+          const mins = Math.floor((h.active || 0) / 60);
+          const secs = Math.round((h.active || 0) % 60);
+          const label = hasActivity
+            ? (mins > 0 ? mins + 'm' : '') + (secs > 0 && mins < 10 ? ' ' + secs + 's' : '')
+            : '';
+          const dataLabel = hasActivity ? 'data-label="' + i + ':00 — ' + label.trim() + '"' : '';
           html += '<div class="hourly-bar-wrap">';
-          html += '<div class="hourly-bar" style="' + barStyle + '" title="' + i + ':00 — ' + fmtSec(h.active) + '"></div>';
-          html += '<div class="hourly-label">' + ((i - minH) % labelEvery === 0 ? i : '') + '</div>';
+          html += '<div class="hourly-bar" style="' + barStyle + '" ' + dataLabel + '></div>';
+          html += '<div class="hourly-label">' + i + '</div>';
           html += '</div>';
         }}
         html += '</div>';
@@ -4816,6 +5007,16 @@ document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
   }}
 
   const hours = END_H - START_H;
+
+  // ---- Work Curve toggle ----
+  let curveOpen = false;
+  document.getElementById('curve-toggle').addEventListener('click', () => {{
+    curveOpen = !curveOpen;
+    document.getElementById('curve-content').style.display = curveOpen ? 'block' : 'none';
+    document.getElementById('curve-arrow').style.transform = curveOpen ? 'rotate(90deg)' : '';
+    if (curveOpen && !window._paceRendered) {{ window._paceRendered = true; renderPace(); }}
+  }});
+  function renderPace() {{
 
   // ---- Pace Tracker (canvas) ----
   const canvasC = document.getElementById('viz-pace');
@@ -5063,6 +5264,8 @@ document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
       ctx.putImageData(baseImage, 0, 0);
     }});
   }}
+
+  }} // end renderPace
 
 }})();
 </script>

@@ -114,7 +114,12 @@ class TasksSyncService(TwoWaySyncService):
             title = 'Untitled'
         
         # Extract status with mapping
-        notion_status = NotionPropertyExtractor.select(props, 'Status')
+        # Notion Status property uses 'status' type (not 'select'), so extract accordingly
+        status_prop = props.get('Status', {}).get('status')
+        notion_status = status_prop.get('name') if status_prop else None
+        # Fallback: try 'select' in case the property type was changed
+        if not notion_status:
+            notion_status = NotionPropertyExtractor.select(props, 'Status')
         status = NOTION_TO_SUPABASE_STATUS.get(notion_status, 'pending')
         
         # Extract due date
