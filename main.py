@@ -5614,3 +5614,34 @@ async def get_insights_history(limit: int = 10):
     except Exception as e:
         logger.error(f"Failed to fetch insights history: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/report/health-insights")
+async def scheduled_health_insights(background_tasks: BackgroundTasks):
+    """
+    Generate daily health insights and deliver via Telegram.
+
+    Generates a 7-day rolling insight, sends a formatted summary to Telegram,
+    and stores the full analysis in Supabase for the dashboard.
+
+    Schedule this daily at 08:30 SGT via Cloud Scheduler (after morning sync + tasks digest).
+    """
+    async def _run_health_insights():
+        from lib.health_insights import generate_health_insights, format_telegram_briefing
+        from lib.telegram_client import send_telegram_message
+        from lib.supabase_client import supabase as sb
+
+        try:
+            logger.info("Scheduled health insights generation starting")
+            result = generate_health_insights(sb, days=7, force=True)
+
+            # Send Telegram briefing
+            briefing = format_telegram_briefing(result)
+            await send_telegram_message(briefing)
+
+            logger.info(f"Health insights delivered: overall={result.get('overall_score')}")
+        except Exception as e:
+            logger.error(f"Scheduled health insights failed: {e}")
+
+    background_tasks.add_task(_run_health_insights)
+    return {"status": "queued", "message": "Health insights generation + Telegram delivery started"}

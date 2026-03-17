@@ -63,6 +63,18 @@ ALERT_THRESHOLDS = {
     "weight_change_kg": 2,      # 2kg change in 7 days
 }
 
+# Keywords for searching personal context relevant to health
+HEALTH_CONTEXT_KEYWORDS = [
+    "injury", "pain", "hurt", "sore", "strain", "sprain",
+    "workout", "exercise", "gym", "run", "swim", "cycling", "training",
+    "sleep", "insomnia", "tired", "fatigue", "exhausted", "energy",
+    "stress", "anxiety", "burnout", "mental health", "meditation",
+    "diet", "nutrition", "weight", "fasting",
+    "doctor", "physio", "physiotherapy", "medication", "supplement",
+    "recovery", "rehab", "rehabilitation",
+    "goal", "target", "fitness goal",
+]
+
 
 # ---------------------------------------------------------------------------
 # Data aggregation
@@ -724,19 +736,146 @@ def _compute_advanced_hrv(sleep_details: list[dict]) -> Optional[dict[str, Any]]
 
 
 # ---------------------------------------------------------------------------
+# Personal context enrichment
+# ---------------------------------------------------------------------------
+
+
+def _fetch_personal_context(supabase: Client, days: int = 30) -> str:
+    """
+    Fetch personal context from Jarvis knowledge base that's relevant to health.
+
+    Searches journals, reflections, and transcripts for health-related mentions
+    (injuries, fitness goals, lifestyle changes, etc.) to give Claude personalized
+    context when generating insights.
+    """
+    context_items: list[str] = []
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    # 1. Recent journals mentioning health topics
+    try:
+        journal_resp = supabase.table("journals").select(
+            "date,content"
+        ).gte("date", cutoff).order("date", desc=True).limit(30).execute()
+
+        if journal_resp.data:
+            for j in journal_resp.data:
+                content_lower = (j.get("content") or "").lower()
+                if any(kw in content_lower for kw in HEALTH_CONTEXT_KEYWORDS):
+                    # Truncate long entries
+                    text = (j.get("content") or "")[:500]
+                    context_items.append(f"[Journal {j.get('date', '?')}] {text}")
+    except Exception as e:
+        logger.debug(f"Could not fetch journals for health context: {e}")
+
+    # 2. Reflections about health/fitness/body
+    try:
+        reflection_resp = supabase.table("reflections").select(
+            "topic_key,content,created_at"
+        ).gte("created_at", cutoff).order("created_at", desc=True).limit(30).execute()
+
+        if reflection_resp.data:
+            for r in reflection_resp.data:
+                content_lower = (r.get("content") or "").lower()
+                topic = (r.get("topic_key") or "").lower()
+                if any(kw in content_lower or kw in topic for kw in HEALTH_CONTEXT_KEYWORDS):
+                    text = (r.get("content") or "")[:500]
+                    date = (r.get("created_at") or "")[:10]
+                    context_items.append(f"[Reflection {date}] {text}")
+    except Exception as e:
+        logger.debug(f"Could not fetch reflections for health context: {e}")
+
+    # 3. Recent transcripts (voice memos) mentioning health
+    try:
+        transcript_resp = supabase.table("transcripts").select(
+            "content,created_at"
+        ).gte("created_at", cutoff).order("created_at", desc=True).limit(20).execute()
+
+        if transcript_resp.data:
+            for t in transcript_resp.data:
+                content_lower = (t.get("content") or "").lower()
+                if any(kw in content_lower for kw in HEALTH_CONTEXT_KEYWORDS):
+                    text = (t.get("content") or "")[:500]
+                    date = (t.get("created_at") or "")[:10]
+                    context_items.append(f"[Voice memo {date}] {text}")
+    except Exception as e:
+        logger.debug(f"Could not fetch transcripts for health context: {e}")
+
+    # 4. User profile insights (health-related traits/patterns)
+    try:
+        profile_resp = supabase.table("user_profile_insights").select(
+            "key,trait,context,confidence"
+        ).gte("confidence", 0.5).order("confidence", desc=True).limit(50).execute()
+
+        if profile_resp.data:
+            health_insights = []
+            for p in profile_resp.data:
+                trait_lower = (p.get("trait") or "").lower()
+                key_lower = (p.get("key") or "").lower()
+                if any(kw in trait_lower or kw in key_lower for kw in HEALTH_CONTEXT_KEYWORDS):
+                    health_insights.append(
+                        f"- {p.get('trait', '')} (confidence: {p.get('confidence', 0):.0%})"
+                    )
+            if health_insights:
+                context_items.append(
+                    "[User Profile - Health Patterns]\n" + "\n".join(health_insights[:10])
+                )
+    except Exception as e:
+        logger.debug(f"Could not fetch user profile for health context: {e}")
+
+    # 5. Previous insights summary (for trend tracking)
+    try:
+        prev_resp = supabase.table("health_insights").select(
+            "period_label,overall_score,recovery_score,sleep_score,"
+            "cardiovascular_score,fitness_score,stress_score,weekly_focus,generated_at"
+        ).order("generated_at", desc=True).limit(4).execute()
+
+        if prev_resp.data and len(prev_resp.data) > 1:
+            # Skip the most recent (that's what we're replacing), show previous
+            history = prev_resp.data[1:]
+            history_lines = []
+            for h in history:
+                date = (h.get("generated_at") or "")[:10]
+                history_lines.append(
+                    f"- {date}: Overall {h.get('overall_score', '?')}, "
+                    f"Recovery {h.get('recovery_score', '?')}, "
+                    f"Sleep {h.get('sleep_score', '?')}, "
+                    f"Cardio {h.get('cardiovascular_score', '?')}, "
+                    f"Fitness {h.get('fitness_score', '?')}, "
+                    f"Stress {h.get('stress_score', '?')} "
+                    f"| Focus: {h.get('weekly_focus', 'N/A')}"
+                )
+            context_items.append(
+                "[Previous Insights History]\n" + "\n".join(history_lines)
+            )
+    except Exception as e:
+        logger.debug(f"Could not fetch previous insights: {e}")
+
+    if not context_items:
+        return ""
+
+    # Cap total context to ~3000 chars to keep prompt efficient
+    combined = "\n\n".join(context_items)
+    if len(combined) > 3000:
+        combined = combined[:3000] + "\n... (truncated)"
+
+    return combined
+
+
+# ---------------------------------------------------------------------------
 # Claude AI analysis
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are an expert health analyst with deep knowledge of sleep science, cardiovascular physiology, exercise science, and body composition. You analyze wearable health data from a Withings ScanWatch 2 Nova smartwatch.
+SYSTEM_PROMPT = """You are an expert health analyst and personal wellness advisor. You analyze wearable health data from a Withings ScanWatch 2 Nova smartwatch, combined with personal context from the user's life (journals, voice memos, reflections, and previous insights).
 
 Your role:
 - Provide evidence-based health insights, not medical diagnoses
 - Identify meaningful patterns and correlations across metrics
 - Score health categories and explain the reasoning
-- Give specific, actionable recommendations
+- Give specific, actionable recommendations tailored to the user's actual life context
 - Flag concerning trends that warrant attention
-- Be direct and clear, not vague or overly cautious
-- Reference specific numbers from the data
+- Connect biometric data with lifestyle context (injuries, travel, work stress, training goals)
+- Track progress against previous insights and recommendations
+- Be direct, personal, and clear. You know this person. Address them as "you"
 
 You have access to advanced HRV analysis from NeuroKit2, including:
 - Frequency-domain metrics: LF/HF power ratio indicates sympathovagal balance
@@ -753,7 +892,9 @@ Important guidelines:
 - Focus on trends over days/weeks, not single-day fluctuations
 - Consider correlations: HRV <-> sleep quality, activity <-> sleep, RHR <-> recovery
 - Use the LF/HF ratio and SD1/SD2 to provide deeper autonomic nervous system insights
-- Be specific: cite actual numbers, percentages, and date ranges"""
+- Be specific: cite actual numbers, percentages, and date ranges
+- When personal context mentions injuries, adapt exercise recommendations accordingly
+- When previous insights exist, note improvements or regressions from prior periods"""
 
 
 def _build_analysis_prompt(
@@ -761,8 +902,9 @@ def _build_analysis_prompt(
     scores: dict[str, Optional[int]],
     alerts: list[dict],
     advanced_hrv: Optional[dict[str, Any]] = None,
+    personal_context: str = "",
 ) -> str:
-    """Build the analysis prompt with all health data context."""
+    """Build the analysis prompt with all health data and personal context."""
 
     prompt = f"""Analyze this health data for the past {metrics['period_days']} days ({metrics['analysis_start']} to {metrics['analysis_end']}).
 
@@ -926,6 +1068,16 @@ NOTE: LF/HF ratio < 1.0 = parasympathetic dominant (recovery), 1.0-2.0 = balance
         for alert in alerts:
             prompt += f"- [{alert['type'].upper()}] {alert['message']}\n"
 
+    if personal_context:
+        prompt += f"""
+## Personal Context
+The following is extracted from the user's journals, voice memos, reflections, and profile.
+Use this to personalize your analysis (e.g., if they mention an injury, adapt exercise recommendations;
+if they're traveling, consider jet lag effects on sleep; if they have fitness goals, track progress).
+
+{personal_context}
+"""
+
     prompt += """
 ## Your Task
 
@@ -1034,8 +1186,11 @@ def generate_health_insights(
     if advanced_hrv:
         metrics["advanced_hrv"] = advanced_hrv
 
-    # Step 5: Build prompt and call Claude
-    prompt = _build_analysis_prompt(metrics, scores, alerts, advanced_hrv)
+    # Step 5: Fetch personal context
+    personal_context = _fetch_personal_context(supabase, days=max(days, 30))
+
+    # Step 6: Build prompt and call Claude
+    prompt = _build_analysis_prompt(metrics, scores, alerts, advanced_hrv, personal_context)
 
     client = anthropic.Anthropic(api_key=api_key)
     # Try primary model, fall back to alternatives
@@ -1161,6 +1316,122 @@ def generate_health_insights(
         # Don't fail the response, just log
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Telegram formatting
+# ---------------------------------------------------------------------------
+
+# Score emojis for Telegram
+_SCORE_EMOJI = {
+    range(0, 40): "🔴",
+    range(40, 60): "🟠",
+    range(60, 80): "🟡",
+    range(80, 101): "🟢",
+}
+
+
+def _score_dot(score: Optional[int]) -> str:
+    """Return colored dot emoji for a score."""
+    if score is None:
+        return "⚪"
+    for rng, emoji in _SCORE_EMOJI.items():
+        if score in rng:
+            return emoji
+    return "⚪"
+
+
+def _severity_emoji(severity: str) -> str:
+    """Return emoji for finding severity."""
+    return {
+        "positive": "✅",
+        "neutral": "ℹ️",
+        "attention": "⚠️",
+        "warning": "🚨",
+    }.get(severity, "")
+
+
+def format_telegram_briefing(insights: dict[str, Any]) -> str:
+    """
+    Format health insights into a concise Telegram message.
+
+    Designed for the morning health briefing: shows overall score,
+    category breakdown, top findings, and the weekly focus.
+    """
+    overall = insights.get("overall_score")
+    summary = insights.get("summary", "")
+    weekly_focus = insights.get("weekly_focus", "")
+    findings = insights.get("findings", [])
+    recommendations = insights.get("recommendations", [])
+    alerts = insights.get("alerts", [])
+
+    # Parse JSON strings if needed
+    if isinstance(findings, str):
+        findings = json.loads(findings)
+    if isinstance(recommendations, str):
+        recommendations = json.loads(recommendations)
+    if isinstance(alerts, str):
+        alerts = json.loads(alerts)
+
+    lines = []
+    lines.append(f"🏥 *Health Insights* | Overall: {_score_dot(overall)} *{overall or '--'}/100*")
+    lines.append("")
+
+    # Category scores
+    categories = [
+        ("Recovery", insights.get("recovery_score")),
+        ("Sleep", insights.get("sleep_score")),
+        ("Cardio", insights.get("cardiovascular_score")),
+        ("Fitness", insights.get("fitness_score")),
+        ("Body", insights.get("body_composition_score")),
+        ("Stress", insights.get("stress_score")),
+    ]
+    score_line = " | ".join(
+        f"{_score_dot(s)} {name} {s or '--'}" for name, s in categories
+    )
+    lines.append(score_line)
+    lines.append("")
+
+    # Summary
+    if summary:
+        lines.append(f"_{summary}_")
+        lines.append("")
+
+    # Alerts (urgent first)
+    if alerts:
+        for alert in alerts[:3]:
+            msg = alert.get("message", "") if isinstance(alert, dict) else str(alert)
+            lines.append(f"🚨 {msg}")
+        lines.append("")
+
+    # Top findings (max 4)
+    if findings:
+        lines.append("*Key Findings:*")
+        for f in findings[:4]:
+            sev = _severity_emoji(f.get("severity", "neutral"))
+            lines.append(f"{sev} {f.get('title', '')}")
+        lines.append("")
+
+    # Top recommendations (max 3, high priority first)
+    high_recs = [r for r in recommendations if r.get("priority") == "high"]
+    other_recs = [r for r in recommendations if r.get("priority") != "high"]
+    top_recs = (high_recs + other_recs)[:3]
+    if top_recs:
+        lines.append("*Recommendations:*")
+        for r in top_recs:
+            priority = "❗" if r.get("priority") == "high" else "➡️"
+            lines.append(f"{priority} {r.get('action', '')}")
+        lines.append("")
+
+    # Weekly focus
+    if weekly_focus:
+        lines.append(f"🎯 *Focus:* {weekly_focus}")
+
+    # Compact footer
+    lines.append("")
+    lines.append("_View full analysis in Health Dashboard_")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
