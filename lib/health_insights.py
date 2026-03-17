@@ -1295,6 +1295,7 @@ def generate_health_insights(
             "body_composition_score": final_scores.get("body_composition"),
             "stress_score": final_scores.get("stress"),
             "summary": ai_analysis.get("summary", ""),
+            "weekly_focus": ai_analysis.get("weekly_focus", ""),
             "findings": json.dumps(ai_analysis.get("findings", [])),
             "correlations": json.dumps(ai_analysis.get("correlations", [])),
             "recommendations": json.dumps(ai_analysis.get("recommendations", [])),
