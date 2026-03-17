@@ -18,3 +18,7 @@ trafilatura>=1.6.0
 ebooklib>=0.18
 beautifulsoup4>=4.12
 Pillow>=10.0
+
+# Health insights dependencies
+neurokit2>=0.2.0
+numpy>=1.24.0

@@ -5558,3 +5558,59 @@ async def get_health_sleep_details(days: int = 7):
     except Exception as e:
         logger.error(f"Failed to fetch sleep details: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- AI Health Insights ---
+
+@app.post("/health-data/insights/generate")
+async def generate_insights(days: int = 7, force: bool = False):
+    """Generate AI health insights using Claude + NeuroKit2.
+
+    Aggregates all health data, computes category scores, runs advanced
+    HRV analysis, and generates evidence-based insights and recommendations.
+
+    Args:
+        days: Number of days to analyze (default 7)
+        force: If True, regenerate even if recent insights exist (default False)
+    """
+    from lib.health_insights import generate_health_insights
+    try:
+        result = await run_in_threadpool(generate_health_insights, supabase, days=days, force=force)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Health insights generation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health-data/insights")
+async def get_latest_insights(days: int = 7):
+    """Get the most recent health insights (cached, no regeneration)."""
+    try:
+        period_label = f"{days}d"
+        result = supabase.table("health_insights").select("*").eq(
+            "period_label", period_label
+        ).order("generated_at", desc=True).limit(1).execute()
+
+        if result.data:
+            return result.data[0]
+        return {"status": "no_insights", "message": f"No insights generated yet for {days}-day period. Call POST /health-data/insights/generate first."}
+    except Exception as e:
+        logger.error(f"Failed to fetch health insights: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health-data/insights/history")
+async def get_insights_history(limit: int = 10):
+    """Get history of generated health insights."""
+    try:
+        result = supabase.table("health_insights").select(
+            "id,period_start,period_end,period_label,overall_score,"
+            "recovery_score,sleep_score,cardiovascular_score,fitness_score,"
+            "body_composition_score,stress_score,summary,generated_at"
+        ).order("generated_at", desc=True).limit(limit).execute()
+        return {"data": result.data, "count": len(result.data)}
+    except Exception as e:
+        logger.error(f"Failed to fetch insights history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
