@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from pydantic import BaseModel
 from lib.sync_service import sync_contacts
 from lib.notion_sync import sync_notion_to_supabase, sync_supabase_to_notion
@@ -69,6 +69,9 @@ from syncs.anki_sync import run_anki_sync
 
 # Import Insight Timer sync
 from syncs.insight_timer_sync import run_sync as run_insight_timer_sync
+
+# Import Withings health sync
+from sync_withings import run_sync as run_withings_sync
 
 # Import Supabase client and Gmail client
 from lib.supabase_client import supabase
@@ -181,9 +184,9 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
     """
 
     # Paths that never require authentication
-    PUBLIC_PATHS = {"/", "/health", "/follow-ups/webhook/send"}
+    PUBLIC_PATHS = {"/", "/health", "/follow-ups/webhook/send", "/withings/authorize"}
     # Path prefixes that never require authentication (health sub-routes)
-    PUBLIC_PREFIXES = ("/health/", "/dashboard/")
+    PUBLIC_PREFIXES = ("/health/", "/dashboard/", "/webhooks/withings/")
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
@@ -754,6 +757,12 @@ async def sync_everything(background_tasks: BackgroundTasks):
 
         # === INSIGHT TIMER SYNC (Firestore → Supabase) ===
         await run_step("insight_timer_sync", run_insight_timer_sync, supabase)
+
+        # === WITHINGS HEALTH SYNC (Withings Cloud → Supabase) ===
+        if os.getenv("WITHINGS_CLIENT_ID"):
+            await run_step("withings_sync", run_withings_sync, supabase, days=7)
+        else:
+            results["withings_sync"] = {"status": "disabled", "reason": "WITHINGS_CLIENT_ID not set"}
 
         # === ANKI SYNC (Supabase ↔ Anki Desktop) - Daily at 3 AM ===
         # Only runs once per day at 3 AM (requires local Anki Desktop with AnkiConnect)
@@ -5317,3 +5326,235 @@ async def day_detail(date: str):
     except Exception as e:
         logger.error(f"Day detail error: {e}")
         return {"date": date, "found": False, "error": str(e)}
+
+
+# ===========================================================================
+# WITHINGS HEALTH INTEGRATION
+# ===========================================================================
+
+@app.get("/withings/authorize")
+async def withings_authorize():
+    """Start Withings OAuth2 flow. Visit this URL in a browser."""
+    from lib.withings_client import WithingsClient
+    client = WithingsClient()
+    auth_url = client.get_authorize_url()
+    return HTMLResponse(f"""
+    <html><body style="font-family: sans-serif; max-width: 600px; margin: 80px auto; text-align: center;">
+        <h1>Jarvis Health - Withings Authorization</h1>
+        <p>Click the button below to authorize Jarvis to access your Withings health data.</p>
+        <a href="{auth_url}" style="display: inline-block; padding: 16px 32px; background: #3b82f6;
+           color: white; text-decoration: none; border-radius: 8px; font-size: 18px; margin-top: 20px;">
+            Connect Withings
+        </a>
+    </body></html>
+    """)
+
+
+@app.get("/webhooks/withings/callback")
+async def withings_oauth_callback(code: str = None, state: str = None, error: str = None):
+    """Handle Withings OAuth2 callback. Exchanges code for tokens."""
+    if error:
+        return HTMLResponse(f"""
+        <html><body style="font-family: sans-serif; max-width: 600px; margin: 80px auto; text-align: center;">
+            <h1>Authorization Failed</h1>
+            <p style="color: red;">Error: {error}</p>
+        </body></html>
+        """, status_code=400)
+
+    if not code:
+        return HTMLResponse("""
+        <html><body style="font-family: sans-serif; max-width: 600px; margin: 80px auto; text-align: center;">
+            <h1>Missing Code</h1>
+            <p>No authorization code received from Withings.</p>
+        </body></html>
+        """, status_code=400)
+
+    try:
+        from lib.withings_client import WithingsClient
+        client = WithingsClient()
+        token_data = client.exchange_code(code)
+        user_id = token_data.get("userid", "unknown")
+        logger.info(f"Withings OAuth complete for user {user_id}")
+        return HTMLResponse(f"""
+        <html><body style="font-family: sans-serif; max-width: 600px; margin: 80px auto; text-align: center;">
+            <h1 style="color: #22c55e;">Connected!</h1>
+            <p>Withings account linked successfully (user: {user_id}).</p>
+            <p>Health data will sync automatically every 15 minutes.</p>
+            <p style="margin-top: 30px; color: #94a3b8;">You can close this window.</p>
+        </body></html>
+        """)
+    except Exception as e:
+        logger.error(f"Withings OAuth callback error: {e}")
+        return HTMLResponse(f"""
+        <html><body style="font-family: sans-serif; max-width: 600px; margin: 80px auto; text-align: center;">
+            <h1 style="color: red;">Error</h1>
+            <p>{str(e)}</p>
+        </body></html>
+        """, status_code=500)
+
+
+@app.post("/sync/withings")
+async def sync_withings(days: int = 7, full: bool = False):
+    """Manually trigger Withings health data sync."""
+    try:
+        result = await run_in_threadpool(run_withings_sync, supabase, days=days, full_sync=full)
+        return result
+    except Exception as e:
+        logger.error(f"Withings sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.head("/webhooks/withings/notify")
+async def withings_webhook_verify():
+    """Withings verifies webhook URL with HEAD request."""
+    return Response(status_code=200)
+
+
+@app.post("/webhooks/withings/notify")
+async def withings_webhook_notify(request: Request, background_tasks: BackgroundTasks):
+    """Receive Withings push notification when new data is available.
+
+    Withings sends: userid, startdate, enddate, appli (data type).
+    Triggers a targeted sync for the notified data type.
+    """
+    try:
+        form = await request.form()
+        appli = int(form.get("appli", 0))
+        startdate = int(form.get("startdate", 0))
+        enddate = int(form.get("enddate", 0))
+        userid = form.get("userid", "unknown")
+
+        logger.info(f"Withings webhook: appli={appli}, user={userid}, range={startdate}-{enddate}")
+
+        # Map appli to data type for targeted sync
+        appli_map = {
+            1: "measurements",   # Weight/body composition
+            4: "measurements",   # Blood pressure, SpO2
+            16: "activity",      # Activity
+            44: "sleep",         # Sleep
+            54: "ecg",           # ECG
+            62: "heart_rate",    # HRV
+        }
+
+        data_type = appli_map.get(appli)
+        if data_type:
+            background_tasks.add_task(run_withings_sync, supabase, days=3, data_type=data_type)
+            log_sync_event("withings_webhook", "info",
+                           f"Webhook received: appli={appli} ({data_type}), triggering sync")
+        else:
+            log_sync_event("withings_webhook", "warning",
+                           f"Unhandled webhook appli={appli}")
+
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"Withings webhook error: {e}")
+        return {"status": "error", "detail": str(e)}
+
+
+# --- Health Data Read Endpoints (for dashboard) ---
+
+@app.get("/health-data/summary")
+async def get_health_summary(days: int = 7):
+    """Get aggregated health summary for dashboard."""
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        since_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+        latest_meas = supabase.table("health_measurements").select("*").order(
+            "measured_at", desc=True).limit(5).execute()
+        latest_sleep = supabase.table("health_sleep").select("*").gte(
+            "date", since_date).order("date", desc=True).execute()
+        latest_activity = supabase.table("health_activity").select("*").gte(
+            "date", since_date).order("date", desc=True).execute()
+        latest_hr = supabase.table("health_heart_rate").select("*").gte(
+            "timestamp", since).order("timestamp", desc=True).limit(1).execute()
+
+        return {
+            "measurements": latest_meas.data,
+            "sleep": latest_sleep.data,
+            "activity": latest_activity.data,
+            "latest_heart_rate": latest_hr.data[0] if latest_hr.data else None,
+        }
+    except Exception as e:
+        logger.error(f"Health summary error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health-data/measurements")
+async def get_health_measurements(days: int = 30):
+    """Get measurement time series for dashboard."""
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        result = supabase.table("health_measurements").select("*").gte(
+            "measured_at", since).order("measured_at", desc=True).execute()
+        return {"data": result.data, "count": len(result.data)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health-data/sleep")
+async def get_health_sleep(days: int = 30):
+    """Get sleep data time series for dashboard."""
+    try:
+        since_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+        result = supabase.table("health_sleep").select("*").gte(
+            "date", since_date).order("date", desc=True).execute()
+        return {"data": result.data, "count": len(result.data)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health-data/activity")
+async def get_health_activity(days: int = 30):
+    """Get activity data time series for dashboard."""
+    try:
+        since_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+        result = supabase.table("health_activity").select("*").gte(
+            "date", since_date).order("date", desc=True).execute()
+        return {"data": result.data, "count": len(result.data)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health-data/heart-rate")
+async def get_health_heart_rate(days: int = 7):
+    """Get intraday heart rate for dashboard."""
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        result = supabase.table("health_heart_rate").select("*").gte(
+            "timestamp", since).order("timestamp", desc=True).execute()
+        return {"data": result.data, "count": len(result.data)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health-data/workouts")
+async def get_health_workouts(days: int = 30):
+    """Get workout data for dashboard."""
+    try:
+        start_date = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        result = supabase.table("health_workouts") \
+            .select("*") \
+            .gte("date", start_date[:10]) \
+            .order("start_at", desc=True) \
+            .execute()
+        return {"data": result.data, "count": len(result.data)}
+    except Exception as e:
+        logger.error(f"Failed to fetch workouts: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health-data/sleep-details")
+async def get_health_sleep_details(days: int = 7):
+    """Get high-frequency sleep data for dashboard."""
+    try:
+        start_date = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        result = supabase.table("health_sleep_details") \
+            .select("*") \
+            .gte("sleep_date", start_date[:10]) \
+            .order("sleep_date", desc=True) \
+            .execute()
+        return {"data": result.data, "count": len(result.data)}
+    except Exception as e:
+        logger.error(f"Failed to fetch sleep details: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
