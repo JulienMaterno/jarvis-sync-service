@@ -5617,31 +5617,33 @@ async def get_insights_history(limit: int = 10):
 
 
 @app.post("/report/health-insights")
-async def scheduled_health_insights(background_tasks: BackgroundTasks):
+async def scheduled_health_insights():
     """
     Generate daily health insights and deliver via Telegram.
 
-    Generates a 7-day rolling insight, sends a formatted summary to Telegram,
-    and stores the full analysis in Supabase for the dashboard.
+    Runs synchronously to prevent Cloud Run from scaling down mid-generation.
+    Cloud Scheduler attempt-deadline is 300s which covers the ~90s Claude call.
 
-    Schedule this daily at 08:30 SGT via Cloud Scheduler (after morning sync + tasks digest).
+    Schedule this daily at 08:30 SGT via Cloud Scheduler.
     """
-    async def _run_health_insights():
-        from lib.health_insights import generate_health_insights, format_telegram_briefing
-        from lib.telegram_client import send_telegram_message
-        from lib.supabase_client import supabase as sb
+    from lib.health_insights import generate_health_insights, format_telegram_briefing
+    from lib.telegram_client import send_telegram_message
 
-        try:
-            logger.info("Scheduled health insights generation starting")
-            result = generate_health_insights(sb, days=7, force=True)
+    try:
+        logger.info("Scheduled health insights generation starting")
+        result = await run_in_threadpool(generate_health_insights, supabase, 7, True)
 
-            # Send Telegram briefing
-            briefing = format_telegram_briefing(result)
-            await send_telegram_message(briefing)
+        # Send Telegram briefing
+        briefing = format_telegram_briefing(result)
+        await send_telegram_message(briefing)
 
-            logger.info(f"Health insights delivered: overall={result.get('overall_score')}")
-        except Exception as e:
-            logger.error(f"Scheduled health insights failed: {e}")
-
-    background_tasks.add_task(_run_health_insights)
-    return {"status": "queued", "message": "Health insights generation + Telegram delivery started"}
+        overall = result.get("overall_score")
+        logger.info(f"Health insights delivered: overall={overall}")
+        return {
+            "status": "success",
+            "overall_score": overall,
+            "summary": result.get("summary", "")[:200],
+        }
+    except Exception as e:
+        logger.error(f"Scheduled health insights failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
