@@ -13,6 +13,9 @@ services:
       - .env
     environment:
       - PORT=8080
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcs-backup-key.json
+    volumes:
+      - ./gcs-backup-key.json:/app/gcs-backup-key.json:ro
     command: >
       sh -c "gunicorn -w 1 -k uvicorn.workers.UvicornWorker main:app
       --bind 0.0.0.0:8080 --timeout 600 --graceful-timeout 600"
