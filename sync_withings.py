@@ -19,7 +19,7 @@ from typing import Any
 
 from lib.withings_client import WithingsClient
 from lib.supabase_client import supabase
-from lib.logging_service import log_sync_event
+from lib.logging_service import log_sync_event_sync
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -72,7 +72,7 @@ WORKOUT_CATEGORIES: dict[int, str] = {
     43: "Multi-sport", 44: "Indoor Running", 187: "Rugby",
     188: "Football", 190: "Pilates", 191: "Basketball", 192: "Soccer",
     193: "Martial Arts", 195: "Trail Running", 196: "Strength Training",
-    272: "Elliptical", 307: "Indoor Cycling",
+    272: "Elliptical", 307: "Indoor Cycling", 550: "HIIT",
 }
 
 SYNC_STATE_KEY = "withings_last_sync"
@@ -275,7 +275,7 @@ class WithingsSync:
         total_created = sum(r.get("created", 0) for r in results.values())
         total_updated = sum(r.get("updated", 0) for r in results.values())
 
-        log_sync_event(
+        log_sync_event_sync(
             "withings_sync",
             status,
             f"Synced {total_created} created, {total_updated} updated in {duration}s",

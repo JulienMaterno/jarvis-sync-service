@@ -7,21 +7,11 @@ Backs up ALL critical Supabase tables to:
 
 Run daily via Cloud Scheduler: POST /backup/full
 
-Tables backed up:
-- contacts (CRM)
-- meetings (meeting records)
-- tasks (action items)
-- journals (daily journals)
-- reflections (topic reflections)
-- transcripts (voice memo transcripts)
-- calendar_events (Google Calendar)
-- emails (Gmail)
-- beeper_chats (messaging)
-- beeper_messages (chat history)
-- books (reading list)
-- highlights (book highlights)
-- applications (grants/fellowships)
-- linkedin_posts (LinkedIn content)
+Tables backed up (17 tables, excludes sync_logs/pipeline_logs):
+- contacts, meetings, tasks, journals, reflections, transcripts
+- calendar_events, emails, beeper_chats, beeper_messages
+- documents, knowledge_chunks, chat_messages
+- books, highlights, applications, linkedin_posts
 """
 
 import asyncio
@@ -66,11 +56,6 @@ KNOWLEDGE_TABLES = [
     "chat_messages",      # Chat history with AI
 ]
 
-SYSTEM_TABLES = [
-    "sync_logs",          # Sync operation logs
-    "pipeline_logs",      # Audio pipeline logs
-]
-
 OPTIONAL_TABLES = [
     "books",              # Reading list
     "highlights",         # Book highlights
@@ -78,7 +63,13 @@ OPTIONAL_TABLES = [
     "linkedin_posts",     # LinkedIn content
 ]
 
-ALL_TABLES = CRITICAL_TABLES + IMPORTANT_TABLES + KNOWLEDGE_TABLES + SYSTEM_TABLES + OPTIONAL_TABLES
+# sync_logs and pipeline_logs excluded - operational data that grows
+# unboundedly (283k+ rows) and can be recreated. Was causing backup to
+# exceed Supabase Storage 50MB limit and block the single gunicorn worker.
+ALL_TABLES = CRITICAL_TABLES + IMPORTANT_TABLES + KNOWLEDGE_TABLES + OPTIONAL_TABLES
+
+# Safety limit per table to prevent runaway backups
+MAX_ROWS_PER_TABLE = 50_000
 
 # Supabase Storage bucket for backups
 SUPABASE_BUCKET = "backups"
@@ -96,16 +87,20 @@ async def backup_table(table_name: str) -> Dict[str, Any]:
         data = []
         page_size = 1000
         start = 0
-        
+
         while True:
             response = supabase.table(table_name).select("*").range(start, start + page_size - 1).execute()
             batch = response.data
             data.extend(batch)
-            
+
             if len(batch) < page_size:
                 break
             start += page_size
-        
+
+            if len(data) >= MAX_ROWS_PER_TABLE:
+                print(f"  Warning: {table_name} hit {MAX_ROWS_PER_TABLE} row limit, truncating")
+                break
+
         return {
             "table": table_name,
             "count": len(data),
@@ -123,14 +118,41 @@ async def backup_table(table_name: str) -> Dict[str, Any]:
 
 
 async def upload_to_supabase_storage(filename: str, content: bytes, content_type: str) -> bool:
-    """Upload backup to Supabase Storage."""
+    """Upload backup to Supabase Storage.
+
+    Uses direct httpx POST to avoid storage3 library issues with the
+    x-upsert header that were causing HTTP 400 on the full backup upload.
+    """
+    import httpx
+
+    supabase_url = os.environ.get("SUPABASE_URL", "")
+    supabase_key = os.environ.get("SUPABASE_KEY", "")
+
+    if not supabase_url or not supabase_key:
+        print("Supabase Storage upload failed: missing SUPABASE_URL or SUPABASE_KEY")
+        return False
+
     try:
-        supabase.storage.from_(SUPABASE_BUCKET).upload(
-            path=filename,
-            file=content,
-            file_options={"content-type": content_type, "upsert": "true"}
-        )
-        return True
+        headers = {
+            "Authorization": f"Bearer {supabase_key}",
+            "apikey": supabase_key,
+            "x-upsert": "true",
+        }
+        files = {"file": (filename, content, content_type)}
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            response = await client.post(
+                f"{supabase_url}/storage/v1/object/{SUPABASE_BUCKET}/{filename}",
+                headers=headers,
+                files=files,
+            )
+
+        if response.status_code in (200, 201):
+            print(f"Uploaded {filename} to Supabase Storage ({len(content):,} bytes)")
+            return True
+        else:
+            print(f"Supabase Storage upload failed: HTTP {response.status_code} - {response.text}")
+            return False
     except Exception as e:
         print(f"Supabase Storage upload failed: {e}")
         return False
@@ -306,7 +328,7 @@ if __name__ == "__main__":
             print(f"  {b['name']} ({b['size']:,} bytes) - {b['created']}")
     else:
         result = asyncio.run(run_full_backup())
-        print(f"\nBackup complete!")
+        print("\nBackup complete!")
         print(f"Total rows: {result['total_rows']:,}")
         print(f"Supabase Storage: {'✓' if result['storage']['supabase'] else '✗'}")
         print(f"GCS: {'✓' if result['storage']['gcs'] else '✗'}")

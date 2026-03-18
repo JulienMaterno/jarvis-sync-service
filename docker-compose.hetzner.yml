@@ -1,0 +1,73 @@
+version: "3.8"
+
+services:
+  sync-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jarvis-sync-service
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    env_file:
+      - .env
+    environment:
+      - PORT=8080
+    command: >
+      sh -c "gunicorn -w 1 -k uvicorn.workers.UvicornWorker main:app
+      --bind 0.0.0.0:8080 --timeout 600 --graceful-timeout 600"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  health-dashboard:
+    build:
+      context: /opt/jarvis/health-dashboard
+      dockerfile: Dockerfile
+    container_name: jarvis-health-dashboard
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3002:3002"
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_SUPABASE_URL=${SUPABASE_URL}
+      - NEXT_PUBLIC_SUPABASE_ANON_KEY=${SUPABASE_KEY}
+      - SYNC_SERVICE_URL=http://sync-service:8080
+      - SYNC_SERVICE_API_KEY=${INTERNAL_API_KEY}
+    depends_on:
+      - sync-service
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3002').then(r => {if(!r.ok) throw r.status})"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: jarvis-cloudflared
+    restart: unless-stopped
+    command: tunnel --config /etc/cloudflared/config.yml run
+    volumes:
+      - ./cloudflared:/etc/cloudflared:ro
+    depends_on:
+      - sync-service
+      - health-dashboard
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -37,16 +37,16 @@ def get_google_contacts_count() -> int:
     """
     try:
         from lib.google_contacts import get_all_contacts
-        from lib.oauth_handler import get_valid_google_token
-        
+        from lib.google_auth import get_access_token
+
         # Get token
         loop = asyncio.new_event_loop()
         try:
-            token = loop.run_until_complete(get_valid_google_token())
+            token = loop.run_until_complete(get_access_token())
             if not token:
                 logger.warning("No valid Google token available")
                 return -1
-            
+
             # Get contacts count
             contacts = loop.run_until_complete(get_all_contacts(token))
             return len(contacts)
