@@ -142,6 +142,7 @@ class NewslettersSyncService(TwoWaySyncService):
     def _build_content_blocks(self, newsletter: Dict) -> List[Dict]:
         """
         Build Notion content blocks from newsletter data.
+        Uses chunked_paragraphs to handle long content safely.
         """
         blocks = []
         builder = ContentBlockBuilder()
@@ -153,16 +154,17 @@ class NewslettersSyncService(TwoWaySyncService):
             paragraphs = content.split('\n\n')
             for para in paragraphs:
                 if para.strip():
+                    para_text = para.strip()
                     # Check if it's a markdown heading
-                    if para.strip().startswith('## '):
-                        heading_text = para.strip()[3:].strip()
+                    if para_text.startswith('## '):
+                        heading_text = para_text[3:].strip()
                         blocks.append(builder.heading_2(heading_text))
-                    elif para.strip().startswith('### '):
-                        heading_text = para.strip()[4:].strip()
+                    elif para_text.startswith('### '):
+                        heading_text = para_text[4:].strip()
                         blocks.append(builder.heading_3(heading_text))
                     else:
-                        # Regular paragraph
-                        blocks.append(builder.paragraph(para.strip()))
+                        # Regular paragraph - use chunked_paragraphs for long text
+                        blocks.extend(builder.chunked_paragraphs(para_text))
 
         return blocks
 
@@ -183,9 +185,14 @@ class NewslettersSyncService(TwoWaySyncService):
                 supabase_records = self.supabase.get_all_active()
             else:
                 cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
-                supabase_records = self.supabase.get_updated_since(cutoff)
+                supabase_records = self.supabase.select_updated_since(cutoff)
 
-            self.logger.info(f"Found {len(supabase_records)} records to sync to Notion")
+            # Filter to records that actually need syncing
+            records_to_sync = self.filter_records_needing_notion_sync(
+                supabase_records, name_field='name'
+            )
+
+            self.logger.info(f"Found {len(records_to_sync)} records to sync to Notion (of {len(supabase_records)} total)")
 
             if metrics:
                 metrics.source_total = len(supabase_records)
@@ -198,7 +205,7 @@ class NewslettersSyncService(TwoWaySyncService):
 
             notion_lookup = {r['id']: r for r in notion_records}
 
-            for record in supabase_records:
+            for record in records_to_sync:
                 try:
                     # Convert to Notion properties format
                     properties = self.convert_to_source(record)
@@ -219,6 +226,16 @@ class NewslettersSyncService(TwoWaySyncService):
                             if metrics:
                                 metrics.notion_api_calls += 1
 
+                        # Stamp back with NOW() to prevent re-sync loops
+                        now_utc = datetime.now(timezone.utc).isoformat()
+                        self.supabase.update(
+                            record_id=record['id'],
+                            data={
+                                'notion_updated_at': now_utc,
+                                'last_sync_source': 'notion',
+                            }
+                        )
+
                         stats.updated += 1
                         self.logger.info(f"Updated Notion page: {record.get('name', record.get('id'))}")
                     else:
@@ -235,12 +252,13 @@ class NewslettersSyncService(TwoWaySyncService):
                         new_page_id = new_page['id']
 
                         # Update Supabase with notion_page_id
+                        now_utc = datetime.now(timezone.utc).isoformat()
                         self.supabase.update(
                             record_id=record['id'],
                             data={
                                 'notion_page_id': new_page_id,
+                                'notion_updated_at': now_utc,
                                 'last_sync_source': 'notion',
-                                'updated_at': datetime.now(timezone.utc).isoformat()
                             }
                         )
 

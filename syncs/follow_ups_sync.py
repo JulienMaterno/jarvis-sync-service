@@ -234,15 +234,20 @@ class FollowUpsSyncService(TwoWaySyncService):
             # Filter out soft-deleted
             supabase_records = [r for r in supabase_records if not r.get("deleted_at")]
 
+            # Filter to records that actually need syncing
+            records_to_sync = self.filter_records_needing_notion_sync(
+                supabase_records, name_field="subject"
+            )
+
             self.logger.info(
-                f"Found {len(supabase_records)} follow-up records to sync to Notion"
+                f"Found {len(records_to_sync)} follow-up records to sync to Notion"
             )
 
             # Build lookup for existing Notion pages
             notion_records = self.notion.query_database(self.notion_database_id)
             notion_lookup = {r["id"]: r for r in notion_records}
 
-            for record in supabase_records:
+            for record in records_to_sync:
                 try:
                     properties = self.convert_to_source(record)
                     notion_page_id = record.get("notion_page_id")
@@ -262,11 +267,12 @@ class FollowUpsSyncService(TwoWaySyncService):
                         if content_blocks:
                             self.notion.append_blocks(notion_page_id, content_blocks)
 
-                        # Update sync tracking
+                        # Stamp back with NOW() to prevent re-sync loops
+                        now_utc = datetime.now(timezone.utc).isoformat()
                         self.supabase.update(
                             record["id"],
                             {
-                                "notion_updated_at": updated_page.get("last_edited_time"),
+                                "notion_updated_at": now_utc,
                                 "last_sync_source": "notion",
                             },
                         )
@@ -281,11 +287,12 @@ class FollowUpsSyncService(TwoWaySyncService):
                         )
 
                         # Update Supabase with Notion page ID
+                        now_utc = datetime.now(timezone.utc).isoformat()
                         self.supabase.update(
                             record["id"],
                             {
                                 "notion_page_id": new_page["id"],
-                                "notion_updated_at": new_page.get("last_edited_time"),
+                                "notion_updated_at": now_utc,
                                 "last_sync_source": "notion",
                             },
                         )

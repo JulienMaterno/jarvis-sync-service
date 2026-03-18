@@ -509,9 +509,10 @@ class ApplicationsSyncService(TwoWaySyncService):
                             except Exception as e:
                                 self.logger.warning(f"Failed to update content blocks: {e}")
 
-                        # Update Supabase with new timestamp
+                        # Stamp back with NOW() to prevent re-sync loops
+                        now_utc = datetime.now(timezone.utc).isoformat()
                         self.supabase.update(record['id'], {
-                            'notion_updated_at': updated_page.get('last_edited_time'),
+                            'notion_updated_at': now_utc,
                             'last_sync_source': 'notion'
                         })
                         metrics.supabase_api_calls += 1
@@ -526,9 +527,10 @@ class ApplicationsSyncService(TwoWaySyncService):
                         metrics.notion_api_calls += 1
 
                         # Update Supabase with new Notion ID
+                        now_utc = datetime.now(timezone.utc).isoformat()
                         self.supabase.update(record['id'], {
                             'notion_page_id': new_page['id'],
-                            'notion_updated_at': new_page.get('last_edited_time'),
+                            'notion_updated_at': now_utc,
                             'last_sync_source': 'notion'
                         })
                         metrics.supabase_api_calls += 1

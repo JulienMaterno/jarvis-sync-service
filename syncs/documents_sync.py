@@ -367,11 +367,15 @@ class DocumentsSyncService(TwoWaySyncService):
                         # Update existing page properties
                         self.notion.update_page(notion_page_id, notion_props)
                         metrics.notion_api_calls += 1
-                        
-                        # Note: Content update requires clearing page first, which is complex
-                        # For now, we only update properties on existing pages
-                        # Content changes will need to be made directly in Notion
-                        
+
+                        # Stamp back with NOW() to prevent re-sync loops
+                        now_utc = datetime.now(timezone.utc).isoformat()
+                        self.supabase.update(record['id'], {
+                            'notion_updated_at': now_utc,
+                            'last_sync_source': 'notion'
+                        })
+                        metrics.supabase_api_calls += 1
+
                         stats.updated += 1
                     else:
                         # Create new page
@@ -381,12 +385,13 @@ class DocumentsSyncService(TwoWaySyncService):
                             children=blocks
                         )
                         metrics.notion_api_calls += 1
-                        
+
                         # Store the Notion page ID back
+                        now_utc = datetime.now(timezone.utc).isoformat()
                         self.supabase.update(record['id'], {
                             'notion_page_id': new_page['id'],
-                            'notion_updated_at': new_page.get('last_edited_time'),
-                            'last_sync_source': 'supabase'
+                            'notion_updated_at': now_utc,
+                            'last_sync_source': 'notion'
                         })
                         metrics.supabase_api_calls += 1
                         

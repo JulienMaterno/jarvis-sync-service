@@ -1788,8 +1788,11 @@ class TwoWaySyncService(BaseSyncService):
             elif r.get('last_sync_source') == 'supabase':
                 # Explicitly marked for sync
                 result.append(r)
-            else:
-                # Check if updated_at > notion_updated_at (local changes)
+            elif r.get('last_sync_source') != 'notion':
+                # Only use timestamp comparison if last_sync_source is NOT 'notion'.
+                # After N→S sync sets last_sync_source='notion', the Supabase updated_at
+                # trigger makes updated_at slightly later than notion_updated_at, causing
+                # a false positive every cycle (the timestamp precision bug).
                 comparison = self.compare_timestamps(
                     r.get('updated_at'),
                     r.get('notion_updated_at')
@@ -2086,41 +2089,41 @@ class TwoWaySyncService(BaseSyncService):
                 metrics.supabase_api_calls += 1
             
             # Filter to records that need syncing to Notion
-            # FIXED: Don't rely on last_sync_source=='supabase' - it's never set when editing directly in Supabase!
-            # Instead, compare updated_at vs notion_updated_at to detect local changes
             records_to_sync = []
             for r in supabase_records:
                 # Skip soft-deleted records
                 if r.get('deleted_at'):
                     continue
-                
+
                 # New records without notion_page_id always need syncing
                 if not r.get('notion_page_id'):
                     records_to_sync.append(r)
                     continue
-                
-                # For existing records, check if Supabase is newer than last Notion sync
+
+                # Explicitly marked for sync to Notion
+                if r.get('last_sync_source') == 'supabase':
+                    records_to_sync.append(r)
+                    continue
+
+                # Skip if last_sync_source is 'notion' — this means the record was
+                # just synced FROM Notion. The Supabase updated_at trigger fires after
+                # the stamp-back update, making updated_at slightly > notion_updated_at,
+                # which would cause a false positive every cycle.
+                if r.get('last_sync_source') == 'notion':
+                    continue
+
+                # For other records, check if Supabase is newer than last Notion sync
                 updated_at = r.get('updated_at')
                 notion_updated_at = r.get('notion_updated_at')
-                
+
                 if not notion_updated_at:
                     # No notion timestamp means it was created but never synced back
                     records_to_sync.append(r)
                     continue
-                
-                # Parse timestamps and compare
-                try:
-                    from dateutil import parser as date_parser
-                    local_time = date_parser.isoparse(updated_at) if isinstance(updated_at, str) else updated_at
-                    notion_time = date_parser.isoparse(notion_updated_at) if isinstance(notion_updated_at, str) else notion_updated_at
-                    
-                    # If Supabase was updated AFTER the last Notion sync, it needs syncing
-                    # Add 5 second buffer to account for sync timing
-                    if local_time > notion_time + timedelta(seconds=5):
-                        records_to_sync.append(r)
-                except Exception as e:
-                    self.logger.warning(f"Could not compare timestamps for record {r.get('id')}: {e}")
-                    # When in doubt, sync it
+
+                # Compare timestamps with buffer
+                comparison = self.compare_timestamps(updated_at, notion_updated_at)
+                if comparison > 0:
                     records_to_sync.append(r)
             
             self.logger.info(f"Found {len(records_to_sync)} records to sync to Notion")
@@ -2145,17 +2148,19 @@ class TwoWaySyncService(BaseSyncService):
                         updated_page = self.notion.update_page(notion_page_id, notion_props)
                         if metrics:
                             metrics.notion_api_calls += 1
-                        
-                        # Update Supabase with new Notion timestamp to prevent re-sync loops
-                        # This is CRITICAL: without this, `last_sync_source` stays 'supabase'
-                        # and future Notion edits would be skipped!
+
+                        # Stamp back with NOW() to prevent re-sync loops.
+                        # IMPORTANT: Use current UTC time, NOT Notion's last_edited_time
+                        # (which has minute precision). This avoids a loop where updated_at
+                        # (ms precision) > notion_updated_at (minute precision).
+                        now_utc = datetime.now(timezone.utc).isoformat()
                         self.supabase.update(record['id'], {
-                            'notion_updated_at': updated_page.get('last_edited_time'),
+                            'notion_updated_at': now_utc,
                             'last_sync_source': 'notion'
                         })
                         if metrics:
                             metrics.supabase_api_calls += 1
-                        
+
                         stats.updated += 1
                     else:
                         # Create new
@@ -2163,9 +2168,10 @@ class TwoWaySyncService(BaseSyncService):
                         if metrics:
                             metrics.notion_api_calls += 1
                         # Update Supabase with new Notion ID
+                        now_utc = datetime.now(timezone.utc).isoformat()
                         self.supabase.update(record['id'], {
                             'notion_page_id': new_page['id'],
-                            'notion_updated_at': new_page.get('last_edited_time'),
+                            'notion_updated_at': now_utc,
                             'last_sync_source': 'notion'
                         })
                         if metrics:

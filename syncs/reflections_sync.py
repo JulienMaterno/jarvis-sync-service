@@ -323,7 +323,10 @@ class ReflectionsSyncService(TwoWaySyncService):
                     needs_sync = True
                 elif r.get('last_sync_source') == 'supabase':
                     needs_sync = True
-                else:
+                elif r.get('last_sync_source') != 'notion':
+                    # Only use timestamp comparison if last_sync_source is NOT 'notion'.
+                    # After N→S sync sets last_sync_source='notion', the Supabase updated_at
+                    # trigger makes updated_at slightly later, causing false positives.
                     comparison = self.compare_timestamps(
                         r.get('updated_at'),
                         r.get('notion_updated_at')
@@ -399,10 +402,11 @@ class ReflectionsSyncService(TwoWaySyncService):
                             except Exception as e:
                                 self.logger.warning(f"Failed to update content blocks: {e}")
                         
-                        # Update Supabase with new Notion timestamp to prevent re-sync loops
-                        # This is CRITICAL: without this, future Notion edits would be skipped!
+                        # Stamp back with NOW() to prevent re-sync loops.
+                        # Use current UTC time, NOT Notion's last_edited_time (minute precision).
+                        now_utc = datetime.now(timezone.utc).isoformat()
                         self.supabase.update(record['id'], {
-                            'notion_updated_at': updated_page.get('last_edited_time'),
+                            'notion_updated_at': now_utc,
                             'last_sync_source': 'notion'
                         })
                         
@@ -424,10 +428,10 @@ class ReflectionsSyncService(TwoWaySyncService):
                                 self.logger.warning(f"Failed to add content blocks: {e}")
                         
                         # Update Supabase with notion_page_id
-                        # Set last_sync_source to 'notion' so future Notion edits flow back to Supabase
+                        now_utc = datetime.now(timezone.utc).isoformat()
                         self.supabase.update(record['id'], {
                             'notion_page_id': new_page_id,
-                            'notion_updated_at': new_page.get('last_edited_time'),
+                            'notion_updated_at': now_utc,
                             'last_sync_source': 'notion'
                         })
                         

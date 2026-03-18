@@ -814,7 +814,10 @@ class MeetingsSyncService(TwoWaySyncService):
                     needs_sync = True
                 elif r.get('last_sync_source') == 'supabase':
                     needs_sync = True
-                else:
+                elif r.get('last_sync_source') != 'notion':
+                    # Only use timestamp comparison if last_sync_source is NOT 'notion'.
+                    # After N→S sync sets last_sync_source='notion', the Supabase updated_at
+                    # trigger makes updated_at slightly later, causing false positives.
                     comparison = self.compare_timestamps(
                         r.get('updated_at'),
                         r.get('notion_updated_at')
@@ -857,11 +860,11 @@ class MeetingsSyncService(TwoWaySyncService):
                         # Note: We don't update content blocks for existing pages to avoid
                         # overwriting AI meeting notes or other manual edits
 
-                        # Update Supabase with new Notion timestamp to prevent re-sync loops
-                        # This is CRITICAL: without this, `last_sync_source` stays 'supabase'
-                        # and future Notion edits would be skipped!
+                        # Stamp back with NOW() to prevent re-sync loops.
+                        # Use current UTC time, NOT Notion's last_edited_time (minute precision).
+                        now_utc = datetime.now(timezone.utc).isoformat()
                         self.supabase.update(record['id'], {
-                            'notion_updated_at': updated_page.get('last_edited_time'),
+                            'notion_updated_at': now_utc,
                             'last_sync_source': 'notion'
                         })
 
@@ -883,9 +886,10 @@ class MeetingsSyncService(TwoWaySyncService):
                                 f"Found existing Notion page for '{record.get('title')}' "
                                 f"- linking instead of creating duplicate"
                             )
+                            now_utc = datetime.now(timezone.utc).isoformat()
                             self.supabase.update(record['id'], {
                                 'notion_page_id': matched_id,
-                                'notion_updated_at': existing_notion_page.get('last_edited_time'),
+                                'notion_updated_at': now_utc,
                                 'last_sync_source': 'notion'
                             })
                             stats.updated += 1
@@ -901,9 +905,10 @@ class MeetingsSyncService(TwoWaySyncService):
                                 metrics.notion_api_calls += 1
 
                             # Update Supabase with new Notion ID
+                            now_utc = datetime.now(timezone.utc).isoformat()
                             self.supabase.update(record['id'], {
                                 'notion_page_id': new_page['id'],
-                                'notion_updated_at': new_page.get('last_edited_time'),
+                                'notion_updated_at': now_utc,
                                 'last_sync_source': 'notion'
                             })
                             stats.created += 1
