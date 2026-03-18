@@ -40,6 +40,7 @@ import os
 import sys
 import tempfile
 import time
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -192,7 +193,7 @@ class GoogleDriveUploader:
 
     def upload_file(self, file_path: Path, folder: str = "books") -> tuple[str, str]:
         """
-        Upload file to Google Drive.
+        Upload file to Google Drive, updating existing file if one with the same name exists.
 
         Args:
             file_path: Path to file
@@ -208,10 +209,14 @@ class GoogleDriveUploader:
 
         parent_id = self._enhanced_folder_id if folder == "enhanced" else self._books_folder_id
 
-        file_metadata = {
-            'name': file_path.name,
-            'parents': [parent_id]
-        }
+        # Check if file with same name already exists in target folder
+        existing = self.drive.files().list(
+            q=f"name='{file_path.name}' and '{parent_id}' in parents and trashed=false",
+            spaces='drive',
+            fields='files(id, webViewLink)'
+        ).execute()
+
+        existing_files = existing.get('files', [])
 
         media = MediaFileUpload(
             str(file_path),
@@ -219,11 +224,26 @@ class GoogleDriveUploader:
             resumable=True
         )
 
-        file = self.drive.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields='id, webViewLink'
-        ).execute()
+        if existing_files:
+            # Update existing file instead of creating duplicate
+            existing_id = existing_files[0]['id']
+            logger.info(f"  Updating existing file {existing_id} (avoiding duplicate)")
+            file = self.drive.files().update(
+                fileId=existing_id,
+                media_body=media,
+                fields='id, webViewLink'
+            ).execute()
+        else:
+            # Create new file
+            file_metadata = {
+                'name': file_path.name,
+                'parents': [parent_id]
+            }
+            file = self.drive.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields='id, webViewLink'
+            ).execute()
 
         return file['id'], file.get('webViewLink', '')
 
@@ -548,21 +568,50 @@ Return JSON:
 ```
 """
 
-        response = client.messages.create(
-            model="claude-sonnet-4-5-20250929",
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}]
-        )
+        # Retry logic for robustness
+        max_retries = 2
+        last_error = None
 
-        # Parse JSON from response
-        import re
-        text = response.content[0].text
+        for attempt in range(max_retries + 1):
+            try:
+                response = client.messages.create(
+                    model="claude-sonnet-4-5-20250929",
+                    max_tokens=1024,
+                    messages=[{"role": "user", "content": prompt}]
+                )
 
-        json_match = re.search(r'```json\s*(\{[\s\S]*?\})\s*```', text)
-        if json_match:
-            return json.loads(json_match.group(1))
+                # Parse JSON from response
+                import re
+                text = response.content[0].text
 
-        # Fallback
+                json_match = re.search(r'```json\s*(\{[\s\S]*?\})\s*```', text)
+                if json_match:
+                    result = json.loads(json_match.group(1))
+
+                    # Validate required fields are present and non-empty
+                    if not result.get('section_summary'):
+                        raise ValueError("Missing or empty section_summary in response")
+
+                    return result
+
+                # No JSON found - retry
+                if attempt < max_retries:
+                    logger.warning(f"No JSON in response for '{subchapter.title}', retrying...")
+                    continue
+
+            except json.JSONDecodeError as e:
+                last_error = e
+                if attempt < max_retries:
+                    logger.warning(f"JSON parse error for '{subchapter.title}', retrying: {e}")
+                    continue
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    logger.warning(f"Error generating enhancement for '{subchapter.title}', retrying: {e}")
+                    continue
+
+        # Fallback after all retries exhausted
+        logger.warning(f"Using fallback summary for '{subchapter.title}' after {max_retries + 1} attempts")
         return {
             "section_summary": f"This section covers {subchapter.title}.",
             "context_bridge": "Continue from the previous section.",
@@ -959,6 +1008,7 @@ class BookProcessingPipeline:
                         'subchapter_number': subch.get('number'),
                         'chapter_title': subch.get('title'),
                         'section_header': subch.get('section_header'),
+                        'content': subch.get('content'),  # Sub-chapter text content
                         'word_count': subch.get('word_count'),
                         'detection_method': subch.get('detection_method'),
                         'preview_summary': subch_enhancement.get('section_summary'),
@@ -1067,13 +1117,37 @@ class BookProcessingPipeline:
         # Step 1: Parse EPUB
         step_start = time.time()
         logger.info("[1/10] Parsing EPUB...")
-        metadata, chapters = parse_epub_file(epub_path)
+        try:
+            metadata, chapters = parse_epub_file(epub_path)
+        except zipfile.BadZipFile:
+            raise ValueError(f"Invalid EPUB file (not a valid ZIP): {epub_path}")
+        except Exception as e:
+            raise ValueError(f"Failed to parse EPUB: {e}")
+
+        # Validate we got usable content
+        if not chapters:
+            raise ValueError("No chapters extracted from EPUB. File may be DRM-protected or malformed.")
+
+        # Use filename as fallback title if metadata missing
+        if not metadata.title:
+            metadata.title = Path(epub_path).stem.replace('_', ' ')
+            logger.warning(f"  No title in metadata, using filename: {metadata.title}")
+
         logger.info(f"  Title: {metadata.title}")
-        logger.info(f"  Author: {metadata.author}")
+        logger.info(f"  Author: {metadata.author or 'Unknown'}")
         logger.info(f"  Chapters: {len(chapters)}")
         total_words = sum(c.word_count for c in chapters)
         logger.info(f"  Total words: {total_words:,}")
+
+        if total_words < 1000:
+            logger.warning(f"  Very short book ({total_words} words) - may be partial or corrupted")
+
         logger.info(f"  Step 1 completed in {time.time() - step_start:.1f}s")
+
+        # Check for direct-upload marker (self-created EPUBs skip AI enhancement)
+        direct_upload = metadata.direct_upload
+        if direct_upload:
+            logger.info("  ** Direct upload mode: skipping AI enhancement (jarvis:direct-upload=true)")
 
         results['book_title'] = metadata.title
 
@@ -1122,12 +1196,14 @@ class BookProcessingPipeline:
             results['book_id'] = book['id']
         logger.info(f"  Step 3 completed in {time.time() - step_start:.1f}s")
 
-        # Step 4: Generate enhancements
+        # Step 4: Generate enhancements (skipped for direct-upload EPUBs)
         step_start = time.time()
         logger.info("[4/10] Generating enhancements...")
         enhancements: dict[int, dict] = {}
 
-        if self.anthropic_api_key:
+        if direct_upload:
+            logger.info("  Skipped (direct upload mode)")
+        elif self.anthropic_api_key:
             # Filter to content chapters using shared logic (skip front/back matter and short chapters)
             leaf_chapters, skipped_count = filter_content_chapters(
                 chapters,
@@ -1244,6 +1320,7 @@ class BookProcessingPipeline:
                                 'number': subchapter.number,
                                 'title': subchapter.title,
                                 'section_header': subchapter.section_header,
+                                'content': subchapter.content,
                                 'word_count': subchapter.word_count,
                                 'detection_method': subchapter.detection_method,
                                 'enhancement': enhancement_data
@@ -1317,9 +1394,12 @@ class BookProcessingPipeline:
         logger.info(f"  Step 7 completed in {time.time() - step_start:.1f}s")
 
         # Step 8: Upload enhanced to Drive (Jarvis/books/enhanced/)
+        # Skipped for direct-upload EPUBs (no enhanced version created)
         step_start = time.time()
         logger.info("[8/10] Uploading enhanced to Drive...")
-        if self.use_drive and self.drive and enhanced_path:
+        if direct_upload:
+            logger.info("  Skipped (direct upload mode - no enhanced version)")
+        elif self.use_drive and self.drive and enhanced_path and enhanced_path != epub_path:
             if preview:
                 logger.info(f"  Would upload to Jarvis/books/enhanced/{enhanced_path.name}")
             else:
@@ -1335,10 +1415,11 @@ class BookProcessingPipeline:
         logger.info(f"  Step 8 completed in {time.time() - step_start:.1f}s")
 
         # Step 9: Upload to Bookfusion
+        # For direct-upload EPUBs, upload the original directly
         step_start = time.time()
         logger.info("[9/10] Uploading to Bookfusion...")
         if self.use_bookfusion and BOOKFUSION_API_KEY:
-            upload_path = enhanced_path if enhanced_path and enhanced_path.exists() else epub_path
+            upload_path = epub_path if direct_upload else (enhanced_path if enhanced_path and enhanced_path.exists() else epub_path)
             if preview:
                 logger.info(f"  Would upload {upload_path.name} to Bookfusion")
             else:

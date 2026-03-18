@@ -64,7 +64,14 @@ def detect_subchapters_from_headers(
     sections: list[SubChapter] = []
 
     for i, match in enumerate(headers):
-        title = match.group(1).strip()
+        raw_title = match.group(1).strip()
+
+        # Strip leading chapter/section numbers like "4." or "8.\u2003" or "12. "
+        # Handles: "4. Title", "4.\u2003Title", "4 Title", "IV. Title"
+        title = re.sub(r'^[\dIVXivx]+[\.\:\u2003\s]+\s*', '', raw_title).strip()
+        if not title:
+            title = raw_title  # Keep original if stripping removed everything
+
         start_pos = match.start()
 
         # End position is start of next header or end of content
@@ -80,10 +87,10 @@ def detect_subchapters_from_headers(
 
         sections.append(SubChapter(
             number=len(sections) + 1,
-            title=title,
+            title=title,  # Cleaned title for display
             content=section_content,
             word_count=word_count,
-            section_header=title,
+            section_header=raw_title,  # Original for HTML matching
             detection_method='header',
             start_pos=start_pos,
             end_pos=end_pos

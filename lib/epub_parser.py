@@ -35,6 +35,7 @@ class EPUBMetadata:
     language: Optional[str] = None
     publisher: Optional[str] = None
     identifier: Optional[str] = None  # ISBN or other ID
+    direct_upload: bool = False  # If True, skip AI enhancement (self-created EPUBs)
 
 
 class EPUBParser:
@@ -160,6 +161,18 @@ class EPUBParser:
                 identifier = meta_elem.find('{http://purl.org/dc/elements/1.1/}identifier')
             if identifier is not None:
                 metadata.identifier = identifier.text
+
+            # Check for direct-upload marker (self-created EPUBs skip enhancement)
+            for meta_tag in meta_elem.findall('{http://www.idpf.org/2007/opf}meta'):
+                if meta_tag.get('name') == 'jarvis:direct-upload' and meta_tag.get('content', '').lower() == 'true':
+                    metadata.direct_upload = True
+                    break
+            # Also check without namespace (some EPUB writers omit it)
+            if not metadata.direct_upload:
+                for meta_tag in meta_elem.findall('meta'):
+                    if meta_tag.get('name') == 'jarvis:direct-upload' and meta_tag.get('content', '').lower() == 'true':
+                        metadata.direct_upload = True
+                        break
 
         return metadata
 
