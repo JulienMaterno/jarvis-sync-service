@@ -9,6 +9,32 @@ logger = logging.getLogger(__name__)
 
 INTELLIGENCE_SERVICE_URL = os.getenv("INTELLIGENCE_SERVICE_URL", "https://jarvis-intelligence-service-776871804948.asia-southeast1.run.app")
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+
+def _store_automated_message(content: str, metadata: dict = None):
+    """
+    Store an automated notification in chat_messages so the AI has context
+    when the user replies to it.
+
+    Uses the same user_id as the Telegram chat so it appears in conversation history.
+    """
+    try:
+        record = {
+            "role": "assistant",
+            "content": content[:10000],
+            "source": "automated_notification",
+            "metadata": metadata or {},
+            "letta_processed": True,  # No need for Letta to process notifications
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if TELEGRAM_CHAT_ID:
+            record["user_id"] = int(TELEGRAM_CHAT_ID)
+
+        supabase.table("chat_messages").insert(record).execute()
+        logger.debug("Stored automated notification in chat_messages")
+    except Exception as e:
+        logger.warning(f"Failed to store automated notification in chat_messages: {e}")
 
 
 def get_activity_summary_for_journal() -> dict:
@@ -701,6 +727,12 @@ async def generate_morning_task_digest():
 
         message = "\n".join(lines)
         await send_telegram_message(message)
+        _store_automated_message(message, {
+            "notification_type": "morning_task_digest",
+            "task_count": total,
+            "overdue_count": len(overdue_tasks),
+            "today_count": len(today_tasks),
+        })
         logger.info(f"Morning task digest sent: {total} tasks")
         return {"status": "success", "tasks_count": total}
 
@@ -772,7 +804,13 @@ async def check_overdue_task_alerts():
         lines.append("")
         lines.append("_Reply to complete or reschedule._")
 
-        await send_telegram_message("\n".join(lines))
+        alert_message = "\n".join(lines)
+        await send_telegram_message(alert_message)
+        _store_automated_message(alert_message, {
+            "notification_type": "overdue_task_alert",
+            "task_ids": [t["id"] for t in new_overdue],
+            "task_titles": [t["title"] for t in new_overdue],
+        })
 
         # Update notified set (keep all current overdue IDs)
         import json

@@ -4065,9 +4065,9 @@ async def list_summary_book_projects():
 @app.get("/dashboard/activity-heatmap", response_class=HTMLResponse)
 async def activity_heatmap():
     """
-    GitHub-style contribution heatmaps for activity, meditation, and meetings.
+    GitHub-style contribution heatmaps for activity, meditation, sleep, and Anki.
     Embeddable in Notion via /embed block.
-    Green = screen time, Blue = meditation, Orange = meetings.
+    Green = screen time, Blue = meditation, Purple = sleep, Amber = Anki reviews.
     """
     import json as _json
 
@@ -4134,34 +4134,20 @@ async def activity_heatmap():
         logger.error(f"Failed to fetch meditation data for heatmap: {e}")
         meditation_json = "{}"
 
-    # --- Fetch Anki review data (aggregated by date, Singapore timezone) ---
+    # --- Fetch sleep data (hours per night from health_sleep) ---
     try:
-        from zoneinfo import ZoneInfo
-        sg_tz = ZoneInfo("Asia/Singapore")
-        # Fetch all review timestamps (lightweight - just one column)
-        anki_data = {}
-        page_size = 1000
-        offset = 0
-        while True:
-            anki_result = supabase.table("anki_review_logs").select(
-                "reviewed_at"
-            ).order("reviewed_at", desc=False).range(offset, offset + page_size - 1).execute()
-            if not anki_result.data:
-                break
-            for row in anki_result.data:
-                ts = row.get("reviewed_at")
-                if ts:
-                    dt = datetime.fromisoformat(ts).astimezone(sg_tz)
-                    d = dt.strftime("%Y-%m-%d")
-                    anki_data[d] = anki_data.get(d, 0) + 1
-            if len(anki_result.data) < page_size:
-                break
-            offset += page_size
-        anki_json = _json.dumps(anki_data)
-        logger.info(f"Anki heatmap: {len(anki_data)} days, {sum(anki_data.values())} reviews")
+        sleep_result = supabase.table("health_sleep").select(
+            "date, duration_total_s, end_at, sleep_score"
+        ).order("date", desc=False).limit(365).execute()
+        sleep_data = {}
+        for row in sleep_result.data:
+            d = row["date"]
+            dur_s = row.get("duration_total_s") or 0
+            sleep_data[d] = round(dur_s / 3600, 2)
+        sleep_json = _json.dumps(sleep_data)
     except Exception as e:
-        logger.error(f"Failed to fetch Anki review data for heatmap: {e}")
-        anki_json = "{}"
+        logger.error(f"Failed to fetch sleep data for heatmap: {e}")
+        sleep_json = "{}"
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -4243,12 +4229,14 @@ async def activity_heatmap():
   .blue .lvl-2 {{ background-color: #0550ae; }}
   .blue .lvl-3 {{ background-color: #1a7af8; }}
   .blue .lvl-4 {{ background-color: #58a6ff; }}
-  /* Amber scale (Anki reviews) */
-  .amber .lvl-0 {{ background-color: #161b22; }}
-  .amber .lvl-1 {{ background-color: #5c3d0e; }}
-  .amber .lvl-2 {{ background-color: #8a5a0e; }}
-  .amber .lvl-3 {{ background-color: #c47f11; }}
-  .amber .lvl-4 {{ background-color: #f5a623; }}
+  /* Purple scale (sleep) — 7 levels for granularity */
+  .purple .lvl-0 {{ background-color: #161b22; }}
+  .purple .lvl-1 {{ background-color: #2d1754; }}
+  .purple .lvl-2 {{ background-color: #4c1d95; }}
+  .purple .lvl-3 {{ background-color: #6b21a8; }}
+  .purple .lvl-4 {{ background-color: #9333ea; }}
+  .purple .lvl-5 {{ background-color: #a855f7; }}
+  .purple .lvl-6 {{ background-color: #c084fc; }}
   .month-labels {{
     display: flex;
     font-size: 9px;
@@ -4549,16 +4537,16 @@ async def activity_heatmap():
   </div>
 
 
-  <!-- Anki Reviews Heatmap (amber) -->
-  <div class="section amber" id="anki-section">
-    <h1>Anki Reviews</h1>
-    <div class="subtitle" id="anki-subtitle"></div>
-    <div class="stats" id="anki-stats"></div>
-    <div class="month-labels" id="anki-months"></div>
+  <!-- Sleep Heatmap (purple) -->
+  <div class="section purple" id="sleep-section">
+    <h1>Sleep</h1>
+    <div class="subtitle" id="sleep-subtitle"></div>
+    <div class="stats" id="sleep-stats"></div>
+    <div class="month-labels" id="sleep-months"></div>
     <div class="heatmap-wrapper">
-      <div class="day-labels" id="anki-daylabels"></div>
+      <div class="day-labels" id="sleep-daylabels"></div>
       <div class="heatmap-scroll">
-        <div class="heatmap" id="anki-heatmap"></div>
+        <div class="heatmap" id="sleep-heatmap"></div>
       </div>
     </div>
     <div class="legend">
@@ -4568,6 +4556,8 @@ async def activity_heatmap():
       <div class="day lvl-2"></div>
       <div class="day lvl-3"></div>
       <div class="day lvl-4"></div>
+      <div class="day lvl-5"></div>
+      <div class="day lvl-6"></div>
       <span>More</span>
     </div>
   </div>
@@ -4601,7 +4591,7 @@ async def activity_heatmap():
 const ACTIVITY_DATA = {activity_json};
 const HOURLY_DATA = {hourly_json};
 const MEDITATION_DATA = {meditation_json};
-const ANKI_DATA = {anki_json};
+const SLEEP_DATA = {sleep_json};
 const DAYS = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
@@ -4829,28 +4819,24 @@ renderHeatmap({{
   formatValue: formatMins,
 }});
 
-// Render Anki heatmap (amber, review count)
-function formatReviews(n) {{
-  if (!n || n < 1) return 'No reviews';
-  const r = Math.round(n);
-  return r + (r === 1 ? ' review' : ' reviews');
-}}
-
+// Render Sleep heatmap (purple, hours — 7 levels for granularity)
 renderHeatmap({{
-  data: ANKI_DATA,
-  heatmapId: 'anki-heatmap',
-  monthsId: 'anki-months',
-  dayLabelsId: 'anki-daylabels',
-  statsId: 'anki-stats',
-  subtitleId: 'anki-subtitle',
-  getLevel: (n) => {{
-    if (!n || n < 1) return 0;
-    if (n < 20) return 1;
-    if (n < 50) return 2;
-    if (n < 100) return 3;
-    return 4;
+  data: SLEEP_DATA,
+  heatmapId: 'sleep-heatmap',
+  monthsId: 'sleep-months',
+  dayLabelsId: 'sleep-daylabels',
+  statsId: 'sleep-stats',
+  subtitleId: 'sleep-subtitle',
+  getLevel: (h) => {{
+    if (!h || h < 0.1) return 0;
+    if (h < 4) return 1;
+    if (h < 5.5) return 2;
+    if (h < 6.5) return 3;
+    if (h < 7.5) return 4;
+    if (h < 9) return 5;
+    return 6;
   }},
-  formatValue: formatReviews,
+  formatValue: formatHours,
 }});
 
 // ---- Day detail modal ----
@@ -5394,10 +5380,19 @@ async def withings_oauth_callback(code: str = None, state: str = None, error: st
 
 
 @app.post("/sync/withings")
-async def sync_withings(days: int = 7, full: bool = False):
-    """Manually trigger Withings health data sync."""
+async def sync_withings(days: int = 7, full: bool = False, data_type: str | None = None):
+    """Manually trigger Withings health data sync.
+
+    Args:
+        days: Lookback window in days (default 7).
+        full: If True, sync last 365 days.
+        data_type: Optional specific type to sync (measurements, activity, sleep,
+                   heart_rate, ecg, workouts, sleep_details). If None, syncs all.
+    """
     try:
-        result = await run_in_threadpool(run_withings_sync, supabase, days=days, full_sync=full)
+        result = await run_in_threadpool(
+            run_withings_sync, supabase, days=days, full_sync=full, data_type=data_type
+        )
         return result
     except Exception as e:
         logger.error(f"Withings sync failed: {e}")
@@ -5646,4 +5641,33 @@ async def scheduled_health_insights():
         }
     except Exception as e:
         logger.error(f"Scheduled health insights failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/report/daily-health")
+async def scheduled_daily_health():
+    """
+    Generate daily morning health micro-briefing and deliver via Telegram.
+
+    Uses Haiku for cost efficiency. Compares last night vs baselines.
+    Schedule this daily at 07:00 SGT via cron on Hetzner.
+    """
+    from lib.health_insights import generate_daily_briefing, format_daily_telegram
+    from lib.telegram_client import send_telegram_message
+
+    try:
+        logger.info("Daily health briefing generation starting")
+        result = await run_in_threadpool(generate_daily_briefing, supabase)
+
+        # Send Telegram briefing
+        msg = format_daily_telegram(result)
+        await send_telegram_message(msg)
+
+        logger.info(f"Daily health briefing delivered: {len(result.get('briefing_text', ''))} chars")
+        return {
+            "status": "success",
+            "briefing": result.get("briefing_text", "")[:200],
+        }
+    except Exception as e:
+        logger.error(f"Daily health briefing failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))

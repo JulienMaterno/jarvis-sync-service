@@ -133,6 +133,28 @@ def _fetch_health_data(supabase: Client, days: int = 7) -> dict[str, Any]:
         ).order("recorded_at", desc=True).limit(20).execute()
         data["ecg"] = ecg_resp.data or []
 
+        # Meetings per day (for correlation with sleep/stress)
+        meeting_resp = supabase.table("meetings").select("date").gte(
+            "date", analysis_start
+        ).is_("deleted_at", "null").execute()
+        meeting_counts: dict[str, int] = {}
+        for m in (meeting_resp.data or []):
+            d = (m.get("date") or "")[:10]
+            if d:
+                meeting_counts[d] = meeting_counts.get(d, 0) + 1
+        data["meetings_by_date"] = meeting_counts
+
+        # Calendar events per day
+        cal_resp = supabase.table("calendar_events").select(
+            "start_time,summary"
+        ).gte("start_time", analysis_start).execute()
+        cal_by_date: dict[str, list[str]] = {}
+        for e in (cal_resp.data or []):
+            d = (e.get("start_time") or "")[:10]
+            if d:
+                cal_by_date.setdefault(d, []).append(e.get("summary", ""))
+        data["calendar_by_date"] = cal_by_date
+
     except Exception as e:
         logger.error(f"Failed to fetch health data for insights: {e}")
         raise
@@ -850,15 +872,72 @@ def _fetch_personal_context(supabase: Client, days: int = 30) -> str:
     except Exception as e:
         logger.debug(f"Could not fetch previous insights: {e}")
 
+    # 6. Active health protocols (structured interventions the user is following)
+    active_protocol = _fetch_active_health_protocol(supabase)
+    if active_protocol:
+        context_items.append(active_protocol)
+
     if not context_items:
         return ""
 
-    # Cap total context to ~3000 chars to keep prompt efficient
+    # Cap total context to ~4000 chars to keep prompt efficient (increased for protocol)
     combined = "\n\n".join(context_items)
-    if len(combined) > 3000:
-        combined = combined[:3000] + "\n... (truncated)"
+    if len(combined) > 4000:
+        combined = combined[:4000] + "\n... (truncated)"
 
     return combined
+
+
+def _fetch_active_health_protocol(supabase: Client) -> str:
+    """
+    Fetch active health protocol from the health_protocols table.
+
+    Returns formatted context string if an active protocol exists, empty string otherwise.
+    The protocol provides structured context about what the user is actively doing
+    to optimize their health, so insights can be tailored accordingly.
+    """
+    try:
+        resp = supabase.table("health_protocols").select(
+            "name,phase,started_at,phase_started_at,target_metrics,protocol_context"
+        ).eq("status", "active").order("started_at", desc=True).limit(1).execute()
+
+        if not resp.data:
+            return ""
+
+        p = resp.data[0]
+        started = (p.get("started_at") or "")[:10]
+        phase_started = (p.get("phase_started_at") or "")[:10]
+
+        lines = [
+            f"[ACTIVE HEALTH PROTOCOL: {p.get('name', 'Unknown')}]",
+            f"- Started: {started}",
+            f"- Current phase: {p.get('phase', 'unknown')} (since {phase_started})",
+        ]
+
+        targets = p.get("target_metrics")
+        if targets:
+            if isinstance(targets, str):
+                targets = json.loads(targets)
+            lines.append("- Target metrics:")
+            for k, v in targets.items():
+                lines.append(f"  * {k}: {v}")
+
+        context = p.get("protocol_context") or ""
+        if context:
+            lines.append(f"- Protocol details: {context[:800]}")
+
+        lines.append(
+            "IMPORTANT: Evaluate the user's data in the context of this active protocol. "
+            "Note progress toward protocol targets. Recommendations should align with "
+            "the protocol phase (don't contradict it). Flag if data suggests the protocol "
+            "needs adjustment."
+        )
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.debug(f"Could not fetch active health protocol: {e}")
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -903,6 +982,9 @@ def _build_analysis_prompt(
     alerts: list[dict],
     advanced_hrv: Optional[dict[str, Any]] = None,
     personal_context: str = "",
+    raw_data: Optional[dict[str, Any]] = None,
+    long_term_patterns: Optional[list[dict[str, Any]]] = None,
+    previous_insights: Optional[dict[str, Any]] = None,
 ) -> str:
     """Build the analysis prompt with all health data and personal context."""
 
@@ -1068,6 +1150,77 @@ NOTE: LF/HF ratio < 1.0 = parasympathetic dominant (recovery), 1.0-2.0 = balance
         for alert in alerts:
             prompt += f"- [{alert['type'].upper()}] {alert['message']}\n"
 
+    # Day-by-day breakdown (so Claude can see within-week patterns)
+    if raw_data:
+        cutoff = metrics.get("analysis_start", "")
+        prompt += "\n## Day-by-Day Breakdown\n"
+
+        sleep_all = raw_data.get("sleep", [])
+        activity_all = raw_data.get("activity", [])
+        meetings = raw_data.get("meetings_by_date", {})
+        calendar = raw_data.get("calendar_by_date", {})
+
+        # Collect all dates in the analysis period
+        dates = set()
+        for s in sleep_all:
+            d = (s.get("date") or "")[:10]
+            if d >= cutoff:
+                dates.add(d)
+        for a in activity_all:
+            d = (a.get("date") or "")[:10]
+            if d >= cutoff:
+                dates.add(d)
+        dates.update(k for k in meetings.keys() if k >= cutoff)
+        dates.update(k for k in calendar.keys() if k >= cutoff)
+
+        sleep_by_date = {(s.get("date") or "")[:10]: s for s in sleep_all}
+        activity_by_date = {(a.get("date") or "")[:10]: a for a in activity_all}
+
+        for d in sorted(dates):
+            parts = [d]
+            s = sleep_by_date.get(d)
+            if s:
+                dur = round(s["duration_total_s"] / 3600, 1) if s.get("duration_total_s") else "?"
+                parts.append(f"sleep:{s.get('sleep_score', '?')}/100 {dur}h")
+            a = activity_by_date.get(d)
+            if a:
+                parts.append(f"steps:{a.get('steps', '?')}")
+            mc = meetings.get(d, 0)
+            cc = len(calendar.get(d, []))
+            if mc or cc:
+                parts.append(f"meetings:{mc} events:{cc}")
+            cal_names = calendar.get(d, [])
+            if cal_names:
+                parts.append(f"[{', '.join(n for n in cal_names[:5] if n)}]")
+            prompt += "- " + " | ".join(parts) + "\n"
+
+    # Long-term patterns (90-day correlations)
+    if long_term_patterns:
+        prompt += "\n## Long-Term Patterns (90 days)\n"
+        prompt += "These are statistically detected correlations from your historical data:\n"
+        for p in long_term_patterns:
+            conf = p.get("confidence", 0)
+            prompt += f"- {p.get('description', '')} (n={p.get('sample_size', '?')}, confidence={conf:.0%})\n"
+
+    # Previous week's insights (so Claude doesn't repeat itself)
+    if previous_insights:
+        prompt += "\n## Previous Analysis (DO NOT repeat these, note changes instead)\n"
+        prompt += f"- Previous overall: {previous_insights.get('overall_score', '?')}/100\n"
+        prompt += f"- Previous summary: {(previous_insights.get('summary') or '')[:300]}\n"
+        prev_focus = previous_insights.get("weekly_focus")
+        if prev_focus:
+            prompt += f"- Previous focus: {prev_focus}\n"
+        prev_recs = previous_insights.get("recommendations")
+        if prev_recs:
+            if isinstance(prev_recs, str):
+                prev_recs = json.loads(prev_recs)
+            high_recs = [r for r in prev_recs if r.get("priority") == "high"]
+            if high_recs:
+                prompt += "- Previous high-priority recommendations:\n"
+                for r in high_recs[:3]:
+                    prompt += f"  * {r.get('action', '')[:150]}\n"
+        prompt += "\nNote any progress or regression compared to last analysis. Did the user follow through on recommendations?\n"
+
     if personal_context:
         prompt += f"""
 ## Personal Context
@@ -1189,8 +1342,28 @@ def generate_health_insights(
     # Step 5: Fetch personal context
     personal_context = _fetch_personal_context(supabase, days=max(days, 30))
 
+    # Step 5b: Detect and persist long-term patterns
+    long_term_patterns = _detect_long_term_patterns(supabase)
+    _persist_patterns(supabase, long_term_patterns)
+
+    # Step 5c: Fetch previous insights (so Claude knows what it already said)
+    previous_insights = None
+    try:
+        prev_resp = supabase.table("health_insights").select(
+            "overall_score,summary,weekly_focus,recommendations"
+        ).order("generated_at", desc=True).limit(1).execute()
+        if prev_resp.data:
+            previous_insights = prev_resp.data[0]
+    except Exception:
+        pass
+
     # Step 6: Build prompt and call Claude
-    prompt = _build_analysis_prompt(metrics, scores, alerts, advanced_hrv, personal_context)
+    prompt = _build_analysis_prompt(
+        metrics, scores, alerts, advanced_hrv, personal_context,
+        raw_data=raw_data,
+        long_term_patterns=long_term_patterns,
+        previous_insights=previous_insights,
+    )
 
     client = anthropic.Anthropic(api_key=api_key)
     # Try primary model, fall back to alternatives
@@ -1470,3 +1643,512 @@ def _avg_from_jsonb(ts_data: Any) -> Optional[float]:
         values = [v for v in ts_data.values() if v is not None and isinstance(v, (int, float))]
         return _avg(values) if values else None
     return None
+
+
+# ---------------------------------------------------------------------------
+# Daily micro-briefing
+# ---------------------------------------------------------------------------
+
+DAILY_MODEL = "claude-haiku-4-5-20251001"
+
+DAILY_SYSTEM_PROMPT = """You are a concise health analyst for a personal health dashboard.
+You generate a short daily morning briefing based on last night's sleep and yesterday's activity,
+compared against the user's 30-day baselines.
+
+Rules:
+- Be EXTREMELY concise. 2-5 short lines max.
+- Only mention what's NOTEWORTHY. If everything is normal, say so in one line.
+- Use specific numbers (e.g., "7.2h sleep, score 82").
+- Compare to baselines with arrows or deltas (e.g., "+12% vs avg", "below your 65 avg").
+- If data is missing, say "no data" for that metric, don't speculate.
+- Never repeat what you said yesterday. The previous briefing is provided, avoid redundancy.
+- Address the user as "you". No greetings, no sign-offs.
+- If there are long-term patterns detected, mention the most relevant one briefly.
+- Include a one-line readiness assessment at the end (e.g., "Good day to train" or "Consider rest today").
+- No markdown headers. Just clean lines with emoji sparingly."""
+
+
+def _fetch_daily_data(supabase: Client) -> dict[str, Any]:
+    """Fetch last night's sleep, yesterday's activity, and 30-day baselines."""
+    now = datetime.now(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    baseline_start = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+    hr_since = (now - timedelta(days=1)).isoformat()
+
+    data: dict[str, Any] = {}
+
+    try:
+        # Last night's sleep (most recent)
+        sleep_resp = supabase.table("health_sleep").select("*").order(
+            "date", desc=True
+        ).limit(1).execute()
+        data["last_sleep"] = sleep_resp.data[0] if sleep_resp.data else None
+
+        # 30-day sleep baseline
+        sleep_baseline = supabase.table("health_sleep").select(
+            "sleep_score,duration_total_s,duration_deep_s,duration_rem_s"
+        ).gte("date", baseline_start).execute()
+        data["sleep_baseline"] = sleep_baseline.data or []
+
+        # Yesterday's activity
+        activity_resp = supabase.table("health_activity").select("*").order(
+            "date", desc=True
+        ).limit(1).execute()
+        data["last_activity"] = activity_resp.data[0] if activity_resp.data else None
+
+        # 30-day activity baseline
+        activity_baseline = supabase.table("health_activity").select(
+            "steps,calories_active"
+        ).gte("date", baseline_start).execute()
+        data["activity_baseline"] = activity_baseline.data or []
+
+        # Latest HR (last 24h, for resting HR estimate)
+        hr_resp = supabase.table("health_heart_rate").select(
+            "heart_rate"
+        ).gte("timestamp", hr_since).order("timestamp", desc=True).limit(500).execute()
+        hr_values = [h["heart_rate"] for h in (hr_resp.data or []) if h.get("heart_rate") and h["heart_rate"] > 0]
+        if hr_values:
+            sorted_hr = sorted(hr_values)
+            resting_count = max(1, len(sorted_hr) // 10)
+            data["resting_hr"] = round(_avg(sorted_hr[:resting_count]))
+            data["avg_hr"] = round(_avg(hr_values))
+        else:
+            data["resting_hr"] = None
+            data["avg_hr"] = None
+
+        # Latest HRV from sleep details
+        hrv_resp = supabase.table("health_sleep_details").select(
+            "rmssd,sdnn_1"
+        ).order("sleep_date", desc=True).limit(1).execute()
+        if hrv_resp.data and hrv_resp.data[0].get("rmssd"):
+            data["last_rmssd"] = _avg_from_jsonb(hrv_resp.data[0]["rmssd"])
+        else:
+            data["last_rmssd"] = None
+
+        # 30-day HRV baseline
+        hrv_baseline = supabase.table("health_sleep_details").select(
+            "rmssd"
+        ).gte("sleep_date", baseline_start).execute()
+        rmssd_vals = []
+        for sd in (hrv_baseline.data or []):
+            v = _avg_from_jsonb(sd.get("rmssd"))
+            if v:
+                rmssd_vals.append(v)
+        data["rmssd_baseline_avg"] = round(_avg(rmssd_vals), 1) if rmssd_vals else None
+
+        # Today's calendar events (meetings)
+        cal_resp = supabase.table("calendar_events").select(
+            "summary,start_time,end_time"
+        ).gte("start_time", today).lte(
+            "start_time", (now + timedelta(days=1)).strftime("%Y-%m-%d")
+        ).order("start_time").execute()
+        data["today_events"] = cal_resp.data or []
+
+    except Exception as e:
+        logger.error(f"Failed to fetch daily health data: {e}")
+        raise
+
+    return data
+
+
+def _fetch_previous_briefing(supabase: Client) -> Optional[str]:
+    """Fetch yesterday's daily briefing so we don't repeat ourselves."""
+    try:
+        resp = supabase.table("health_daily_briefings").select(
+            "briefing_text"
+        ).order("generated_at", desc=True).limit(1).execute()
+        if resp.data:
+            return resp.data[0].get("briefing_text", "")
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_long_term_patterns(supabase: Client) -> list[dict[str, Any]]:
+    """Fetch stored long-term patterns from health_patterns table."""
+    try:
+        resp = supabase.table("health_patterns").select("*").eq(
+            "active", True
+        ).order("confidence", desc=True).limit(10).execute()
+        return resp.data or []
+    except Exception:
+        return []
+
+
+def _detect_long_term_patterns(supabase: Client) -> list[dict[str, Any]]:
+    """
+    Detect long-term correlations across 90 days of data.
+
+    Looks for patterns like:
+    - Meeting-heavy days -> worse sleep that night
+    - High activity days -> better HRV next morning
+    - Late calendar events -> longer sleep latency
+    - Workout days -> lower resting HR next day
+    """
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=90)).strftime("%Y-%m-%d")
+    patterns: list[dict[str, Any]] = []
+
+    try:
+        # Get sleep data with dates
+        sleep_resp = supabase.table("health_sleep").select(
+            "date,sleep_score,duration_total_s,duration_deep_s,duration_rem_s,"
+            "sleep_latency_s,waso_s,total_timeinbed_s"
+        ).gte("date", start).order("date").execute()
+        sleep_by_date = {s["date"][:10]: s for s in (sleep_resp.data or [])}
+
+        # Get activity data
+        activity_resp = supabase.table("health_activity").select(
+            "date,steps,calories_active,intense_activity_seconds,moderate_activity_seconds"
+        ).gte("date", start).order("date").execute()
+        activity_by_date = {a["date"][:10]: a for a in (activity_resp.data or [])}
+
+        # Get meeting counts per day
+        meeting_resp = supabase.table("meetings").select(
+            "date"
+        ).gte("date", start).is_("deleted_at", "null").execute()
+        meeting_counts: dict[str, int] = {}
+        for m in (meeting_resp.data or []):
+            d = (m.get("date") or "")[:10]
+            if d:
+                meeting_counts[d] = meeting_counts.get(d, 0) + 1
+
+        # Get calendar events per day (more complete than meetings table)
+        cal_resp = supabase.table("calendar_events").select(
+            "start_time,end_time"
+        ).gte("start_time", start).execute()
+        cal_counts: dict[str, int] = {}
+        late_event_dates: set[str] = set()
+        for e in (cal_resp.data or []):
+            st = e.get("start_time", "")
+            if st:
+                d = st[:10]
+                cal_counts[d] = cal_counts.get(d, 0) + 1
+                # Check if event is after 18:00 UTC (could be late meeting)
+                hour = int(st[11:13]) if len(st) > 13 else 0
+                if hour >= 12:  # 12 UTC = 20:00 SGT
+                    late_event_dates.add(d)
+
+        # Get workout days
+        workout_resp = supabase.table("health_workouts").select(
+            "date"
+        ).gte("date", start).execute()
+        workout_dates = set()
+        for w in (workout_resp.data or []):
+            d = (w.get("date") or "")[:10]
+            if d:
+                workout_dates.add(d)
+
+        # --- Pattern 1: Meeting-heavy days -> sleep quality ---
+        high_meeting_sleep = []
+        low_meeting_sleep = []
+        for date_str, sleep in sleep_by_date.items():
+            score = sleep.get("sleep_score")
+            if not score:
+                continue
+            # Check previous day's meetings (meetings affect that night's sleep)
+            prev_day = (datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+            mc = meeting_counts.get(prev_day, 0) + cal_counts.get(prev_day, 0)
+            if mc >= 3:
+                high_meeting_sleep.append(score)
+            elif mc == 0:
+                low_meeting_sleep.append(score)
+
+        if len(high_meeting_sleep) >= 3 and len(low_meeting_sleep) >= 3:
+            avg_high = round(_avg(high_meeting_sleep), 1)
+            avg_low = round(_avg(low_meeting_sleep), 1)
+            diff = round(avg_low - avg_high, 1)
+            if abs(diff) > 3:
+                patterns.append({
+                    "pattern_key": "meetings_vs_sleep",
+                    "description": f"Days with 3+ meetings/events correlate with sleep score {avg_high} vs {avg_low} on quiet days (delta: {diff:+.1f})",
+                    "direction": "negative" if diff > 0 else "positive",
+                    "strength": min(abs(diff) / 10, 1.0),
+                    "confidence": min(len(high_meeting_sleep) + len(low_meeting_sleep), 30) / 30,
+                    "sample_size": len(high_meeting_sleep) + len(low_meeting_sleep),
+                    "data": {"high_meeting_avg": avg_high, "low_meeting_avg": avg_low},
+                })
+
+        # --- Pattern 2: Active days -> next night HRV ---
+        # (Using activity calories as proxy for activity intensity)
+        active_day_next_sleep = []
+        inactive_day_next_sleep = []
+        for date_str, activity in activity_by_date.items():
+            cal_active = activity.get("calories_active") or 0
+            steps = activity.get("steps") or 0
+            next_day = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+            next_sleep = sleep_by_date.get(next_day)
+            if not next_sleep or not next_sleep.get("sleep_score"):
+                continue
+            if steps > 8000 or cal_active > 300:
+                active_day_next_sleep.append(next_sleep["sleep_score"])
+            elif steps < 3000:
+                inactive_day_next_sleep.append(next_sleep["sleep_score"])
+
+        if len(active_day_next_sleep) >= 3 and len(inactive_day_next_sleep) >= 3:
+            avg_active = round(_avg(active_day_next_sleep), 1)
+            avg_inactive = round(_avg(inactive_day_next_sleep), 1)
+            diff = round(avg_active - avg_inactive, 1)
+            if abs(diff) > 3:
+                patterns.append({
+                    "pattern_key": "activity_vs_sleep",
+                    "description": f"Active days (8k+ steps) followed by sleep score {avg_active} vs {avg_inactive} after sedentary days (delta: {diff:+.1f})",
+                    "direction": "positive" if diff > 0 else "negative",
+                    "strength": min(abs(diff) / 10, 1.0),
+                    "confidence": min(len(active_day_next_sleep) + len(inactive_day_next_sleep), 30) / 30,
+                    "sample_size": len(active_day_next_sleep) + len(inactive_day_next_sleep),
+                    "data": {"active_avg": avg_active, "inactive_avg": avg_inactive},
+                })
+
+        # --- Pattern 3: Workout days -> next day resting HR ---
+        # We don't have daily RHR easily, so use sleep deep % as recovery proxy
+        workout_next_deep = []
+        no_workout_next_deep = []
+        for date_str, sleep in sleep_by_date.items():
+            deep = sleep.get("duration_deep_s")
+            total = sleep.get("duration_total_s")
+            if not deep or not total or total == 0:
+                continue
+            deep_pct = deep / total * 100
+            prev_day = (datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+            if prev_day in workout_dates:
+                workout_next_deep.append(deep_pct)
+            else:
+                no_workout_next_deep.append(deep_pct)
+
+        if len(workout_next_deep) >= 3 and len(no_workout_next_deep) >= 3:
+            avg_workout = round(_avg(workout_next_deep), 1)
+            avg_no = round(_avg(no_workout_next_deep), 1)
+            diff = round(avg_workout - avg_no, 1)
+            if abs(diff) > 2:
+                patterns.append({
+                    "pattern_key": "workout_vs_deep_sleep",
+                    "description": f"Workout days: {avg_workout:.0f}% deep sleep vs {avg_no:.0f}% on rest days (delta: {diff:+.1f}%)",
+                    "direction": "positive" if diff > 0 else "negative",
+                    "strength": min(abs(diff) / 8, 1.0),
+                    "confidence": min(len(workout_next_deep) + len(no_workout_next_deep), 30) / 30,
+                    "sample_size": len(workout_next_deep) + len(no_workout_next_deep),
+                    "data": {"workout_avg": avg_workout, "no_workout_avg": avg_no},
+                })
+
+        # --- Pattern 4: Late events -> sleep latency ---
+        late_event_latency = []
+        no_late_latency = []
+        for date_str, sleep in sleep_by_date.items():
+            latency = sleep.get("sleep_latency_s")
+            if not latency:
+                continue
+            prev_day = (datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+            if prev_day in late_event_dates:
+                late_event_latency.append(latency / 60)
+            else:
+                no_late_latency.append(latency / 60)
+
+        if len(late_event_latency) >= 3 and len(no_late_latency) >= 3:
+            avg_late = round(_avg(late_event_latency), 1)
+            avg_no = round(_avg(no_late_latency), 1)
+            diff = round(avg_late - avg_no, 1)
+            if abs(diff) > 2:
+                patterns.append({
+                    "pattern_key": "late_events_vs_latency",
+                    "description": f"Late events (after 8pm): {avg_late:.0f}min sleep latency vs {avg_no:.0f}min normally (delta: {diff:+.1f}min)",
+                    "direction": "negative" if diff > 0 else "positive",
+                    "strength": min(abs(diff) / 15, 1.0),
+                    "confidence": min(len(late_event_latency) + len(no_late_latency), 20) / 20,
+                    "sample_size": len(late_event_latency) + len(no_late_latency),
+                    "data": {"late_avg": avg_late, "no_late_avg": avg_no},
+                })
+
+    except Exception as e:
+        logger.error(f"Long-term pattern detection failed: {e}")
+
+    return patterns
+
+
+def _persist_patterns(supabase: Client, patterns: list[dict[str, Any]]) -> None:
+    """Upsert detected patterns to health_patterns table."""
+    if not patterns:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    for p in patterns:
+        try:
+            record = {
+                "pattern_key": p["pattern_key"],
+                "description": p["description"],
+                "direction": p.get("direction"),
+                "strength": round(p.get("strength", 0), 3),
+                "confidence": round(p.get("confidence", 0), 3),
+                "sample_size": p.get("sample_size", 0),
+                "data": json.dumps(p.get("data", {})),
+                "active": True,
+                "last_detected_at": now,
+            }
+            supabase.table("health_patterns").upsert(
+                record, on_conflict="pattern_key"
+            ).execute()
+        except Exception as e:
+            logger.debug(f"Failed to persist pattern {p['pattern_key']}: {e}")
+
+
+def generate_daily_briefing(supabase: Client) -> dict[str, Any]:
+    """
+    Generate a concise daily morning health briefing.
+
+    Uses Haiku for cost efficiency. Compares last night's sleep and
+    yesterday's activity against 30-day baselines. Includes long-term
+    patterns and avoids repeating yesterday's briefing.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY not set")
+
+    start_time = time.time()
+
+    # Fetch data
+    daily = _fetch_daily_data(supabase)
+    prev_briefing = _fetch_previous_briefing(supabase)
+    patterns = _fetch_long_term_patterns(supabase)
+
+    # Also re-detect patterns (updates stored patterns)
+    fresh_patterns = _detect_long_term_patterns(supabase)
+    _persist_patterns(supabase, fresh_patterns)
+    # Use fresh if available, fall back to stored
+    if fresh_patterns:
+        patterns = fresh_patterns
+
+    # Build compact prompt
+    prompt_parts = []
+
+    # Last night's sleep
+    s = daily.get("last_sleep")
+    if s:
+        sleep_date = (s.get("date") or "")[:10]
+        dur_h = round(s["duration_total_s"] / 3600, 1) if s.get("duration_total_s") else None
+        deep_h = round(s["duration_deep_s"] / 3600, 2) if s.get("duration_deep_s") else None
+        rem_h = round(s["duration_rem_s"] / 3600, 2) if s.get("duration_rem_s") else None
+        prompt_parts.append(f"LAST NIGHT ({sleep_date}): score={s.get('sleep_score')}, "
+                           f"duration={dur_h}h, deep={deep_h}h, REM={rem_h}h, "
+                           f"latency={round(s['sleep_latency_s']/60, 1) if s.get('sleep_latency_s') else '?'}min, "
+                           f"waso={round(s['waso_s']/60, 1) if s.get('waso_s') else '?'}min")
+    else:
+        prompt_parts.append("LAST NIGHT: no sleep data")
+
+    # Baselines
+    sb = daily.get("sleep_baseline", [])
+    if sb:
+        scores = [x["sleep_score"] for x in sb if x.get("sleep_score")]
+        durs = [x["duration_total_s"] / 3600 for x in sb if x.get("duration_total_s")]
+        prompt_parts.append(f"30-DAY SLEEP BASELINE: avg score={round(_avg(scores), 1) if scores else '?'}, "
+                           f"avg duration={round(_avg(durs), 1) if durs else '?'}h, "
+                           f"nights tracked={len(scores)}")
+
+    # Yesterday's activity
+    a = daily.get("last_activity")
+    if a:
+        act_date = (a.get("date") or "")[:10]
+        prompt_parts.append(f"YESTERDAY ACTIVITY ({act_date}): steps={a.get('steps')}, "
+                           f"active cal={a.get('calories_active')}, "
+                           f"hr avg={a.get('hr_average')}")
+    else:
+        prompt_parts.append("YESTERDAY ACTIVITY: no data")
+
+    # Activity baseline
+    ab = daily.get("activity_baseline", [])
+    if ab:
+        steps_bl = [x["steps"] for x in ab if x.get("steps")]
+        prompt_parts.append(f"30-DAY ACTIVITY BASELINE: avg steps={round(_avg(steps_bl)) if steps_bl else '?'}, "
+                           f"days tracked={len(steps_bl)}")
+
+    # Heart rate
+    if daily.get("resting_hr"):
+        prompt_parts.append(f"RESTING HR: {daily['resting_hr']} bpm")
+    if daily.get("last_rmssd"):
+        bl = daily.get("rmssd_baseline_avg")
+        prompt_parts.append(f"HRV (RMSSD): {round(daily['last_rmssd'], 1)}ms"
+                           f"{f' (baseline: {bl}ms)' if bl else ''}")
+
+    # Today's schedule
+    events = daily.get("today_events", [])
+    if events:
+        meeting_count = len([e for e in events if not any(
+            kw in (e.get("summary") or "").lower()
+            for kw in ["birthday", "gym", "swim", "run", "workout", "mobility"]
+        )])
+        workout_events = [e for e in events if any(
+            kw in (e.get("summary") or "").lower()
+            for kw in ["gym", "swim", "run", "workout", "mobility", "sprint"]
+        )]
+        prompt_parts.append(f"TODAY: {meeting_count} meetings/events, "
+                           f"{len(workout_events)} planned workouts"
+                           f"{' (' + ', '.join(e.get('summary','') for e in workout_events) + ')' if workout_events else ''}")
+
+    # Long-term patterns
+    if patterns:
+        prompt_parts.append("LONG-TERM PATTERNS (90 days):")
+        for p in patterns[:4]:
+            prompt_parts.append(f"  - {p.get('description', p.get('pattern_key', ''))}"
+                               f" (confidence: {p.get('confidence', 0):.0%})")
+
+    # Previous briefing (to avoid repetition)
+    if prev_briefing:
+        prompt_parts.append(f"YESTERDAY'S BRIEFING (do NOT repeat this): {prev_briefing[:300]}")
+
+    prompt = "\n".join(prompt_parts)
+
+    # Call Haiku
+    client = anthropic.Anthropic(api_key=api_key)
+    try:
+        response = client.messages.create(
+            model=DAILY_MODEL,
+            max_tokens=500,
+            system=DAILY_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except anthropic.NotFoundError:
+        # Fallback to Sonnet if Haiku not available
+        response = client.messages.create(
+            model=ANALYSIS_MODEL,
+            max_tokens=500,
+            system=DAILY_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+    briefing_text = response.content[0].text.strip()
+    generation_time = int((time.time() - start_time) * 1000)
+
+    # Persist
+    result = {
+        "briefing_text": briefing_text,
+        "sleep_date": (daily.get("last_sleep", {}) or {}).get("date", "")[:10],
+        "activity_date": (daily.get("last_activity", {}) or {}).get("date", "")[:10],
+        "model_used": DAILY_MODEL,
+        "prompt_tokens": response.usage.input_tokens,
+        "completion_tokens": response.usage.output_tokens,
+        "generation_time_ms": generation_time,
+    }
+
+    try:
+        supabase.table("health_daily_briefings").insert({
+            "briefing_text": briefing_text,
+            "sleep_date": result["sleep_date"] or None,
+            "activity_date": result["activity_date"] or None,
+            "model_used": result["model_used"],
+            "prompt_tokens": result["prompt_tokens"],
+            "completion_tokens": result["completion_tokens"],
+            "generation_time_ms": generation_time,
+        }).execute()
+    except Exception as e:
+        logger.error(f"Failed to persist daily briefing: {e}")
+
+    logger.info(f"Daily briefing generated: {len(briefing_text)} chars, "
+                f"tokens={response.usage.input_tokens}+{response.usage.output_tokens}, "
+                f"time={generation_time}ms")
+
+    return result
+
+
+def format_daily_telegram(result: dict[str, Any]) -> str:
+    """Format daily briefing for Telegram."""
+    text = result.get("briefing_text", "No briefing generated.")
+    return f"☀️ *Morning Health Check*\n\n{text}"
