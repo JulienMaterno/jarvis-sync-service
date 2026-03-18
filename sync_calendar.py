@@ -66,9 +66,13 @@ class CalendarSync:
                 full_sync = True
 
             if full_sync:
-                logger.info(f"Performing full sync (-{days_past}d to +{days_future}d)")
-                time_min = datetime.now(timezone.utc) - timedelta(days=days_past)
-                time_max = datetime.now(timezone.utc) + timedelta(days=days_future)
+                # When sync token expires, use shorter window to reduce API load
+                # Only fetch recent past + near future (not 270 days)
+                effective_past = 14 if token_invalid else days_past
+                effective_future = 60 if token_invalid else days_future
+                logger.info(f"Performing full sync (-{effective_past}d to +{effective_future}d){' (token expired, using shorter window)' if token_invalid else ''}")
+                time_min = datetime.now(timezone.utc) - timedelta(days=effective_past)
+                time_max = datetime.now(timezone.utc) + timedelta(days=effective_future)
                 
                 logger.info(f"Syncing calendar from {time_min} to {time_max}")
                 
@@ -91,44 +95,76 @@ class CalendarSync:
                     raise
 
             logger.info(f"Found {len(events)} events in Google Calendar")
-            
+
+            # Build contact lookup cache: fetch all contacts once instead of per-event queries
+            contact_cache_email = {}  # email -> contact_id
+            contact_cache_name = {}   # "first last" -> contact_id
+            try:
+                contacts_resp = supabase.table("contacts").select("id,email,first_name,last_name").is_("deleted_at", "null").execute()
+                for c in (contacts_resp.data or []):
+                    if c.get("email"):
+                        contact_cache_email[c["email"].strip().lower()] = c["id"]
+                    fname = (c.get("first_name") or "").strip().lower()
+                    lname = (c.get("last_name") or "").strip().lower()
+                    if fname and lname:
+                        contact_cache_name[f"{fname} {lname}"] = c["id"]
+                    elif fname:
+                        # Only store single-name if unique
+                        if fname not in contact_cache_name:
+                            contact_cache_name[fname] = c["id"]
+                        else:
+                            contact_cache_name[fname] = None  # Ambiguous, skip
+                logger.info(f"Contact cache: {len(contact_cache_email)} emails, {len(contact_cache_name)} names")
+            except Exception as e:
+                logger.warning(f"Failed to build contact cache, falling back to per-event lookups: {e}")
+
+            def lookup_contact_cached(email: str) -> Optional[str]:
+                if not email:
+                    return None
+                clean = email.strip().lower()
+                if '<' in clean and '>' in clean:
+                    clean = clean[clean.find('<')+1:clean.find('>')]
+                return contact_cache_email.get(clean)
+
+            def lookup_contact_by_name_cached(name: str) -> Optional[str]:
+                if not name:
+                    return None
+                clean = name.strip().lower()
+                cid = contact_cache_name.get(clean)
+                return cid if cid else None  # None means ambiguous or not found
+
             upsert_data = []
             for event in events:
-                # Skip cancelled events if we want, but keeping them with status='cancelled' is better
-                
                 start = event.get('start', {})
                 end = event.get('end', {})
-                
-                # Handle all-day events (date only) vs timed events (dateTime)
+
                 start_time = start.get('dateTime') or start.get('date')
                 end_time = end.get('dateTime') or end.get('date')
-                
-                # Find contact from organizer or attendees
+
+                # Find contact from organizer or attendees using cached lookups
                 organizer = event.get('organizer', {})
                 attendees = event.get('attendees', [])
 
-                # Strategy 1: Try email matching first
-                contact_id = find_contact_by_email(organizer.get('email'))
+                contact_id = lookup_contact_cached(organizer.get('email'))
                 if not contact_id and attendees:
                     for att in attendees:
-                        if att.get('self'):  # Skip self
+                        if att.get('self'):
                             continue
-                        contact_id = find_contact_by_email(att.get('email'))
+                        contact_id = lookup_contact_cached(att.get('email'))
                         if contact_id:
                             break
 
-                # Strategy 2: Fall back to name matching if no email match
                 if not contact_id and attendees:
                     for att in attendees:
-                        if att.get('self'):  # Skip self
+                        if att.get('self'):
                             continue
                         display_name = att.get('displayName')
                         if display_name:
-                            contact_id = find_contact_by_name(display_name)
+                            contact_id = lookup_contact_by_name_cached(display_name)
                             if contact_id:
                                 logger.info(f"Linked event '{event.get('summary', '')}' to contact via name: {display_name}")
                                 break
-                
+
                 record = {
                     "google_event_id": event['id'],
                     "calendar_id": "primary",
@@ -144,7 +180,7 @@ class CalendarSync:
                     "organizer": event.get('organizer', {}),
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                     "last_sync_at": datetime.now(timezone.utc).isoformat(),
-                    "contact_id": contact_id  # Auto-link to contact
+                    "contact_id": contact_id
                 }
                 upsert_data.append(record)
 

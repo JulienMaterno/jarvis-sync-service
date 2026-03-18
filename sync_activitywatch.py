@@ -312,8 +312,15 @@ class ActivityWatchSync:
             
             for hostname in hostnames:
                 host_events = [e for e in events if e.get("hostname") == hostname]
+                # Skip hostnames with no window events — they produce empty summaries
+                # (e.g. "unknown" from aw-watcher-web-chrome which only has web tab events)
+                has_window_events = any(
+                    e.get("bucket_type") == "currentwindow" for e in host_events
+                )
+                if not has_window_events:
+                    continue
                 summary = self._calculate_summary(host_events, date, hostname)
-                
+
                 if summary:
                     supabase.table("activity_summaries").upsert(
                         summary,

@@ -2,6 +2,9 @@
 """Test calendar API call"""
 
 import asyncio
+import pytest
+
+pytestmark = pytest.mark.integration
 from datetime import datetime, timedelta, timezone
 from lib.google_calendar import GoogleCalendarClient
 

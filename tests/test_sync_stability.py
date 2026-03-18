@@ -3,6 +3,9 @@
 
 import os
 import sys
+import pytest
+
+pytestmark = pytest.mark.integration
 from dotenv import load_dotenv
 load_dotenv()
 

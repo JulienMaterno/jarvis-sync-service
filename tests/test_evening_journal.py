@@ -1,5 +1,8 @@
 """Test evening journal generation."""
 import asyncio
+import pytest
+
+pytestmark = pytest.mark.integration
 from reports import generate_evening_journal_prompt
 
 async def test():

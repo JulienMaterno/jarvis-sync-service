@@ -1,6 +1,9 @@
 """Test briefing generation for Robin - even with minimal data"""
 import os
 import asyncio
+import pytest
+
+pytestmark = pytest.mark.integration
 from dotenv import load_dotenv
 import httpx
 

@@ -916,7 +916,7 @@ class TestPingPongPrevention:
             'notion_updated_at': old_time,
             'updated_at': new_time,  # 1 hour newer than last Notion sync
             'deleted_at': None,
-            'last_sync_source': 'notion',  # Last sync was from Notion
+            'last_sync_source': 'supabase',  # Explicitly marked for sync
         }
 
         service.supabase.select_all.return_value = [edited_record]

@@ -195,8 +195,6 @@ def transform_supabase_to_notion(contact: Dict[str, Any]) -> Dict[str, Any]:
     # So we don't need to unpack JSON back to Notion.
     
     return props
-        
-    return props
 
 def sync_notion_deletions_to_supabase(last_synced_at: Optional[str]):
     """

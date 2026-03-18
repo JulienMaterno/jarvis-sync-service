@@ -568,6 +568,10 @@ class ContactsSyncService(TwoWaySyncService):
                 elif r.get('last_sync_source') == 'supabase':
                     # Explicitly marked - needs sync
                     needs_sync = True
+                elif r.get('last_sync_source') == 'notion':
+                    # Skip - just synced from Notion. The updated_at trigger makes
+                    # updated_at slightly > notion_updated_at, causing false positives.
+                    continue
                 else:
                     # Check timestamp comparison: updated_at > notion_updated_at
                     updated_at = r.get('updated_at')

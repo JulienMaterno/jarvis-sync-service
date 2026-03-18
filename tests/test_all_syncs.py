@@ -9,6 +9,9 @@ import sys
 import asyncio
 import traceback
 from datetime import datetime
+import pytest
+
+pytestmark = pytest.mark.integration
 
 # Try to load .env if present
 try:
