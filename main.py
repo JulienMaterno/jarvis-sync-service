@@ -14,7 +14,7 @@ from lib.notion_sync import sync_notion_to_supabase, sync_supabase_to_notion
 from lib.logging_service import log_sync_event
 from lib.telegram_client import notify_error, reset_failure_count
 from lib.health_monitor import check_sync_health, get_sync_statistics, run_health_check, SystemHealthMonitor
-from reports import generate_daily_report, generate_evening_journal_prompt, generate_morning_task_digest, check_overdue_task_alerts
+from reports import generate_daily_report, generate_evening_journal_prompt, generate_morning_task_digest, check_overdue_task_alerts, generate_email_digest
 from backup import backup_contacts
 import logging
 
@@ -72,6 +72,7 @@ from syncs.insight_timer_sync import run_sync as run_insight_timer_sync
 
 # Import Withings health sync
 from sync_withings import run_sync as run_withings_sync
+from lib.sleep_staging import run_post_withings_staging
 
 # Import Supabase client and Gmail client
 from lib.supabase_client import supabase
@@ -761,6 +762,8 @@ async def sync_everything(background_tasks: BackgroundTasks):
         # === WITHINGS HEALTH SYNC (Withings Cloud → Supabase) ===
         if os.getenv("WITHINGS_CLIENT_ID"):
             await run_step("withings_sync", run_withings_sync, supabase, days=7)
+            # Custom sleep staging (runs on any new/unprocessed nights)
+            await run_step("sleep_staging", run_post_withings_staging, supabase)
         else:
             results["withings_sync"] = {"status": "disabled", "reason": "WITHINGS_CLIENT_ID not set"}
 
@@ -1094,6 +1097,26 @@ async def morning_tasks_digest(background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/report/email-digest")
+@app.get("/report/email-digest")
+async def email_follow_up_digest():
+    """
+    Scans Gmail and returns an email follow-up digest.
+
+    Returns structured data about:
+    - Sent emails awaiting reply (>3 days)
+    - Received emails you haven't replied to (>2 days)
+    - Due follow-ups from the follow_ups table
+
+    Designed to be called by Claude Code to flag items conversationally.
+    """
+    try:
+        result = await generate_email_digest()
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/report/overdue-alerts")
 async def overdue_task_alerts(background_tasks: BackgroundTasks):
     """
@@ -1219,6 +1242,36 @@ async def trigger_full_backup(background_tasks: BackgroundTasks):
     }
 
 
+# --- Database Cleanup (retention policy) ---
+
+RETENTION_POLICY = [
+    ("sync_logs", 30, "created_at"),
+    ("sync_audit", 30, "created_at"),
+    ("activity_events", 90, "timestamp"),
+    ("mcp_activity_logs", 90, "created_at"),
+    ("provider_traces", 30, "created_at"),
+]
+
+
+def _run_db_cleanup() -> dict:
+    """Delete old rows from log/audit tables based on retention policy."""
+    from lib.supabase_client import supabase as sb
+
+    results = {}
+    for table, days, date_col in RETENTION_POLICY:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        try:
+            resp = sb.table(table).delete().lt(date_col, cutoff).execute()
+            deleted = len(resp.data) if resp.data else 0
+            results[table] = deleted
+            if deleted > 0:
+                logger.info(f"DB cleanup: deleted {deleted} rows from {table} older than {days} days")
+        except Exception as e:
+            logger.warning(f"DB cleanup: failed to clean {table}: {e}")
+            results[table] = f"error: {e}"
+    return results
+
+
 # --- Weekly Maintenance (bundle of weekly jobs) ---
 
 @app.post("/weekly-maintenance")
@@ -1229,8 +1282,9 @@ async def weekly_maintenance(background_tasks: BackgroundTasks):
     This is designed to be called by Cloud Scheduler once per week (e.g., Sunday 2am).
 
     Runs in parallel:
-    1. Full backup (Supabase → GCS)
-    2. Anki card generation (new highlights → cards, chapter/book summaries)
+    1. Database cleanup (retention policy for logs/audit tables)
+    2. Full backup (Supabase → GCS)
+    3. Anki card generation (new highlights → cards, chapter/book summaries)
 
     Returns immediately, tasks run in background.
     """
@@ -1239,12 +1293,22 @@ async def weekly_maintenance(background_tasks: BackgroundTasks):
 
     results = {
         "started_at": datetime.now(timezone.utc).isoformat(),
-        "tasks": ["backup", "anki_cards"],
+        "tasks": ["db_cleanup", "backup", "anki_cards"],
         "status": "queued"
     }
 
     async def run_all_weekly_tasks():
         task_results = {}
+
+        # Run database cleanup (retention policy)
+        try:
+            logger.info("Weekly maintenance: Starting database cleanup...")
+            cleanup_result = await run_in_threadpool(_run_db_cleanup)
+            task_results["db_cleanup"] = {"status": "success", **cleanup_result}
+            logger.info(f"Weekly maintenance: DB cleanup completed - {cleanup_result}")
+        except Exception as e:
+            logger.error(f"Weekly maintenance: DB cleanup failed: {e}", exc_info=True)
+            task_results["db_cleanup"] = {"status": "error", "error": str(e)}
 
         # Run backup
         try:
@@ -4149,6 +4213,28 @@ async def activity_heatmap():
         logger.error(f"Failed to fetch sleep data for heatmap: {e}")
         sleep_json = "{}"
 
+    # --- Fetch sleep custom data (staging detail from health_sleep_custom) ---
+    try:
+        sleep_custom_result = supabase.table("health_sleep_custom").select(
+            "sleep_date, duration_deep_s, duration_light_s, duration_rem_s, "
+            "duration_awake_s, duration_total_s, custom_sleep_score"
+        ).order("sleep_date", desc=False).limit(365).execute()
+        sleep_custom_data = {}
+        for row in sleep_custom_result.data:
+            d = row["sleep_date"]
+            sleep_custom_data[d] = {
+                "deep": row.get("duration_deep_s") or 0,
+                "light": row.get("duration_light_s") or 0,
+                "rem": row.get("duration_rem_s") or 0,
+                "awake": row.get("duration_awake_s") or 0,
+                "total": row.get("duration_total_s") or 0,
+                "score": row.get("custom_sleep_score"),
+            }
+        sleep_custom_json = _json.dumps(sleep_custom_data)
+    except Exception as e:
+        logger.error(f"Failed to fetch sleep custom data for heatmap: {e}")
+        sleep_custom_json = "{}"
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4302,7 +4388,7 @@ async def activity_heatmap():
     border-radius: 10px;
     padding: 20px 24px;
     width: 90%;
-    max-width: 520px;
+    max-width: 580px;
     max-height: 85vh;
     overflow-y: auto;
     color: #c9d1d9;
@@ -4485,6 +4571,50 @@ async def activity_heatmap():
     letter-spacing: 0.5px;
     margin-bottom: 8px;
   }}
+  /* Sleep detail modal extras */
+  .sleep-canvas-wrap {{
+    background: #161b22;
+    border-radius: 6px;
+    padding: 8px 4px;
+    margin-bottom: 10px;
+  }}
+  .sleep-canvas-wrap canvas {{
+    width: 100%;
+    display: block;
+  }}
+  .sleep-vitals {{
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+    gap: 8px;
+    margin-top: 8px;
+  }}
+  .sleep-vital {{
+    background: #161b22;
+    border-radius: 6px;
+    padding: 6px 8px;
+    text-align: center;
+  }}
+  .sleep-vital-value {{
+    font-size: 15px;
+    font-weight: 700;
+    color: #e6edf3;
+  }}
+  .sleep-vital-label {{
+    font-size: 8px;
+    color: #7d8590;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }}
+  /* Sleep Quality collapsible section */
+  .sleep-quality-section {{
+    margin-top: 12px;
+  }}
+  .sleep-quality-canvas-wrap {{
+    background: #161b22;
+    border-radius: 8px;
+    padding: 12px 8px;
+    margin-bottom: 10px;
+  }}
 </style>
 </head>
 <body>
@@ -4562,6 +4692,24 @@ async def activity_heatmap():
     </div>
   </div>
 
+  <!-- Sleep Quality — 30-day trends (collapsed by default) -->
+  <div class="section sleep-quality-section" id="sleep-quality-section">
+    <h1 id="sleep-quality-toggle" style="cursor:pointer;user-select:none;">
+      <span id="sleep-quality-arrow" style="display:inline-block;transition:transform 0.2s;font-size:10px;margin-right:4px;">&#9654;</span>Sleep Quality (30 days)
+    </h1>
+    <div id="sleep-quality-content" style="display:none;">
+      <div class="subtitle">Sleep stages breakdown and score trend</div>
+      <div class="sleep-quality-canvas-wrap" style="margin-top:10px;">
+        <div class="viz-label">Stages per Night</div>
+        <canvas id="sleep-stages-canvas" height="120" style="width:100%;"></canvas>
+      </div>
+      <div class="sleep-quality-canvas-wrap">
+        <div class="viz-label">Sleep Score Trend</div>
+        <canvas id="sleep-score-canvas" height="80" style="width:100%;"></canvas>
+      </div>
+    </div>
+  </div>
+
   <!-- Today's Work Curve — Pace Tracker (collapsed by default) -->
   <div class="section" id="curve-section" style="margin-top:24px;">
     <h1 id="curve-toggle" style="cursor:pointer;user-select:none;">
@@ -4592,6 +4740,7 @@ const ACTIVITY_DATA = {activity_json};
 const HOURLY_DATA = {hourly_json};
 const MEDITATION_DATA = {meditation_json};
 const SLEEP_DATA = {sleep_json};
+const SLEEP_CUSTOM_DATA = {sleep_custom_json};
 const DAYS = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
@@ -4967,6 +5116,483 @@ document.getElementById('activity-heatmap').addEventListener('click', (e) => {{
   }}
 }});
 
+// Click handler on sleep heatmap cells
+document.getElementById('sleep-heatmap').addEventListener('click', (e) => {{
+  if (e.target.classList.contains('day') && e.target.dataset.date) {{
+    showSleepDetail(e.target.dataset.date);
+  }}
+}});
+
+function showSleepDetail(dateStr) {{
+  const d = new Date(dateStr + 'T00:00:00');
+  modalTitle.textContent = 'Sleep: ' + formatDate(d);
+  modalBody.innerHTML = '<div class="no-data">Loading...</div>';
+  overlay.classList.add('active');
+
+  const baseUrl = window.location.origin;
+  fetch(baseUrl + '/dashboard/sleep-detail?date=' + dateStr)
+    .then(r => r.json())
+    .then(data => {{
+      if (!data.found) {{
+        modalBody.innerHTML = '<div class="no-data">No sleep data for this night.</div>';
+        return;
+      }}
+
+      let html = '';
+
+      // Summary stats row
+      const score = data.custom_sleep_score != null ? Math.round(data.custom_sleep_score) : '--';
+      const totalH = data.duration_total_s ? fmtSec(data.duration_total_s) : '--';
+      const deepH = data.duration_deep_s ? fmtSec(data.duration_deep_s) : '--';
+      const remH = data.duration_rem_s ? fmtSec(data.duration_rem_s) : '--';
+      const lightH = data.duration_light_s ? fmtSec(data.duration_light_s) : '--';
+      const awakeH = data.duration_awake_s ? fmtSec(data.duration_awake_s) : '--';
+
+      html += '<div class="modal-stats">';
+      html += '<div class="modal-stat"><div class="modal-stat-value" style="color:#a855f7">' + score + '</div><div class="modal-stat-label">Score</div></div>';
+      html += '<div class="modal-stat"><div class="modal-stat-value">' + totalH + '</div><div class="modal-stat-label">Total</div></div>';
+      html += '<div class="modal-stat"><div class="modal-stat-value" style="color:#312e81">' + deepH + '</div><div class="modal-stat-label">Deep</div></div>';
+      html += '<div class="modal-stat"><div class="modal-stat-value" style="color:#818cf8">' + remH + '</div><div class="modal-stat-label">REM</div></div>';
+      html += '<div class="modal-stat"><div class="modal-stat-value" style="color:#a5b4fc">' + lightH + '</div><div class="modal-stat-label">Light</div></div>';
+      html += '<div class="modal-stat"><div class="modal-stat-value" style="color:#fbbf24">' + awakeH + '</div><div class="modal-stat-label">Awake</div></div>';
+      html += '</div>';
+
+      // Hypnogram canvas
+      if (data.epochs && data.epochs.length > 0) {{
+        html += '<h3>Hypnogram</h3>';
+        html += '<div class="sleep-canvas-wrap"><canvas id="hypnogram-canvas" height="150"></canvas></div>';
+
+        // HR + RMSSD canvas
+        const hasHr = data.epochs.some(e => e.hr != null);
+        const hasRmssd = data.epochs.some(e => e.rmssd != null);
+        if (hasHr || hasRmssd) {{
+          html += '<h3>Heart Rate &amp; HRV</h3>';
+          html += '<div class="sleep-canvas-wrap"><canvas id="hr-rmssd-canvas" height="120"></canvas></div>';
+        }}
+      }}
+
+      // Withings vitals row
+      if (data.withings) {{
+        const w = data.withings;
+        html += '<h3>Vitals (Withings)</h3>';
+        html += '<div class="sleep-vitals">';
+        if (w.hr_average != null) html += '<div class="sleep-vital"><div class="sleep-vital-value">' + Math.round(w.hr_average) + '</div><div class="sleep-vital-label">HR Avg</div></div>';
+        if (w.hr_min != null) html += '<div class="sleep-vital"><div class="sleep-vital-value">' + Math.round(w.hr_min) + '</div><div class="sleep-vital-label">HR Min</div></div>';
+        if (w.hr_max != null) html += '<div class="sleep-vital"><div class="sleep-vital-value">' + Math.round(w.hr_max) + '</div><div class="sleep-vital-label">HR Max</div></div>';
+        if (w.rr_average != null) html += '<div class="sleep-vital"><div class="sleep-vital-value">' + w.rr_average.toFixed(1) + '</div><div class="sleep-vital-label">RR Avg</div></div>';
+        if (w.sleep_score != null) html += '<div class="sleep-vital"><div class="sleep-vital-value">' + Math.round(w.sleep_score) + '</div><div class="sleep-vital-label">W. Score</div></div>';
+        if (w.sleep_efficiency_pct != null) html += '<div class="sleep-vital"><div class="sleep-vital-value">' + Math.round(w.sleep_efficiency_pct * 100) + '%</div><div class="sleep-vital-label">Efficiency</div></div>';
+        if (w.sleep_latency_s != null) html += '<div class="sleep-vital"><div class="sleep-vital-value">' + Math.round(w.sleep_latency_s / 60) + 'm</div><div class="sleep-vital-label">Latency</div></div>';
+        if (w.waso_s != null) html += '<div class="sleep-vital"><div class="sleep-vital-value">' + Math.round(w.waso_s / 60) + 'm</div><div class="sleep-vital-label">WASO</div></div>';
+        html += '</div>';
+      }}
+
+      modalBody.innerHTML = html;
+
+      // Draw hypnogram after DOM insert
+      if (data.epochs && data.epochs.length > 0) {{
+        drawHypnogram(data.epochs);
+        const hasHr2 = data.epochs.some(e => e.hr != null);
+        const hasRmssd2 = data.epochs.some(e => e.rmssd != null);
+        if (hasHr2 || hasRmssd2) drawHrRmssd(data.epochs);
+      }}
+    }})
+    .catch((err) => {{
+      modalBody.innerHTML = '<div class="no-data">Failed to load sleep details.<br><span style="font-size:10px;color:#7d8590">' + (err.message || err) + '</span></div>';
+    }});
+}}
+
+function drawHypnogram(epochs) {{
+  const canvas = document.getElementById('hypnogram-canvas');
+  if (!canvas) return;
+  const W = canvas.parentElement.offsetWidth - 8;
+  const H = 150;
+  canvas.width = W * 2; canvas.height = H * 2;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  const ctx = canvas.getContext('2d');
+  ctx.scale(2, 2);
+
+  const pad = {{ l: 42, r: 10, t: 10, b: 24 }};
+  const cw = W - pad.l - pad.r;
+  const ch = H - pad.t - pad.b;
+
+  // Stage mapping: numeric (0=Wake, 1=Light, 2=Deep, 3=REM) -> display order
+  // Display order: Wake=0 (top), Light=1, REM=2, Deep=3 (bottom)
+  const stageToDisplay = {{ 0: 0, 1: 1, 2: 3, 3: 2 }};  // 2(Deep)->3(bottom), 3(REM)->2
+  const stageColors = {{ 0: '#fbbf24', 1: '#a5b4fc', 2: '#312e81', 3: '#818cf8' }};
+  const displayLabels = ['Wake', 'Light', 'REM', 'Deep'];
+  const displayColors = ['#fbbf24', '#a5b4fc', '#818cf8', '#312e81'];
+  const stageY = (displayIdx) => pad.t + (displayIdx / 3) * ch;
+
+  const n = epochs.length;
+  const barW = Math.max(1, cw / n);
+
+  // Parse first/last timestamps for x-axis labels
+  let firstTs = null, lastTs = null;
+  if (epochs[0].ts) firstTs = new Date(epochs[0].ts);
+  if (epochs[n - 1].ts) lastTs = new Date(epochs[n - 1].ts);
+
+  // Draw stage bars
+  for (let i = 0; i < n; i++) {{
+    const e = epochs[i];
+    const stage = typeof e.stage === 'number' ? e.stage : 0;
+    const displayIdx = stageToDisplay[stage] ?? 0;
+    const x = pad.l + (i / n) * cw;
+    const y = stageY(displayIdx);
+    const barH = ch - (displayIdx / 3) * ch;
+    ctx.fillStyle = stageColors[stage] || '#a5b4fc';
+    ctx.fillRect(x, y, Math.ceil(barW) + 0.5, barH);
+  }}
+
+  // Y-axis labels
+  ctx.fillStyle = '#7d8590'; ctx.font = '9px sans-serif'; ctx.textAlign = 'right';
+  for (let s = 0; s <= 3; s++) {{
+    ctx.fillText(displayLabels[s], pad.l - 4, stageY(s) + 4);
+    ctx.strokeStyle = '#21262d'; ctx.lineWidth = 0.5;
+    ctx.beginPath(); ctx.moveTo(pad.l, stageY(s)); ctx.lineTo(W - pad.r, stageY(s)); ctx.stroke();
+  }}
+
+  // X-axis time labels
+  if (firstTs && lastTs) {{
+    ctx.fillStyle = '#7d8590'; ctx.font = '9px sans-serif'; ctx.textAlign = 'center';
+    const totalMs = lastTs - firstTs;
+    const step = Math.max(1, Math.floor(n / 6));
+    for (let i = 0; i < n; i += step) {{
+      if (epochs[i].ts) {{
+        const t = new Date(epochs[i].ts);
+        const lbl = String(t.getHours()).padStart(2, '0') + ':' + String(t.getMinutes()).padStart(2, '0');
+        ctx.fillText(lbl, pad.l + (i / n) * cw, H - 6);
+      }}
+    }}
+  }}
+}}
+
+function drawHrRmssd(epochs) {{
+  const canvas = document.getElementById('hr-rmssd-canvas');
+  if (!canvas) return;
+  const W = canvas.parentElement.offsetWidth - 8;
+  const H = 120;
+  canvas.width = W * 2; canvas.height = H * 2;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  const ctx = canvas.getContext('2d');
+  ctx.scale(2, 2);
+
+  const pad = {{ l: 32, r: 36, t: 10, b: 24 }};
+  const cw = W - pad.l - pad.r;
+  const ch = H - pad.t - pad.b;
+  const n = epochs.length;
+
+  // Collect HR and RMSSD values
+  const hrs = epochs.map(e => e.hr);
+  const rmssds = epochs.map(e => e.rmssd);
+  const hrVals = hrs.filter(v => v != null);
+  const rmssdVals = rmssds.filter(v => v != null);
+
+  const hrMin = hrVals.length > 0 ? Math.min(...hrVals) - 5 : 40;
+  const hrMax = hrVals.length > 0 ? Math.max(...hrVals) + 5 : 100;
+  const rmssdMin = rmssdVals.length > 0 ? Math.max(0, Math.min(...rmssdVals) - 5) : 0;
+  const rmssdMax = rmssdVals.length > 0 ? Math.max(...rmssdVals) + 10 : 100;
+
+  const xOf = (i) => pad.l + (i / (n - 1)) * cw;
+  const yHr = (v) => pad.t + ch - ((v - hrMin) / (hrMax - hrMin)) * ch;
+  const yRmssd = (v) => pad.t + ch - ((v - rmssdMin) / (rmssdMax - rmssdMin)) * ch;
+
+  // Draw HR line (rose)
+  if (hrVals.length > 0) {{
+    ctx.strokeStyle = '#fb7185'; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < n; i++) {{
+      if (hrs[i] != null) {{
+        const x = xOf(i), y = yHr(hrs[i]);
+        if (!started) {{ ctx.moveTo(x, y); started = true; }}
+        else ctx.lineTo(x, y);
+      }}
+    }}
+    ctx.stroke();
+  }}
+
+  // Draw RMSSD line (purple)
+  if (rmssdVals.length > 0) {{
+    ctx.strokeStyle = '#a78bfa'; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < n; i++) {{
+      if (rmssds[i] != null) {{
+        const x = xOf(i), y = yRmssd(rmssds[i]);
+        if (!started) {{ ctx.moveTo(x, y); started = true; }}
+        else ctx.lineTo(x, y);
+      }}
+    }}
+    ctx.stroke();
+  }}
+
+  // Left axis (HR)
+  ctx.fillStyle = '#fb7185'; ctx.font = '9px sans-serif'; ctx.textAlign = 'right';
+  const hrStep = Math.ceil((hrMax - hrMin) / 4);
+  for (let v = Math.ceil(hrMin); v <= hrMax; v += hrStep) {{
+    ctx.fillText(v + '', pad.l - 4, yHr(v) + 3);
+    ctx.strokeStyle = '#21262d'; ctx.lineWidth = 0.5;
+    ctx.beginPath(); ctx.moveTo(pad.l, yHr(v)); ctx.lineTo(W - pad.r, yHr(v)); ctx.stroke();
+  }}
+
+  // Right axis (RMSSD)
+  if (rmssdVals.length > 0) {{
+    ctx.fillStyle = '#a78bfa'; ctx.textAlign = 'left';
+    const rStep = Math.ceil((rmssdMax - rmssdMin) / 4);
+    for (let v = Math.ceil(rmssdMin); v <= rmssdMax; v += rStep) {{
+      ctx.fillText(v + '', W - pad.r + 4, yRmssd(v) + 3);
+    }}
+  }}
+
+  // X-axis time labels
+  ctx.fillStyle = '#7d8590'; ctx.font = '9px sans-serif'; ctx.textAlign = 'center';
+  const step = Math.max(1, Math.floor(n / 6));
+  for (let i = 0; i < n; i += step) {{
+    if (epochs[i].ts) {{
+      const t = new Date(epochs[i].ts);
+      const lbl = String(t.getHours()).padStart(2, '0') + ':' + String(t.getMinutes()).padStart(2, '0');
+      ctx.fillText(lbl, xOf(i), H - 6);
+    }}
+  }}
+
+  // Legend
+  ctx.font = '9px sans-serif'; ctx.textAlign = 'left';
+  ctx.fillStyle = '#fb7185'; ctx.fillText('HR (bpm)', pad.l + 4, pad.t + 10);
+  ctx.fillStyle = '#a78bfa'; ctx.fillText('RMSSD (ms)', pad.l + 70, pad.t + 10);
+}}
+
+// ============================================================
+// Sleep Quality — 30 day trends (collapsed section)
+// ============================================================
+(function() {{
+  let sqOpen = false;
+  document.getElementById('sleep-quality-toggle').addEventListener('click', () => {{
+    sqOpen = !sqOpen;
+    document.getElementById('sleep-quality-content').style.display = sqOpen ? 'block' : 'none';
+    document.getElementById('sleep-quality-arrow').style.transform = sqOpen ? 'rotate(90deg)' : '';
+    if (sqOpen && !window._sleepQualityRendered) {{
+      window._sleepQualityRendered = true;
+      renderSleepQuality();
+    }}
+  }});
+
+  function renderSleepQuality() {{
+    const today = new Date();
+    today.setHours(0,0,0,0);
+    const dates = [];
+    const stagesData = [];
+    const scores = [];
+
+    for (let i = 29; i >= 0; i--) {{
+      const d = new Date(today);
+      d.setDate(d.getDate() - i);
+      const ds = localDateStr(d);
+      dates.push(ds);
+      const sc = SLEEP_CUSTOM_DATA[ds];
+      if (sc) {{
+        stagesData.push({{ date: ds, deep: sc.deep / 3600, light: sc.light / 3600, rem: sc.rem / 3600, awake: sc.awake / 3600 }});
+        scores.push({{ date: ds, score: sc.score }});
+      }} else {{
+        stagesData.push({{ date: ds, deep: 0, light: 0, rem: 0, awake: 0 }});
+        scores.push({{ date: ds, score: null }});
+      }}
+    }}
+
+    // --- Stacked bar chart ---
+    const c1 = document.getElementById('sleep-stages-canvas');
+    if (c1) {{
+      const W = c1.parentElement.offsetWidth - 16;
+      const H = 120;
+      c1.width = W * 2; c1.height = H * 2;
+      c1.style.width = W + 'px'; c1.style.height = H + 'px';
+      const ctx = c1.getContext('2d');
+      ctx.scale(2, 2);
+
+      const pad = {{ l: 28, r: 6, t: 6, b: 22 }};
+      const cw = W - pad.l - pad.r;
+      const ch = H - pad.t - pad.b;
+      const barW = Math.max(3, (cw / 30) - 2);
+      const gap = (cw - barW * 30) / 29;
+
+      // Find max total for scaling
+      const maxTotal = Math.max(...stagesData.map(s => s.deep + s.light + s.rem + s.awake), 1);
+      const yScale = ch / Math.max(maxTotal, 10);
+
+      const colors = {{ deep: '#312e81', rem: '#818cf8', light: '#a5b4fc', awake: '#fbbf24' }};
+
+      for (let i = 0; i < 30; i++) {{
+        const s = stagesData[i];
+        const x = pad.l + i * (barW + gap);
+        let y = pad.t + ch;
+
+        // Stack: deep -> rem -> light -> awake (bottom to top)
+        const segments = [
+          {{ val: s.deep, color: colors.deep }},
+          {{ val: s.rem, color: colors.rem }},
+          {{ val: s.light, color: colors.light }},
+          {{ val: s.awake, color: colors.awake }},
+        ];
+        segments.forEach(seg => {{
+          const h = seg.val * yScale;
+          if (h > 0) {{
+            ctx.fillStyle = seg.color;
+            ctx.fillRect(x, y - h, barW, h);
+            y -= h;
+          }}
+        }});
+      }}
+
+      // Y-axis
+      ctx.fillStyle = '#7d8590'; ctx.font = '9px sans-serif'; ctx.textAlign = 'right';
+      for (let v = 0; v <= Math.ceil(maxTotal); v += 2) {{
+        const y = pad.t + ch - v * yScale;
+        if (y >= pad.t) {{
+          ctx.fillText(v + 'h', pad.l - 4, y + 3);
+          ctx.strokeStyle = '#21262d'; ctx.lineWidth = 0.5;
+          ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y); ctx.stroke();
+        }}
+      }}
+
+      // X-axis (show every 5th date)
+      ctx.fillStyle = '#7d8590'; ctx.font = '8px sans-serif'; ctx.textAlign = 'center';
+      for (let i = 0; i < 30; i += 5) {{
+        const parts = dates[i].split('-');
+        const lbl = parseInt(parts[1]) + '/' + parseInt(parts[2]);
+        ctx.fillText(lbl, pad.l + i * (barW + gap) + barW / 2, H - 6);
+      }}
+
+      // Legend
+      ctx.font = '8px sans-serif'; ctx.textAlign = 'left';
+      let lx = pad.l + 4;
+      [['Deep','#312e81'],['REM','#818cf8'],['Light','#a5b4fc'],['Awake','#fbbf24']].forEach(([label, color]) => {{
+        ctx.fillStyle = color;
+        ctx.fillRect(lx, pad.t, 8, 8);
+        ctx.fillStyle = '#7d8590';
+        ctx.fillText(label, lx + 10, pad.t + 7);
+        lx += ctx.measureText(label).width + 18;
+      }});
+
+      // Tooltip on hover
+      const stagesToolip = document.getElementById('tooltip');
+      c1.addEventListener('mousemove', (e) => {{
+        const rect = c1.getBoundingClientRect();
+        const scaleX = c1.width / rect.width / 2;
+        const mx = (e.clientX - rect.left) * scaleX;
+        const idx = Math.floor((mx - pad.l) / (barW + gap));
+        if (idx >= 0 && idx < 30) {{
+          const s = stagesData[idx];
+          const total = s.deep + s.light + s.rem + s.awake;
+          if (total > 0) {{
+            const pct = (v) => Math.round(v / total * 100);
+            const parts = dates[idx].split('-');
+            const lbl = parseInt(parts[1]) + '/' + parseInt(parts[2]);
+            stagesToolip.innerHTML = '<strong>' + lbl + '</strong><br>' +
+              'Deep: ' + fmtSec(s.deep * 3600) + ' (' + pct(s.deep) + '%)<br>' +
+              'REM: ' + fmtSec(s.rem * 3600) + ' (' + pct(s.rem) + '%)<br>' +
+              'Light: ' + fmtSec(s.light * 3600) + ' (' + pct(s.light) + '%)<br>' +
+              'Awake: ' + fmtSec(s.awake * 3600) + ' (' + pct(s.awake) + '%)';
+            stagesToolip.style.display = 'block';
+            stagesToolip.style.left = (e.clientX - stagesToolip.offsetWidth - 12) + 'px';
+            stagesToolip.style.top = (e.clientY - 30) + 'px';
+          }} else {{
+            stagesToolip.style.display = 'none';
+          }}
+        }} else {{
+          stagesToolip.style.display = 'none';
+        }}
+      }});
+      c1.addEventListener('mouseleave', () => {{ stagesToolip.style.display = 'none'; }});
+    }}
+
+    // --- Score trend line ---
+    const c2 = document.getElementById('sleep-score-canvas');
+    if (c2) {{
+      const W = c2.parentElement.offsetWidth - 16;
+      const H = 80;
+      c2.width = W * 2; c2.height = H * 2;
+      c2.style.width = W + 'px'; c2.style.height = H + 'px';
+      const ctx = c2.getContext('2d');
+      ctx.scale(2, 2);
+
+      const pad = {{ l: 28, r: 6, t: 10, b: 22 }};
+      const cw = W - pad.l - pad.r;
+      const ch = H - pad.t - pad.b;
+
+      const validScores = scores.filter(s => s.score != null);
+      if (validScores.length === 0) {{
+        ctx.fillStyle = '#7d8590'; ctx.font = '12px sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText('No score data', W / 2, H / 2);
+        return;
+      }}
+
+      const minS = Math.max(0, Math.min(...validScores.map(s => s.score)) - 5);
+      const maxS = Math.min(100, Math.max(...validScores.map(s => s.score)) + 5);
+
+      const xOf = (i) => pad.l + (i / 29) * cw;
+      const yOf = (v) => pad.t + ch - ((v - minS) / (maxS - minS)) * ch;
+
+      // Fill area
+      ctx.fillStyle = 'rgba(168,85,247,0.15)';
+      ctx.beginPath();
+      let firstIdx = -1;
+      let lastIdx = -1;
+      for (let i = 0; i < 30; i++) {{
+        if (scores[i].score != null) {{
+          if (firstIdx < 0) {{ firstIdx = i; ctx.moveTo(xOf(i), yOf(scores[i].score)); }}
+          else ctx.lineTo(xOf(i), yOf(scores[i].score));
+          lastIdx = i;
+        }}
+      }}
+      if (firstIdx >= 0) {{
+        ctx.lineTo(xOf(lastIdx), yOf(minS));
+        ctx.lineTo(xOf(firstIdx), yOf(minS));
+        ctx.closePath(); ctx.fill();
+      }}
+
+      // Line
+      ctx.strokeStyle = '#a855f7'; ctx.lineWidth = 2;
+      ctx.beginPath();
+      let started = false;
+      for (let i = 0; i < 30; i++) {{
+        if (scores[i].score != null) {{
+          const x = xOf(i), y = yOf(scores[i].score);
+          if (!started) {{ ctx.moveTo(x, y); started = true; }}
+          else ctx.lineTo(x, y);
+        }}
+      }}
+      ctx.stroke();
+
+      // Dots
+      ctx.fillStyle = '#a855f7';
+      for (let i = 0; i < 30; i++) {{
+        if (scores[i].score != null) {{
+          ctx.beginPath();
+          ctx.arc(xOf(i), yOf(scores[i].score), 2.5, 0, Math.PI * 2);
+          ctx.fill();
+        }}
+      }}
+
+      // Y-axis
+      ctx.fillStyle = '#7d8590'; ctx.font = '9px sans-serif'; ctx.textAlign = 'right';
+      const sStep = Math.ceil((maxS - minS) / 4);
+      for (let v = Math.ceil(minS); v <= maxS; v += sStep) {{
+        ctx.fillText(v + '', pad.l - 4, yOf(v) + 3);
+        ctx.strokeStyle = '#21262d'; ctx.lineWidth = 0.5;
+        ctx.beginPath(); ctx.moveTo(pad.l, yOf(v)); ctx.lineTo(W - pad.r, yOf(v)); ctx.stroke();
+      }}
+
+      // X-axis
+      ctx.fillStyle = '#7d8590'; ctx.font = '8px sans-serif'; ctx.textAlign = 'center';
+      for (let i = 0; i < 30; i += 5) {{
+        const parts = dates[i].split('-');
+        const lbl = parseInt(parts[1]) + '/' + parseInt(parts[2]);
+        ctx.fillText(lbl, xOf(i), H - 6);
+      }}
+    }}
+  }}
+}})();
+
 // ============================================================
 // Today's Work Curve — 4 Visualization Options
 // ============================================================
@@ -5314,6 +5940,66 @@ async def day_detail(date: str):
         return {"date": date, "found": False, "error": str(e)}
 
 
+@app.get("/dashboard/sleep-detail")
+async def dashboard_sleep_detail(date: str):
+    """Return sleep staging details for the modal (combines health_sleep_custom + health_sleep)."""
+    try:
+        # Query health_sleep_custom for staging data
+        # Try exact date first, then date-1 (timezone offset: health_sleep stores dates
+        # shifted by UTC+8, so the heatmap date may be +1 vs sleep_date in custom table)
+        custom_result = supabase.table("health_sleep_custom").select(
+            "sleep_date, duration_deep_s, duration_light_s, duration_rem_s, "
+            "duration_awake_s, duration_total_s, custom_sleep_score, "
+            "epoch_count, algorithm_version, epochs"
+        ).eq("sleep_date", date).limit(1).execute()
+
+        if not custom_result.data:
+            # Try date - 1 day (timezone offset fallback)
+            from datetime import datetime as _dt, timedelta as _td
+            prev_date = (_dt.strptime(date, "%Y-%m-%d") - _td(days=1)).strftime("%Y-%m-%d")
+            custom_result = supabase.table("health_sleep_custom").select(
+                "sleep_date, duration_deep_s, duration_light_s, duration_rem_s, "
+                "duration_awake_s, duration_total_s, custom_sleep_score, "
+                "epoch_count, algorithm_version, epochs"
+            ).eq("sleep_date", prev_date).limit(1).execute()
+
+        if not custom_result.data:
+            return {"date": date, "found": False}
+
+        row = custom_result.data[0]
+
+        # Query health_sleep for Withings vitals
+        withings_data = None
+        try:
+            sleep_result = supabase.table("health_sleep").select(
+                "hr_average, hr_min, hr_max, rr_average, sleep_score, "
+                "sleep_efficiency_pct, sleep_latency_s, waso_s"
+            ).eq("date", date).limit(1).execute()
+            if sleep_result.data:
+                withings_data = sleep_result.data[0]
+        except Exception as e:
+            logger.warning(f"Failed to fetch Withings sleep data for {date}: {e}")
+
+        return {
+            "date": date,
+            "found": True,
+            "sleep_date": row.get("sleep_date"),
+            "duration_deep_s": row.get("duration_deep_s") or 0,
+            "duration_light_s": row.get("duration_light_s") or 0,
+            "duration_rem_s": row.get("duration_rem_s") or 0,
+            "duration_awake_s": row.get("duration_awake_s") or 0,
+            "duration_total_s": row.get("duration_total_s") or 0,
+            "custom_sleep_score": row.get("custom_sleep_score"),
+            "epoch_count": row.get("epoch_count"),
+            "algorithm_version": row.get("algorithm_version"),
+            "epochs": row.get("epochs") or [],
+            "withings": withings_data,
+        }
+    except Exception as e:
+        logger.error(f"Sleep detail error for {date}: {e}")
+        return {"date": date, "found": False, "error": str(e)}
+
+
 # ===========================================================================
 # WITHINGS HEALTH INTEGRATION
 # ===========================================================================
@@ -5399,6 +6085,21 @@ async def sync_withings(days: int = 7, full: bool = False, data_type: str | None
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/sync/sleep-staging")
+async def sync_sleep_staging(days: int = 3):
+    """Manually trigger custom sleep staging for recent nights.
+
+    Args:
+        days: How many days back to check for unprocessed nights (default 3).
+    """
+    try:
+        result = await run_in_threadpool(run_post_withings_staging, supabase, days_back=days)
+        return result
+    except Exception as e:
+        logger.error(f"Sleep staging sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.head("/webhooks/withings/notify")
 async def withings_webhook_verify():
     """Withings verifies webhook URL with HEAD request."""
@@ -5434,6 +6135,9 @@ async def withings_webhook_notify(request: Request, background_tasks: Background
         data_type = appli_map.get(appli)
         if data_type:
             background_tasks.add_task(run_withings_sync, supabase, days=3, data_type=data_type)
+            # Run custom sleep staging after sleep data sync
+            if data_type == "sleep":
+                background_tasks.add_task(run_post_withings_staging, supabase)
             log_sync_event("withings_webhook", "info",
                            f"Webhook received: appli={appli} ({data_type}), triggering sync")
         else:
