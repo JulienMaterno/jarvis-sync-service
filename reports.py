@@ -829,3 +829,258 @@ async def check_overdue_task_alerts():
     except Exception as e:
         logger.error(f"Failed to check overdue tasks: {e}")
         raise e
+
+
+async def generate_email_digest():
+    """
+    Daily email follow-up digest. Scans Gmail threads and surfaces:
+
+    1. AWAITING REPLY: You sent an email, they haven't replied (>3 days)
+    2. YOU OWE REPLY: They sent you something, you haven't replied (>2 days)
+    3. FOLLOW-UPS DUE: Tracked follow-ups from the follow_ups table
+
+    Sends summary to Telegram. Triggered daily at 9am SGT via Cloud Scheduler.
+    """
+    from lib.google_gmail import GmailClient
+
+    try:
+        logger.info("Generating email follow-up digest...")
+
+        gmail = GmailClient()
+        now = datetime.now(timezone.utc)
+
+        # Aaron's known email addresses
+        my_addresses = {
+            "aaron.j.putting@gmail.com",
+            "aaron.putting@ventures.com.de",
+        }
+
+        def _is_me(email_addr: str) -> bool:
+            """Check if an email address belongs to Aaron."""
+            if not email_addr:
+                return False
+            # Extract bare email from "Name <email>" format
+            addr = email_addr.lower().strip()
+            if "<" in addr:
+                addr = addr.split("<")[1].rstrip(">")
+            return addr in my_addresses
+
+        def _is_noise(email_addr: str) -> bool:
+            """Filter out automated/no-reply/newsletter senders."""
+            if not email_addr:
+                return True
+            addr = email_addr.lower()
+            noise_patterns = [
+                "noreply", "no-reply", "mailer-daemon", "notifications",
+                "calendar-notification", "notify", "donotreply",
+                "automated", "support@", "info@google",
+                "googlegroups", "github.com", "linkedin.com",
+                "luma.com", "cal.com", "calendly.com",
+                "notion.so", "slack.com", "stripe.com",
+            ]
+            return any(p in addr for p in noise_patterns)
+
+        def _is_noise_subject(subject: str) -> bool:
+            """Filter calendar invites, cancellations, auto-replies."""
+            if not subject:
+                return False
+            s = subject.lower()
+            noise_starts = [
+                "accepted:", "declined:", "tentative:",
+                "canceled:", "cancelled:",
+                "automatische antwort:", "automatic reply:",
+                "zugesagt:", "abgelehnt:",
+            ]
+            noise_contains = [
+                "out of office", "abwesenheit", "außer haus",
+                "auto-reply", "autoreply",
+            ]
+            if any(s.startswith(p) for p in noise_starts):
+                return True
+            return any(p in s for p in noise_contains)
+
+        def _extract_sender(msg: dict) -> str:
+            """Get From header from a message."""
+            for h in msg.get("payload", {}).get("headers", []):
+                if h["name"].lower() == "from":
+                    return h["value"]
+            return ""
+
+        def _extract_header(msg: dict, name: str) -> str:
+            for h in msg.get("payload", {}).get("headers", []):
+                if h["name"].lower() == name.lower():
+                    return h["value"]
+            return ""
+
+        def _msg_timestamp(msg: dict) -> datetime:
+            """Get message timestamp from internalDate."""
+            ms = int(msg.get("internalDate", "0"))
+            return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+
+        def _display_name(from_header: str) -> str:
+            """Extract display name from From header."""
+            if "<" in from_header:
+                return from_header.split("<")[0].strip().strip('"')
+            return from_header.split("@")[0]
+
+        # -----------------------------------------------------------------
+        # 1. AWAITING REPLY: Sent emails where the thread has no reply
+        # -----------------------------------------------------------------
+        awaiting_reply = []
+        try:
+            # Get sent emails from last 14 days
+            sent_msgs = await gmail.list_messages(
+                query="in:sent newer_than:14d -in:chats",
+                max_results=80
+            )
+
+            # Deduplicate by thread_id
+            seen_threads = set()
+            unique_threads = []
+            for msg in sent_msgs:
+                tid = msg.get("threadId")
+                if tid and tid not in seen_threads:
+                    seen_threads.add(tid)
+                    unique_threads.append(tid)
+
+            # Check each thread
+            for thread_id in unique_threads[:50]:  # Cap at 50 threads
+                try:
+                    thread = await gmail.get_thread(thread_id, format="metadata")
+                    messages = thread.get("messages", [])
+                    if not messages:
+                        continue
+
+                    # Get the last message in thread
+                    last_msg = messages[-1]
+                    last_sender = _extract_sender(last_msg)
+                    last_time = _msg_timestamp(last_msg)
+                    subject = _extract_header(messages[0], "Subject")
+
+                    # Skip noise
+                    if _is_noise(last_sender) or _is_noise_subject(subject):
+                        continue
+
+                    # If I sent the last message and it's been >3 days
+                    if _is_me(last_sender) and (now - last_time).days >= 3:
+                        # Find who the recipient is
+                        to_header = _extract_header(last_msg, "To")
+                        if _is_noise(to_header):
+                            continue
+
+                        days_ago = (now - last_time).days
+                        awaiting_reply.append({
+                            "subject": subject[:60],
+                            "recipient": _display_name(to_header),
+                            "days": days_ago,
+                        })
+
+                except Exception as e:
+                    logger.debug(f"Error processing thread {thread_id}: {e}")
+                    continue
+
+        except Exception as e:
+            logger.warning(f"Error scanning sent emails: {e}")
+
+        # -----------------------------------------------------------------
+        # 2. YOU OWE REPLY: Received emails where Aaron hasn't replied
+        # -----------------------------------------------------------------
+        you_owe_reply = []
+        try:
+            # Get inbox emails from last 7 days, not from me
+            inbox_msgs = await gmail.list_messages(
+                query="in:inbox newer_than:7d -from:me -category:promotions -category:social -category:updates -in:chats",
+                max_results=50
+            )
+
+            inbox_threads = set()
+            for msg in inbox_msgs:
+                tid = msg.get("threadId")
+                if tid and tid not in inbox_threads and tid not in seen_threads:
+                    inbox_threads.add(tid)
+
+            for thread_id in inbox_threads:
+                try:
+                    thread = await gmail.get_thread(thread_id, format="metadata")
+                    messages = thread.get("messages", [])
+                    if not messages:
+                        continue
+
+                    last_msg = messages[-1]
+                    last_sender = _extract_sender(last_msg)
+                    last_time = _msg_timestamp(last_msg)
+                    subject = _extract_header(messages[0], "Subject")
+
+                    if _is_noise(last_sender) or _is_noise_subject(subject):
+                        continue
+
+                    # If they sent the last message and it's been >2 days
+                    if not _is_me(last_sender) and (now - last_time).days >= 2:
+                        days_ago = (now - last_time).days
+                        you_owe_reply.append({
+                            "subject": subject[:60],
+                            "sender": _display_name(last_sender),
+                            "days": days_ago,
+                        })
+
+                except Exception as e:
+                    logger.debug(f"Error processing inbox thread {thread_id}: {e}")
+                    continue
+
+        except Exception as e:
+            logger.warning(f"Error scanning inbox: {e}")
+
+        # -----------------------------------------------------------------
+        # 3. FOLLOW-UPS DUE from follow_ups table
+        # -----------------------------------------------------------------
+        due_followups = []
+        try:
+            fu_resp = supabase.table("follow_ups") \
+                .select("subject, recipient_email, recipient_name, next_follow_up_date, follow_up_count") \
+                .eq("status", "pending") \
+                .lte("next_follow_up_date", now.isoformat()) \
+                .execute()
+            due_followups = fu_resp.data or []
+        except Exception as e:
+            logger.warning(f"Error checking follow_ups table: {e}")
+
+        # -----------------------------------------------------------------
+        # Post-processing: deduplicate and filter noise
+        # -----------------------------------------------------------------
+        # If same sender/recipient appears 3+ times, it's likely automated
+        from collections import Counter
+        awaiting_counts = Counter(item["recipient"] for item in awaiting_reply)
+        awaiting_reply = [
+            item for item in awaiting_reply
+            if awaiting_counts[item["recipient"]] < 3
+        ]
+        owe_counts = Counter(item["sender"] for item in you_owe_reply)
+        you_owe_reply = [
+            item for item in you_owe_reply
+            if owe_counts[item["sender"]] < 3
+        ]
+
+        # -----------------------------------------------------------------
+        # Sort results
+        # -----------------------------------------------------------------
+        awaiting_reply.sort(key=lambda x: -x["days"])
+        you_owe_reply.sort(key=lambda x: -x["days"])
+
+        total = len(awaiting_reply) + len(you_owe_reply) + len(due_followups)
+
+        logger.info(
+            f"Email digest: {len(awaiting_reply)} awaiting, "
+            f"{len(you_owe_reply)} owe reply, {len(due_followups)} follow-ups due"
+        )
+
+        return {
+            "status": "success",
+            "total": total,
+            "awaiting_reply": awaiting_reply,
+            "you_owe_reply": you_owe_reply,
+            "due_followups": due_followups,
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to generate email digest: {e}")
+        raise e

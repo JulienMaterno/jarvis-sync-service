@@ -127,6 +127,27 @@ def _fetch_health_data(supabase: Client, days: int = 7) -> dict[str, Any]:
         ).order("sleep_date", desc=True).execute()
         data["sleep_details"] = sleep_det_resp.data or []
 
+        # Custom sleep staging (our algorithm, more accurate than Withings)
+        try:
+            custom_resp = supabase.table("health_sleep_custom").select(
+                "sleep_date,duration_deep_s,duration_light_s,duration_rem_s,"
+                "duration_awake_s,duration_total_s,custom_sleep_score"
+            ).gte("sleep_date", baseline_start).order("sleep_date", desc=True).execute()
+            data["custom_sleep"] = custom_resp.data or []
+        except Exception:
+            data["custom_sleep"] = []
+
+        # Temperature (from Withings bridge - internal API)
+        try:
+            temp_resp = supabase.table("health_temperature").select(
+                "date,temp_avg_c,temp_min_c,temp_max_c,temp_status,"
+                "hr_resting,rmssd_start_avg,rmssd_end_avg,breathing_quality,"
+                "deep_sleep_s,rem_sleep_s"
+            ).gte("date", baseline_start).order("date", desc=True).execute()
+            data["temperature"] = temp_resp.data or []
+        except Exception:
+            data["temperature"] = []
+
         # ECG recordings
         ecg_resp = supabase.table("health_ecg").select("*").gte(
             "recorded_at", baseline_start
@@ -213,6 +234,26 @@ def _compute_metrics(raw: dict[str, Any], days: int) -> dict[str, Any]:
             baseline_scores = [s["sleep_score"] for s in sleep_baseline if s.get("sleep_score")]
             if baseline_scores and scores:
                 metrics["sleep"]["score_vs_baseline"] = round(_avg(scores) - _avg(baseline_scores), 1)
+
+        # Override with custom staging if available (more accurate than Withings)
+        custom_all = raw.get("custom_sleep", [])
+        custom_period = [c for c in custom_all if c.get("sleep_date", "") >= cutoff]
+        if custom_period:
+            c_deep = [c["duration_deep_s"] / 3600 for c in custom_period if c.get("duration_deep_s")]
+            c_rem = [c["duration_rem_s"] / 3600 for c in custom_period if c.get("duration_rem_s")]
+            c_light = [c["duration_light_s"] / 3600 for c in custom_period if c.get("duration_light_s")]
+            c_scores = [c["custom_sleep_score"] for c in custom_period if c.get("custom_sleep_score")]
+            if c_deep:
+                metrics["sleep"]["avg_deep_hrs"] = round(_avg(c_deep), 2)
+            if c_rem:
+                metrics["sleep"]["avg_rem_hrs"] = round(_avg(c_rem), 2)
+            if c_light:
+                metrics["sleep"]["avg_light_hrs"] = round(_avg(c_light), 2)
+            if c_scores:
+                metrics["sleep"]["avg_score"] = round(_avg(c_scores), 1)
+            metrics["sleep"]["staging_source"] = "custom_heuristic_v1"
+        else:
+            metrics["sleep"]["staging_source"] = "withings_native"
     else:
         metrics["sleep"] = None
 
@@ -315,6 +356,15 @@ def _compute_metrics(raw: dict[str, Any], days: int) -> dict[str, Any]:
     vo2max = [float(m["vo2max"]) for m in meas_all if m.get("vo2max")]
     skin_temps = [float(m["skin_temp_c"]) for m in meas_period if m.get("skin_temp_c")]
     body_temps = [float(m["body_temp_c"]) for m in meas_period if m.get("body_temp_c")]
+
+    # Supplement with bridge temperature data if public API returned nothing
+    bridge_temps = raw.get("temperature", [])
+    if not skin_temps and not body_temps and bridge_temps:
+        # Sleep temperature readings (have deep_sleep_s) are most relevant
+        sleep_temps = [t for t in bridge_temps if t.get("deep_sleep_s")]
+        if sleep_temps:
+            body_temps = [float(t["temp_avg_c"]) for t in sleep_temps if t.get("temp_avg_c")]
+            skin_temps = []  # Bridge gives core body temp, not skin
     spo2_vals = [float(m["spo2_pct"]) for m in meas_period if m.get("spo2_pct")]
     visceral = [float(m["visceral_fat_index"]) for m in meas_period if m.get("visceral_fat_index")]
 
@@ -330,6 +380,7 @@ def _compute_metrics(raw: dict[str, Any], days: int) -> dict[str, Any]:
         "latest_vo2max": round(vo2max[0], 1) if vo2max else None,
         "avg_skin_temp_c": round(_avg(skin_temps), 1) if skin_temps else None,
         "avg_body_temp_c": round(_avg(body_temps), 1) if body_temps else None,
+        "body_temp_trend": [round(t, 2) for t in body_temps[-7:]] if len(body_temps) >= 2 else None,
         "avg_spo2_pct": round(_avg(spo2_vals), 1) if spo2_vals else None,
         "min_spo2_pct": round(min(spo2_vals), 1) if spo2_vals else None,
         "visceral_fat_index": round(visceral[0], 1) if visceral else None,
@@ -1726,6 +1777,22 @@ def _fetch_daily_data(supabase: Client) -> dict[str, Any]:
         else:
             data["last_rmssd"] = None
 
+        # Custom sleep staging (our own algorithm, more accurate than Withings)
+        try:
+            custom_resp = supabase.table("health_sleep_custom").select(
+                "sleep_date,duration_deep_s,duration_light_s,duration_rem_s,"
+                "duration_awake_s,duration_total_s,custom_sleep_score,algorithm_version"
+            ).order("sleep_date", desc=True).limit(1).execute()
+            data["last_custom_sleep"] = custom_resp.data[0] if custom_resp.data else None
+
+            custom_baseline = supabase.table("health_sleep_custom").select(
+                "custom_sleep_score,duration_total_s,duration_deep_s,duration_rem_s"
+            ).gte("sleep_date", baseline_start).execute()
+            data["custom_sleep_baseline"] = custom_baseline.data or []
+        except Exception:
+            data["last_custom_sleep"] = None
+            data["custom_sleep_baseline"] = []
+
         # 30-day HRV baseline
         hrv_baseline = supabase.table("health_sleep_details").select(
             "rmssd"
@@ -1736,6 +1803,21 @@ def _fetch_daily_data(supabase: Client) -> dict[str, Any]:
             if v:
                 rmssd_vals.append(v)
         data["rmssd_baseline_avg"] = round(_avg(rmssd_vals), 1) if rmssd_vals else None
+
+        # Temperature (from Withings bridge)
+        try:
+            temp_resp = supabase.table("health_temperature").select(
+                "date,temp_avg_c,temp_min_c,temp_max_c,rmssd_start_avg,rmssd_end_avg,breathing_quality"
+            ).order("date", desc=True).limit(7).execute()
+            data["temperature"] = temp_resp.data or []
+            # Last night's temp (sleep readings have deep_sleep_s, filter for those)
+            sleep_temps = supabase.table("health_temperature").select(
+                "date,temp_avg_c,temp_min_c,temp_max_c"
+            ).not_.is_("deep_sleep_s", "null").order("date", desc=True).limit(1).execute()
+            data["last_night_temp"] = sleep_temps.data[0] if sleep_temps.data else None
+        except Exception:
+            data["temperature"] = []
+            data["last_night_temp"] = None
 
         # Today's calendar events (meetings)
         cal_resp = supabase.table("calendar_events").select(
@@ -2020,26 +2102,67 @@ def generate_daily_briefing(supabase: Client) -> dict[str, Any]:
     # Build compact prompt
     prompt_parts = []
 
-    # Last night's sleep
+    # Last night's sleep — prefer custom staging (our algorithm) over Withings
+    cs = daily.get("last_custom_sleep")
     s = daily.get("last_sleep")
-    if s:
+    if cs:
+        sleep_date = (cs.get("sleep_date") or "")[:10]
+        dur_h = round(cs["duration_total_s"] / 3600, 1) if cs.get("duration_total_s") else None
+        deep_h = round(cs["duration_deep_s"] / 3600, 2) if cs.get("duration_deep_s") else None
+        rem_h = round(cs["duration_rem_s"] / 3600, 2) if cs.get("duration_rem_s") else None
+        light_h = round(cs["duration_light_s"] / 3600, 2) if cs.get("duration_light_s") else None
+        awake_h = round(cs["duration_awake_s"] / 3600, 2) if cs.get("duration_awake_s") else None
+        # Add Withings vitals (latency, waso) which custom staging doesn't have
+        latency = round(s['sleep_latency_s'] / 60, 1) if s and s.get('sleep_latency_s') else '?'
+        waso = round(s['waso_s'] / 60, 1) if s and s.get('waso_s') else '?'
+        prompt_parts.append(
+            f"LAST NIGHT ({sleep_date}, custom staging): score={cs.get('custom_sleep_score')}, "
+            f"duration={dur_h}h, deep={deep_h}h, REM={rem_h}h, light={light_h}h, awake={awake_h}h, "
+            f"latency={latency}min, waso={waso}min"
+        )
+        prompt_parts.append(
+            "NOTE: Sleep stages from our custom HRV-based algorithm (validated, kappa>0.5). "
+            "Withings native staging has kappa=0.22, do NOT use Withings stage durations."
+        )
+        # Add temperature if available
+        nt = daily.get("last_night_temp")
+        if nt:
+            prompt_parts.append(
+                f"BODY TEMP (sleep): avg={nt.get('temp_avg_c')}°C, "
+                f"min={nt.get('temp_min_c')}°C, max={nt.get('temp_max_c')}°C"
+            )
+    elif s:
         sleep_date = (s.get("date") or "")[:10]
         dur_h = round(s["duration_total_s"] / 3600, 1) if s.get("duration_total_s") else None
         deep_h = round(s["duration_deep_s"] / 3600, 2) if s.get("duration_deep_s") else None
         rem_h = round(s["duration_rem_s"] / 3600, 2) if s.get("duration_rem_s") else None
-        prompt_parts.append(f"LAST NIGHT ({sleep_date}): score={s.get('sleep_score')}, "
+        prompt_parts.append(f"LAST NIGHT ({sleep_date}, Withings only - low accuracy): score={s.get('sleep_score')}, "
                            f"duration={dur_h}h, deep={deep_h}h, REM={rem_h}h, "
                            f"latency={round(s['sleep_latency_s']/60, 1) if s.get('sleep_latency_s') else '?'}min, "
                            f"waso={round(s['waso_s']/60, 1) if s.get('waso_s') else '?'}min")
+        prompt_parts.append("WARNING: No custom staging available. Withings staging kappa=0.22, treat stage durations as rough estimates only.")
     else:
         prompt_parts.append("LAST NIGHT: no sleep data")
 
-    # Baselines
+    # Baselines — prefer custom staging baseline
+    csb = daily.get("custom_sleep_baseline", [])
     sb = daily.get("sleep_baseline", [])
-    if sb:
+    if csb:
+        scores = [x["custom_sleep_score"] for x in csb if x.get("custom_sleep_score")]
+        durs = [x["duration_total_s"] / 3600 for x in csb if x.get("duration_total_s")]
+        deeps = [x["duration_deep_s"] / 3600 for x in csb if x.get("duration_deep_s")]
+        rems = [x["duration_rem_s"] / 3600 for x in csb if x.get("duration_rem_s")]
+        prompt_parts.append(
+            f"SLEEP BASELINE (custom staging, {len(scores)} nights): "
+            f"avg score={round(_avg(scores), 1) if scores else '?'}, "
+            f"avg duration={round(_avg(durs), 1) if durs else '?'}h, "
+            f"avg deep={round(_avg(deeps), 2) if deeps else '?'}h, "
+            f"avg REM={round(_avg(rems), 2) if rems else '?'}h"
+        )
+    elif sb:
         scores = [x["sleep_score"] for x in sb if x.get("sleep_score")]
         durs = [x["duration_total_s"] / 3600 for x in sb if x.get("duration_total_s")]
-        prompt_parts.append(f"30-DAY SLEEP BASELINE: avg score={round(_avg(scores), 1) if scores else '?'}, "
+        prompt_parts.append(f"30-DAY SLEEP BASELINE (Withings, low accuracy): avg score={round(_avg(scores), 1) if scores else '?'}, "
                            f"avg duration={round(_avg(durs), 1) if durs else '?'}h, "
                            f"nights tracked={len(scores)}")
 

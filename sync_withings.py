@@ -209,7 +209,10 @@ class WithingsSync:
                 results["heart_rate"] = self._sync_heart_rate(
                     int(hr_start.timestamp()), int(now.timestamp())
                 )
-                self._cursors["heart_rate"] = now.isoformat()
+                # Only advance cursor if records were actually synced,
+                # so late-arriving data (delayed watch upload) isn't skipped
+                if results["heart_rate"].get("created", 0) > 0:
+                    self._cursors["heart_rate"] = now.isoformat()
             except Exception as e:
                 logger.error(f"Heart rate sync failed: {e}")
                 errors.append(f"heart_rate: {e}")
@@ -261,7 +264,10 @@ class WithingsSync:
                 results["sleep_details"] = self._sync_sleep_details(
                     int(sd_start.timestamp()), int(now.timestamp())
                 )
-                self._cursors["sleep_details"] = now.isoformat()
+                # Only advance cursor if records were actually synced,
+                # so late-arriving data (delayed watch upload) isn't skipped
+                if results["sleep_details"].get("created", 0) > 0:
+                    self._cursors["sleep_details"] = now.isoformat()
             except Exception as e:
                 logger.error(f"Sleep details sync failed: {e}")
                 errors.append(f"sleep_details: {e}")
