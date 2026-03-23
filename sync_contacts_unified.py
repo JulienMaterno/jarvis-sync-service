@@ -355,7 +355,7 @@ class ContactsSyncService(TwoWaySyncService):
             'linkedin_url': Extract.url(props, 'LinkedIn URL'),  # Notion uses "LinkedIn URL"
             'location': location,
             'contact_type': contact_type,  # Friends, Family, Business, Other
-            'subscribed': props.get('Subscribed?', {}).get('checkbox', False),  # Notion uses "Subscribed?"
+            'subscribed': props.get('Subscribed?', {}).get('checkbox'),  # None if missing, True/False if set
         }
     
     def convert_to_source(self, supabase_record: Dict) -> Dict:
@@ -480,11 +480,9 @@ class ContactsSyncService(TwoWaySyncService):
                                 if field not in data or not data[field]:
                                     data[field] = existing_record[field]
 
-                        # Skip if Supabase has local changes pending sync to Notion
-                        if existing_record.get('last_sync_source') == 'supabase':
-                            self.logger.info(f"Skipping contact '{data.get('first_name')} {data.get('last_name')}' - has local changes pending")
-                            stats.skipped += 1
-                            continue
+                        # Preserve subscribed value if Notion didn't explicitly set it
+                        if data.get('subscribed') is None and existing_record.get('subscribed') is not None:
+                            data['subscribed'] = existing_record['subscribed']
 
                         # Already linked - check if update needed
                         comparison = self.compare_timestamps(
