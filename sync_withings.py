@@ -77,6 +77,10 @@ WORKOUT_CATEGORIES: dict[int, str] = {
 
 SYNC_STATE_KEY = "withings_last_sync"
 
+# If a data type hasn't synced new data in this many days, expand lookback
+STALENESS_THRESHOLD_DAYS = 2
+STALENESS_LOOKBACK_DAYS = 14
+
 
 class WithingsSync:
     """Syncs Withings health data to Supabase."""
@@ -86,6 +90,42 @@ class WithingsSync:
     def __init__(self):
         self.client = WithingsClient()
         self._cursors: dict[str, str] = {}
+
+    def _get_effective_start(
+        self, cursor_key: str, default_start: datetime, now: datetime
+    ) -> datetime:
+        """Get effective start time for a data type, with staleness recovery.
+
+        If the cursor exists but is stale (no data found for STALENESS_THRESHOLD_DAYS),
+        expand the lookback to STALENESS_LOOKBACK_DAYS to catch up on missed data.
+
+        Args:
+            cursor_key: Key in self._cursors (e.g. "heart_rate").
+            default_start: Fallback start when no cursor exists.
+            now: Current timestamp.
+
+        Returns:
+            Effective start datetime for the sync query.
+        """
+        cursor_val = self._cursors.get(cursor_key)
+        if not cursor_val:
+            return default_start
+
+        cursor_dt = datetime.fromisoformat(cursor_val.replace("Z", "+00:00"))
+        days_since_cursor = (now - cursor_dt).total_seconds() / 86400
+
+        # If cursor is recent, use it normally
+        if days_since_cursor <= STALENESS_THRESHOLD_DAYS:
+            return cursor_dt
+
+        # Cursor is stale: data hasn't been found in a while.
+        # Expand lookback to catch delayed uploads or missed data.
+        expanded_start = now - timedelta(days=STALENESS_LOOKBACK_DAYS)
+        logger.warning(
+            f"Staleness recovery for {cursor_key}: cursor is {days_since_cursor:.1f} days old, "
+            f"expanding lookback to {STALENESS_LOOKBACK_DAYS} days"
+        )
+        return expanded_start
 
     def _load_cursors(self) -> dict[str, str]:
         """Load last sync timestamps from sync_state table.
@@ -148,17 +188,15 @@ class WithingsSync:
         # --- Measurements (uses Unix timestamps) ---
         if data_type is None or data_type == "measurements":
             try:
-                meas_cursor = self._cursors.get("measurements")
-                if full_sync or not meas_cursor:
+                if full_sync:
                     meas_start = default_start
                 else:
-                    meas_start = datetime.fromisoformat(
-                        meas_cursor.replace("Z", "+00:00")
-                    )
+                    meas_start = self._get_effective_start("measurements", default_start, now)
                 start_ts = int(meas_start.timestamp())
                 end_ts = int(now.timestamp())
                 results["measurements"] = self._sync_measurements(start_ts, end_ts)
-                self._cursors["measurements"] = now.isoformat()
+                if results["measurements"].get("created", 0) > 0:
+                    self._cursors["measurements"] = now.isoformat()
             except Exception as e:
                 logger.error(f"Measurements sync failed: {e}")
                 errors.append(f"measurements: {e}")
@@ -171,10 +209,13 @@ class WithingsSync:
                 if full_sync or not act_cursor:
                     act_start = (now - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
                 else:
-                    act_start = act_cursor
+                    # Always look back at least STALENESS_LOOKBACK_DAYS for delayed data
+                    min_start = (now - timedelta(days=STALENESS_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+                    act_start = min(act_cursor, min_start)
                 act_end = now.strftime("%Y-%m-%d")
                 results["activity"] = self._sync_activity(act_start, act_end)
-                self._cursors["activity"] = act_end
+                if results["activity"].get("created", 0) > 0:
+                    self._cursors["activity"] = act_end
             except Exception as e:
                 logger.error(f"Activity sync failed: {e}")
                 errors.append(f"activity: {e}")
@@ -187,10 +228,16 @@ class WithingsSync:
                 if full_sync or not sleep_cursor:
                     sleep_start = (now - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
                 else:
-                    sleep_start = sleep_cursor
+                    # Always look back at least STALENESS_LOOKBACK_DAYS to catch
+                    # delayed watch uploads and backdated sleep data
+                    cursor_date = datetime.fromisoformat(sleep_cursor)
+                    min_start = (now - timedelta(days=STALENESS_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+                    sleep_start = min(sleep_cursor, min_start)
                 sleep_end = now.strftime("%Y-%m-%d")
                 results["sleep"] = self._sync_sleep(sleep_start, sleep_end)
-                self._cursors["sleep"] = sleep_end
+                # Only advance cursor when data was found, so delayed uploads aren't skipped
+                if results["sleep"].get("created", 0) > 0:
+                    self._cursors["sleep"] = sleep_end
             except Exception as e:
                 logger.error(f"Sleep sync failed: {e}")
                 errors.append(f"sleep: {e}")
@@ -199,13 +246,10 @@ class WithingsSync:
         # --- Heart Rate (uses Unix timestamps, max 24h per request) ---
         if data_type is None or data_type == "heart_rate":
             try:
-                hr_cursor = self._cursors.get("heart_rate")
-                if full_sync or not hr_cursor:
+                if full_sync:
                     hr_start = default_start
                 else:
-                    hr_start = datetime.fromisoformat(
-                        hr_cursor.replace("Z", "+00:00")
-                    )
+                    hr_start = self._get_effective_start("heart_rate", default_start, now)
                 results["heart_rate"] = self._sync_heart_rate(
                     int(hr_start.timestamp()), int(now.timestamp())
                 )
@@ -221,17 +265,16 @@ class WithingsSync:
         # --- ECG (uses Unix timestamps) ---
         if data_type is None or data_type == "ecg":
             try:
-                ecg_cursor = self._cursors.get("ecg")
-                if full_sync or not ecg_cursor:
+                if full_sync:
                     ecg_start = default_start
                 else:
-                    ecg_start = datetime.fromisoformat(
-                        ecg_cursor.replace("Z", "+00:00")
-                    )
+                    ecg_start = self._get_effective_start("ecg", default_start, now)
                 results["ecg"] = self._sync_ecg(
                     int(ecg_start.timestamp()), int(now.timestamp())
                 )
-                self._cursors["ecg"] = now.isoformat()
+                # Only advance cursor if records were actually synced
+                if results["ecg"].get("created", 0) > 0:
+                    self._cursors["ecg"] = now.isoformat()
             except Exception as e:
                 logger.error(f"ECG sync failed: {e}")
                 errors.append(f"ecg: {e}")
@@ -256,11 +299,10 @@ class WithingsSync:
         # --- Sleep Details (uses Unix timestamps, max 24h per request) ---
         if data_type is None or data_type == "sleep":
             try:
-                sd_cursor = self._cursors.get("sleep_details")
-                if full_sync or not sd_cursor:
+                if full_sync:
                     sd_start = default_start
                 else:
-                    sd_start = datetime.fromisoformat(sd_cursor.replace("Z", "+00:00"))
+                    sd_start = self._get_effective_start("sleep_details", default_start, now)
                 results["sleep_details"] = self._sync_sleep_details(
                     int(sd_start.timestamp()), int(now.timestamp())
                 )
@@ -330,11 +372,12 @@ class WithingsSync:
             if parsed:
                 records.append(parsed)
 
+        persisted = 0
         if records:
-            self._upsert_batch("health_measurements", records, "withings_grpid")
+            persisted = self._upsert_batch("health_measurements", records, "withings_grpid")
 
-        logger.info(f"Synced {len(records)} measurement groups")
-        return {"created": len(records), "updated": 0}
+        logger.info(f"Synced {persisted} measurement groups")
+        return {"created": persisted, "updated": 0}
 
     def _sync_activity(self, start_ymd: str, end_ymd: str) -> dict[str, int]:
         """Sync daily activity summaries from Withings.
@@ -495,10 +538,15 @@ class WithingsSync:
                     )
 
                 if records:
-                    self._upsert_batch(
+                    persisted = self._upsert_batch(
                         "health_heart_rate", records, "timestamp,source"
                     )
-                    total_records += len(records)
+                    total_records += persisted
+                    if persisted < len(records):
+                        logger.warning(
+                            f"Heart rate: {len(records) - persisted}/{len(records)} "
+                            f"records failed to persist for {current_start}-{current_end}"
+                        )
 
             except Exception as e:
                 logger.warning(
@@ -551,11 +599,12 @@ class WithingsSync:
             if record["withings_ecg_id"] is not None:
                 records.append(record)
 
+        persisted = 0
         if records:
-            self._upsert_batch("health_ecg", records, "withings_ecg_id")
+            persisted = self._upsert_batch("health_ecg", records, "withings_ecg_id")
 
-        logger.info(f"Synced {len(records)} ECG recordings")
-        return {"created": len(records), "updated": 0}
+        logger.info(f"Synced {persisted} ECG recordings")
+        return {"created": persisted, "updated": 0}
 
     def _sync_workouts(self, start_ymd: str, end_ymd: str) -> dict[str, int]:
         """Sync workout data from Withings."""
@@ -652,8 +701,13 @@ class WithingsSync:
                     records.append(record)
 
                 if records:
-                    self._upsert_batch("health_sleep_details", records, "sleep_date,start_at,state")
-                    total_records += len(records)
+                    persisted = self._upsert_batch("health_sleep_details", records, "sleep_date,start_at,state")
+                    total_records += persisted
+                    if persisted < len(records):
+                        logger.warning(
+                            f"Sleep details: {len(records) - persisted}/{len(records)} "
+                            f"records failed to persist for {current_start}-{current_end}"
+                        )
 
             except Exception as e:
                 logger.warning(f"Sleep details sync failed for range {current_start}-{current_end}: {e}")
@@ -718,7 +772,7 @@ class WithingsSync:
 
     def _upsert_batch(
         self, table: str, records: list[dict], conflict_key: str
-    ) -> None:
+    ) -> int:
         """Batch upsert records to Supabase.
 
         Splits records into chunks of BATCH_SIZE and upserts each chunk.
@@ -727,18 +781,24 @@ class WithingsSync:
             table: Supabase table name.
             records: List of record dicts to upsert.
             conflict_key: Comma-separated column names for ON CONFLICT.
+
+        Returns:
+            Number of records successfully upserted.
         """
+        success_count = 0
         for i in range(0, len(records), self.BATCH_SIZE):
             batch = records[i : i + self.BATCH_SIZE]
             try:
                 supabase.table(table).upsert(
                     batch, on_conflict=conflict_key
                 ).execute()
+                success_count += len(batch)
             except Exception as e:
                 logger.error(
                     f"Failed to upsert batch {i // self.BATCH_SIZE} "
-                    f"to {table}: {e}"
+                    f"({len(batch)} records) to {table}: {e}"
                 )
+        return success_count
 
 
 def run_sync(
