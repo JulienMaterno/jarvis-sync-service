@@ -187,7 +187,7 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
     # Paths that never require authentication
     PUBLIC_PATHS = {"/", "/health", "/follow-ups/webhook/send", "/withings/authorize"}
     # Path prefixes that never require authentication (health sub-routes)
-    PUBLIC_PREFIXES = ("/health/", "/dashboard/", "/webhooks/withings/")
+    PUBLIC_PREFIXES = ("/health/", "/dashboard/", "/webhooks/withings/", "/webhooks/hevy/")
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
@@ -669,121 +669,126 @@ async def sync_everything(background_tasks: BackgroundTasks):
                 logger.info(f"⏱️ {name} completed in {elapsed_ms:.0f}ms")
 
         # =====================================================================
-        # PHASE 2: Run syncs only for entities with changes
+        # PHASE 2: Run syncs in parallel where possible
+        #
+        # Dependency chains (must be sequential within chain):
+        #   - Contacts: notion→sb → google → sb→notion
+        #   - Gmail chain: gmail → follow_ups → follow_ups_notion
+        #   - Beeper chain: beeper → beeper_notion
+        #   - Withings chain: withings → sleep_staging
+        #   - Meetings chain: meetings → meeting_av_hq
+        #
+        # Everything else is independent and runs concurrently.
         # =====================================================================
-        
-        # === CONTACTS SYNC (conditional - checks Notion CRM + Supabase changes) ===
-        if 'contacts' in synced_entities:
-            await run_step("notion_to_supabase", lambda: sync_notion_to_supabase(check_deletions=True), entity_name='contacts')
-            await run_step("google_sync", sync_contacts)
-            await run_step("supabase_to_notion", sync_supabase_to_notion)
 
-            # Log contacts sync completion (consistent with other entity *Sync_complete events)
-            contacts_status = "success" if all(
-                results.get(k, {}).get("status") == "success"
-                for k in ["notion_to_supabase", "google_sync", "supabase_to_notion"]
-            ) else "partial"
-            google_stats = results.get("google_sync", {}).get("data", {})
-            synced = google_stats.get("synced", 0) if isinstance(google_stats, dict) else 0
-            errors = google_stats.get("errors", 0) if isinstance(google_stats, dict) else 0
-            await log_sync_event(
-                "ContactsSync_complete", contacts_status,
-                f"Contacts sync: {synced} synced, {errors} errors (Notion+Google+Notion)"
-            )
-        else:
-            results["contacts_sync"] = {"status": "skipped", "reason": "no_changes"}
-        
-        # === MEETINGS SYNC (conditional) ===
-        if 'meetings' in synced_entities:
-            await run_step("meetings_sync", run_meeting_sync, full_sync=False, since_hours=24, entity_name='meetings')
-        else:
-            results["meetings_sync"] = {"status": "skipped", "reason": "no_changes"}
-        
-        # === TASKS SYNC (conditional) ===
-        if 'tasks' in synced_entities:
-            await run_step("tasks_sync", run_task_sync, full_sync=False, since_hours=24, entity_name='tasks')
-        else:
-            results["tasks_sync"] = {"status": "skipped", "reason": "no_changes"}
-        
-        # === REFLECTIONS SYNC (conditional) ===
-        if 'reflections' in synced_entities:
-            await run_step("reflections_sync", run_reflection_sync, full_sync=False, since_hours=24, entity_name='reflections')
-        else:
-            results["reflections_sync"] = {"status": "skipped", "reason": "no_changes"}
-        
-        # === JOURNALS SYNC (conditional) ===
-        if 'journals' in synced_entities:
-            await run_step("journals_sync", run_journal_sync, full_sync=False, since_hours=24, entity_name='journals')
-        else:
-            results["journals_sync"] = {"status": "skipped", "reason": "no_changes"}
-        
-        # === CALENDAR SYNC (always run - external source) ===
-        await run_step("calendar_sync", run_calendar_sync)
+        # --- Define dependency chains as async functions ---
 
-        # === GMAIL SYNC (always run - external source) ===
-        await run_step("gmail_sync", run_gmail_sync)
+        async def contacts_chain():
+            """Contacts: 3-step bidirectional sync (Notion ↔ Supabase ↔ Google)."""
+            if 'contacts' in synced_entities:
+                await run_step("notion_to_supabase", lambda: sync_notion_to_supabase(check_deletions=True), entity_name='contacts')
+                await run_step("google_sync", sync_contacts)
+                await run_step("supabase_to_notion", sync_supabase_to_notion)
 
-        # === EMAIL FOLLOW-UP SYNC (after Gmail, uses fresh email data) ===
-        await run_step("follow_up_sync", run_follow_up_sync)
-
-        # === FOLLOW-UPS NOTION SYNC (bidirectional, after follow-up sync) ===
-        await run_step("follow_ups_notion_sync", run_follow_ups_notion_sync, full_sync=False, since_hours=24)
-
-        # === BOOKS SYNC (Notion → Supabase, one-way) ===
-        await run_step("books_sync", run_books_sync, full_sync=False, since_hours=24)
-        
-        # === HIGHLIGHTS SYNC (Notion → Supabase, one-way) ===
-        await run_step("highlights_sync", run_highlights_sync, full_sync=False, hours=24)
-        
-        # === APPLICATIONS SYNC (bidirectional) ===
-        await run_step("applications_sync", run_applications_sync, full_sync=False, since_hours=24)
-        
-        # === LINKEDIN POSTS SYNC (bidirectional) ===
-        await run_step("linkedin_posts_sync", run_linkedin_posts_sync, full_sync=False, since_hours=24)
-        
-        # === DOCUMENTS SYNC (bidirectional) ===
-        await run_step("documents_sync", run_documents_sync, full_sync=False, since_hours=24)
-        
-        # === BEEPER SYNC (WhatsApp/Telegram/LinkedIn messages) ===
-        # This gracefully handles offline laptop - just skips and catches up next run
-        await run_step("beeper_sync", run_beeper_sync, supabase, full_sync=False)
-
-        # === BEEPER → NOTION SYNC (append new messages to Notion pages) ===
-        # Runs after beeper sync so new messages are in Supabase first
-        await run_step("beeper_notion_sync", run_beeper_notion_sync, supabase, full_sync=False)
-
-        # === MEETING → AV HQ SYNC (create meeting pages in AV HQ teamspace) ===
-        # Runs after meeting sync so new meetings are in Supabase first
-        await run_step("meeting_av_hq_sync", run_meeting_av_hq_sync, supabase, full_sync=False)
-
-        # === INSIGHT TIMER SYNC (Firestore → Supabase) ===
-        await run_step("insight_timer_sync", run_insight_timer_sync, supabase)
-
-        # === WITHINGS HEALTH SYNC (Withings Cloud → Supabase) ===
-        if os.getenv("WITHINGS_CLIENT_ID"):
-            await run_step("withings_sync", run_withings_sync, supabase, days=7)
-            # Custom sleep staging (runs on any new/unprocessed nights)
-            await run_step("sleep_staging", run_post_withings_staging, supabase)
-        else:
-            results["withings_sync"] = {"status": "disabled", "reason": "WITHINGS_CLIENT_ID not set"}
-
-        # === ANKI SYNC (Supabase ↔ Anki Desktop) - Daily at 3 AM ===
-        # Only runs once per day at 3 AM (requires local Anki Desktop with AnkiConnect)
-        if os.getenv("ANKI_SYNC_ENABLED", "false").lower() == "true":
-            current_hour = datetime.now(timezone.utc).hour
-            daily_hour = int(os.getenv("ANKI_SYNC_DAILY_HOUR", "3"))
-
-            if current_hour == daily_hour:
-                logger.info(f"Running daily Anki sync (hour={current_hour})")
-                await run_step("anki_sync", run_anki_sync, supabase)
+                contacts_status = "success" if all(
+                    results.get(k, {}).get("status") == "success"
+                    for k in ["notion_to_supabase", "google_sync", "supabase_to_notion"]
+                ) else "partial"
+                google_stats = results.get("google_sync", {}).get("data", {})
+                synced = google_stats.get("synced", 0) if isinstance(google_stats, dict) else 0
+                errors = google_stats.get("errors", 0) if isinstance(google_stats, dict) else 0
+                await log_sync_event(
+                    "ContactsSync_complete", contacts_status,
+                    f"Contacts sync: {synced} synced, {errors} errors (Notion+Google+Notion)"
+                )
             else:
-                results["anki_sync"] = {
-                    "status": "skipped",
-                    "reason": f"scheduled_for_hour_{daily_hour}_utc",
-                    "current_hour": current_hour
-                }
-        else:
-            results["anki_sync"] = {"status": "disabled", "reason": "ANKI_SYNC_ENABLED not set"}
+                results["contacts_sync"] = {"status": "skipped", "reason": "no_changes"}
+
+        async def gmail_chain():
+            """Gmail → follow-ups → follow-ups Notion (sequential dependency)."""
+            await run_step("gmail_sync", run_gmail_sync)
+            await run_step("follow_up_sync", run_follow_up_sync)
+            await run_step("follow_ups_notion_sync", run_follow_ups_notion_sync, full_sync=False, since_hours=24)
+
+        async def beeper_chain():
+            """Beeper → Beeper Notion (messages must be in Supabase first)."""
+            await run_step("beeper_sync", run_beeper_sync, supabase, full_sync=False)
+            await run_step("beeper_notion_sync", run_beeper_notion_sync, supabase, full_sync=False)
+
+        async def meetings_chain():
+            """Meetings → AV HQ Notion pages (meetings must be in Supabase first)."""
+            if 'meetings' in synced_entities:
+                await run_step("meetings_sync", run_meeting_sync, full_sync=False, since_hours=24, entity_name='meetings')
+            else:
+                results["meetings_sync"] = {"status": "skipped", "reason": "no_changes"}
+            await run_step("meeting_av_hq_sync", run_meeting_av_hq_sync, supabase, full_sync=False)
+
+        async def withings_chain():
+            """Withings → sleep staging (staging depends on fresh withings data)."""
+            if os.getenv("WITHINGS_CLIENT_ID"):
+                await run_step("withings_sync", run_withings_sync, supabase, days=7)
+                await run_step("sleep_staging", run_post_withings_staging, supabase)
+            else:
+                results["withings_sync"] = {"status": "disabled", "reason": "WITHINGS_CLIENT_ID not set"}
+
+        async def tasks_step():
+            if 'tasks' in synced_entities:
+                await run_step("tasks_sync", run_task_sync, full_sync=False, since_hours=24, entity_name='tasks')
+            else:
+                results["tasks_sync"] = {"status": "skipped", "reason": "no_changes"}
+
+        async def reflections_step():
+            if 'reflections' in synced_entities:
+                await run_step("reflections_sync", run_reflection_sync, full_sync=False, since_hours=24, entity_name='reflections')
+            else:
+                results["reflections_sync"] = {"status": "skipped", "reason": "no_changes"}
+
+        async def journals_step():
+            if 'journals' in synced_entities:
+                await run_step("journals_sync", run_journal_sync, full_sync=False, since_hours=24, entity_name='journals')
+            else:
+                results["journals_sync"] = {"status": "skipped", "reason": "no_changes"}
+
+        async def anki_step():
+            if os.getenv("ANKI_SYNC_ENABLED", "false").lower() == "true":
+                current_hour = datetime.now(timezone.utc).hour
+                daily_hour = int(os.getenv("ANKI_SYNC_DAILY_HOUR", "3"))
+                if current_hour == daily_hour:
+                    logger.info(f"Running daily Anki sync (hour={current_hour})")
+                    await run_step("anki_sync", run_anki_sync, supabase)
+                else:
+                    results["anki_sync"] = {
+                        "status": "skipped",
+                        "reason": f"scheduled_for_hour_{daily_hour}_utc",
+                        "current_hour": current_hour
+                    }
+            else:
+                results["anki_sync"] = {"status": "disabled", "reason": "ANKI_SYNC_ENABLED not set"}
+
+        # --- Run all chains and independent engines concurrently ---
+        logger.info("Running sync engines in parallel...")
+        await asyncio.gather(
+            contacts_chain(),
+            meetings_chain(),
+            tasks_step(),
+            reflections_step(),
+            journals_step(),
+            gmail_chain(),
+            beeper_chain(),
+            # Calendar (always, independent)
+            run_step("calendar_sync", run_calendar_sync),
+            # Books & highlights (one-way, independent)
+            run_step("books_sync", run_books_sync, full_sync=False, since_hours=24),
+            run_step("highlights_sync", run_highlights_sync, full_sync=False, hours=24),
+            # Bidirectional content syncs (independent)
+            run_step("applications_sync", run_applications_sync, full_sync=False, since_hours=24),
+            run_step("linkedin_posts_sync", run_linkedin_posts_sync, full_sync=False, since_hours=24),
+            run_step("documents_sync", run_documents_sync, full_sync=False, since_hours=24),
+            # External data sources (independent)
+            run_step("insight_timer_sync", run_insight_timer_sync, supabase),
+            withings_chain(),
+            anki_step(),
+        )
 
         # Track sync completion
         _last_sync_end = datetime.now(timezone.utc)
@@ -4131,7 +4136,7 @@ async def activity_heatmap():
     """
     GitHub-style contribution heatmaps for activity, meditation, sleep, and Anki.
     Embeddable in Notion via /embed block.
-    Green = screen time, Blue = meditation, Purple = sleep, Amber = Anki reviews.
+    Green = screen time, Blue = meditation, Purple = sleep, Amber = workouts.
     """
     import json as _json
 
@@ -4235,6 +4240,24 @@ async def activity_heatmap():
         logger.error(f"Failed to fetch sleep custom data for heatmap: {e}")
         sleep_custom_json = "{}"
 
+    # --- Fetch workout data (from Hevy via health_workout_sessions) ---
+    try:
+        workout_result = supabase.table("health_workout_sessions").select(
+            "started_at, duration_seconds, title, session_type"
+        ).order("started_at", desc=False).limit(365).execute()
+        workout_data = {}
+        for row in workout_result.data:
+            ts = row.get("started_at", "")
+            if not ts:
+                continue
+            # Convert to SGT (UTC+8) for correct date bucketing
+            d = ts[:10]  # YYYY-MM-DD from ISO timestamp
+            workout_data[d] = workout_data.get(d, 0) + 1
+        workout_json = _json.dumps(workout_data)
+    except Exception as e:
+        logger.error(f"Failed to fetch workout data for heatmap: {e}")
+        workout_json = "{}"
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4323,6 +4346,12 @@ async def activity_heatmap():
   .purple .lvl-4 {{ background-color: #9333ea; }}
   .purple .lvl-5 {{ background-color: #a855f7; }}
   .purple .lvl-6 {{ background-color: #c084fc; }}
+  /* Amber scale (workouts) */
+  .amber .lvl-0 {{ background-color: #161b22; }}
+  .amber .lvl-1 {{ background-color: #5c3d0e; }}
+  .amber .lvl-2 {{ background-color: #92600a; }}
+  .amber .lvl-3 {{ background-color: #d97706; }}
+  .amber .lvl-4 {{ background-color: #f59e0b; }}
   .month-labels {{
     display: flex;
     font-size: 9px;
@@ -4692,6 +4721,29 @@ async def activity_heatmap():
     </div>
   </div>
 
+  <!-- Workout Heatmap (amber) -->
+  <div class="section amber" id="workout-section">
+    <h1>Workouts</h1>
+    <div class="subtitle" id="workout-subtitle"></div>
+    <div class="stats" id="workout-stats"></div>
+    <div class="month-labels" id="workout-months"></div>
+    <div class="heatmap-wrapper">
+      <div class="day-labels" id="workout-daylabels"></div>
+      <div class="heatmap-scroll">
+        <div class="heatmap" id="workout-heatmap"></div>
+      </div>
+    </div>
+    <div class="legend">
+      <span>Less</span>
+      <div class="day lvl-0"></div>
+      <div class="day lvl-1"></div>
+      <div class="day lvl-2"></div>
+      <div class="day lvl-3"></div>
+      <div class="day lvl-4"></div>
+      <span>More</span>
+    </div>
+  </div>
+
   <!-- Sleep Quality — 30-day trends (collapsed by default) -->
   <div class="section sleep-quality-section" id="sleep-quality-section">
     <h1 id="sleep-quality-toggle" style="cursor:pointer;user-select:none;">
@@ -4741,6 +4793,7 @@ const HOURLY_DATA = {hourly_json};
 const MEDITATION_DATA = {meditation_json};
 const SLEEP_DATA = {sleep_json};
 const SLEEP_CUSTOM_DATA = {sleep_custom_json};
+const WORKOUT_DATA = {workout_json};
 const DAYS = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
@@ -4986,6 +5039,78 @@ renderHeatmap({{
     return 6;
   }},
   formatValue: formatHours,
+}});
+
+// Render Workout heatmap (amber, session count)
+renderHeatmap({{
+  data: WORKOUT_DATA,
+  heatmapId: 'workout-heatmap',
+  monthsId: 'workout-months',
+  dayLabelsId: 'workout-daylabels',
+  statsId: 'workout-stats',
+  subtitleId: 'workout-subtitle',
+  getLevel: (c) => {{
+    if (!c) return 0;
+    if (c === 1) return 1;
+    if (c === 2) return 2;
+    if (c === 3) return 3;
+    return 4;
+  }},
+  formatValue: (c) => {{
+    if (!c) return 'Rest day';
+    return c + ' session' + (c > 1 ? 's' : '');
+  }},
+}});
+
+// Workout heatmap click handler
+document.getElementById('workout-heatmap').addEventListener('click', (e) => {{
+  if (e.target.classList.contains('day') && e.target.dataset.date) {{
+    const dateStr = e.target.dataset.date;
+    const d = new Date(dateStr + 'T00:00:00');
+    modalTitle.textContent = 'Workout: ' + formatDate(d);
+    modalBody.innerHTML = '<div class="no-data">Loading...</div>';
+    overlay.classList.add('active');
+    const baseUrl = window.location.origin;
+    fetch(baseUrl + '/dashboard/workout-detail?date=' + dateStr)
+      .then(r => r.json())
+      .then(data => {{
+        if (!data.sessions || data.sessions.length === 0) {{
+          modalBody.innerHTML = '<div class="no-data">No workout data for this day.</div>';
+          return;
+        }}
+        let html = '';
+        data.sessions.forEach(s => {{
+          const durMin = Math.round((s.duration_seconds || 0) / 60);
+          html += '<h3 style="margin-top:12px;color:#f59e0b">' + (s.title || 'Workout') + '</h3>';
+          html += '<div style="display:flex;gap:16px;margin:8px 0">';
+          html += '<div class="stat"><div class="stat-value">' + durMin + 'm</div><div class="stat-label">Duration</div></div>';
+          html += '<div class="stat"><div class="stat-value">' + s.exercise_count + '</div><div class="stat-label">Exercises</div></div>';
+          html += '<div class="stat"><div class="stat-value">' + s.set_count + '</div><div class="stat-label">Sets</div></div>';
+          html += '</div>';
+          if (s.exercises) {{
+            s.exercises.forEach(ex => {{
+              const rehab = ex.is_rehab ? ' <span style="color:#f59e0b;font-size:9px">REHAB</span>' : '';
+              const sets = ex.sets || [];
+              let setInfo = '';
+              if (sets.length > 0) {{
+                const s0 = sets[0];
+                if (s0.weight_kg && s0.reps) setInfo = sets.length + 'x' + s0.reps + ' @ ' + s0.weight_kg + 'kg';
+                else if (s0.reps) setInfo = sets.length + 'x' + s0.reps;
+                else if (s0.duration_seconds) setInfo = sets.length + 'x' + s0.duration_seconds + 's';
+              }}
+              html += '<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #21262d">';
+              html += '<span style="font-size:11px">' + ex.exercise_name + rehab + '</span>';
+              html += '<span style="font-size:11px;color:#7d8590">' + setInfo + '</span>';
+              html += '</div>';
+            }});
+          }}
+        }});
+        modalBody.innerHTML = html;
+      }})
+      .catch(() => {{
+        modalBody.innerHTML = '<div class="no-data">Failed to load workout details.</div>';
+      }});
+  }}
 }});
 
 // ---- Day detail modal ----
@@ -6000,6 +6125,53 @@ async def dashboard_sleep_detail(date: str):
         return {"date": date, "found": False, "error": str(e)}
 
 
+@app.get("/dashboard/workout-detail")
+async def dashboard_workout_detail(date: str):
+    """Return workout details for a given date for the heatmap modal."""
+    try:
+        date_start = f"{date}T00:00:00"
+        date_end = f"{date}T23:59:59"
+        sessions_result = supabase.table("health_workout_sessions").select(
+            "id, title, session_type, started_at, ended_at, duration_seconds, notes"
+        ).gte("started_at", date_start).lte("started_at", date_end).execute()
+
+        if not sessions_result.data:
+            return {"date": date, "sessions": []}
+
+        sessions = []
+        for session in sessions_result.data:
+            exercises_result = supabase.table("health_workout_exercises").select(
+                "id, exercise_name, is_rehab, muscle_group, exercise_order"
+            ).eq("session_id", session["id"]).order("exercise_order").execute()
+
+            exercises = []
+            for ex in exercises_result.data:
+                sets_result = supabase.table("health_workout_sets").select(
+                    "set_order, set_type, weight_kg, reps, duration_seconds, rpe"
+                ).eq("exercise_id", ex["id"]).order("set_order").execute()
+
+                exercises.append({
+                    "exercise_name": ex["exercise_name"],
+                    "is_rehab": ex.get("is_rehab", False),
+                    "muscle_group": ex.get("muscle_group"),
+                    "sets": sets_result.data,
+                })
+
+            sessions.append({
+                "title": session.get("title", "Workout"),
+                "duration_seconds": session.get("duration_seconds", 0),
+                "exercise_count": len(exercises),
+                "set_count": sum(len(e["sets"]) for e in exercises),
+                "exercises": exercises,
+            })
+
+        return {"date": date, "sessions": sessions}
+    except Exception as e:
+        logger.error(f"Workout detail error: {e}")
+        return {"date": date, "sessions": [], "error": str(e)}
+
+
+
 # ===========================================================================
 # WITHINGS HEALTH INTEGRATION
 # ===========================================================================
@@ -6147,6 +6319,57 @@ async def withings_webhook_notify(request: Request, background_tasks: Background
         return {"status": "ok"}
     except Exception as e:
         logger.error(f"Withings webhook error: {e}")
+        return {"status": "error", "detail": str(e)}
+
+
+@app.post("/sync/hevy/manual")
+async def sync_hevy_manual():
+    """Manually trigger a full Hevy workout backfill.
+
+    Syncs all workouts from Hevy that are not yet in Supabase.
+    """
+    from syncs.hevy_sync import sync_all_hevy_workouts
+    try:
+        result = await run_in_threadpool(sync_all_hevy_workouts, supabase)
+        return result
+    except Exception as e:
+        logger.error(f"Hevy manual sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/webhooks/hevy/notify")
+async def hevy_webhook_notify(request: Request, background_tasks: BackgroundTasks):
+    """Receive Hevy webhook when a workout is completed.
+
+    Hevy sends: {"workoutId": "uuid"}
+    Must respond 200 within 5 seconds.
+    """
+    # Validate authorization header
+    auth_header = request.headers.get("Authorization", "")
+    expected_secret = os.getenv("HEVY_WEBHOOK_SECRET", "")
+    if expected_secret and auth_header != f"Bearer {expected_secret}":
+        logger.warning("Hevy webhook: invalid authorization header")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        body = await request.json()
+        workout_id = body.get("workoutId")
+        if not workout_id:
+            logger.warning("Hevy webhook: missing workoutId in payload")
+            return {"status": "error", "detail": "missing workoutId"}
+
+        logger.info(f"Hevy webhook: received workout {workout_id}")
+
+        # Import and queue background sync
+        from syncs.hevy_sync import sync_hevy_workout
+        background_tasks.add_task(sync_hevy_workout, supabase, workout_id)
+
+        log_sync_event("hevy_webhook", "info",
+                       f"Webhook received: workoutId={workout_id}, triggering sync")
+
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"Hevy webhook error: {e}")
         return {"status": "error", "detail": str(e)}
 
 
