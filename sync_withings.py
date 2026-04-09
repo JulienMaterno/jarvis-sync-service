@@ -281,7 +281,7 @@ class WithingsSync:
                 results["ecg"] = {"created": 0, "updated": 0, "error": str(e)}
 
         # --- Workouts (uses YYYY-MM-DD, same cursor pattern as activity) ---
-        if data_type is None or data_type == "activity":
+        if data_type is None or data_type in ("activity", "workouts"):
             try:
                 wk_cursor = self._cursors.get("workouts")
                 if full_sync or not wk_cursor:
@@ -297,17 +297,17 @@ class WithingsSync:
                 results["workouts"] = {"created": 0, "updated": 0, "error": str(e)}
 
         # --- Sleep Details (uses Unix timestamps, max 24h per request) ---
-        if data_type is None or data_type == "sleep":
+        # Always look back at least 3 days for sleep_details, regardless of cursor.
+        # Withings uploads HRV data (RMSSD, SDNN) in a delayed second phase,
+        # sometimes hours after the initial stage/structure data. Without this,
+        # the cursor advances past the sleep period and the HRV data is never fetched.
+        # The upsert handles deduplication, so re-fetching is safe.
+        if data_type is None or data_type in ("sleep", "sleep_details"):
             try:
-                if full_sync:
-                    sd_start = default_start
-                else:
-                    sd_start = self._get_effective_start("sleep_details", default_start, now)
+                sd_start = now - timedelta(days=3)
                 results["sleep_details"] = self._sync_sleep_details(
                     int(sd_start.timestamp()), int(now.timestamp())
                 )
-                # Only advance cursor if records were actually synced,
-                # so late-arriving data (delayed watch upload) isn't skipped
                 if results["sleep_details"].get("created", 0) > 0:
                     self._cursors["sleep_details"] = now.isoformat()
             except Exception as e:
@@ -684,8 +684,17 @@ class WithingsSync:
                         continue
 
                     start_dt = datetime.fromtimestamp(s_start, tz=timezone.utc)
+                    # Assign sleep_date based on local "sleep night":
+                    # Convert to local time (UTC+8 for Asia/Singapore).
+                    # Epochs before noon local belong to the previous calendar
+                    # date's sleep night (e.g. 9:30 AM SGT Apr 6 = night of Apr 5).
+                    local_dt = start_dt + timedelta(hours=8)
+                    if local_dt.hour < 12:
+                        sleep_night = (local_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+                    else:
+                        sleep_night = local_dt.strftime("%Y-%m-%d")
                     record = {
-                        "sleep_date": start_dt.strftime("%Y-%m-%d"),
+                        "sleep_date": sleep_night,
                         "start_at": start_dt.isoformat(),
                         "end_at": datetime.fromtimestamp(s_end, tz=timezone.utc).isoformat(),
                         "state": entry.get("state"),

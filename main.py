@@ -14,7 +14,7 @@ from lib.notion_sync import sync_notion_to_supabase, sync_supabase_to_notion
 from lib.logging_service import log_sync_event
 from lib.telegram_client import notify_error, reset_failure_count
 from lib.health_monitor import check_sync_health, get_sync_statistics, run_health_check, SystemHealthMonitor
-from reports import generate_daily_report, generate_evening_journal_prompt, generate_morning_task_digest, check_overdue_task_alerts, generate_email_digest
+from reports import generate_daily_report, generate_evening_journal_prompt, generate_morning_task_digest, check_overdue_task_alerts, generate_email_digest, scan_draft_sent_diffs
 from backup import backup_contacts
 import logging
 
@@ -73,6 +73,7 @@ from syncs.insight_timer_sync import run_sync as run_insight_timer_sync
 # Import Withings health sync
 from sync_withings import run_sync as run_withings_sync
 from lib.sleep_staging import run_post_withings_staging
+from lib.sleep_briefing import run_sleep_briefing_if_needed
 
 # Import Supabase client and Gmail client
 from lib.supabase_client import supabase
@@ -724,10 +725,11 @@ async def sync_everything(background_tasks: BackgroundTasks):
             await run_step("meeting_av_hq_sync", run_meeting_av_hq_sync, supabase, full_sync=False)
 
         async def withings_chain():
-            """Withings → sleep staging (staging depends on fresh withings data)."""
+            """Withings → sleep staging → daily briefing (each step depends on the previous)."""
             if os.getenv("WITHINGS_CLIENT_ID"):
                 await run_step("withings_sync", run_withings_sync, supabase, days=7)
                 await run_step("sleep_staging", run_post_withings_staging, supabase)
+                await run_step("sleep_briefing", run_sleep_briefing_if_needed, supabase)
             else:
                 results["withings_sync"] = {"status": "disabled", "reason": "WITHINGS_CLIENT_ID not set"}
 
@@ -1117,6 +1119,20 @@ async def email_follow_up_digest():
     """
     try:
         result = await generate_email_digest()
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/report/draft-diffs")
+@app.get("/report/draft-diffs")
+async def draft_sent_diffs():
+    """
+    Scans for drafts that were sent (possibly with edits) and stores the diff.
+    Builds a learning loop for email style preferences over time.
+    """
+    try:
+        result = await scan_draft_sent_diffs()
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -6141,7 +6157,7 @@ async def dashboard_workout_detail(date: str):
         sessions = []
         for session in sessions_result.data:
             exercises_result = supabase.table("health_workout_exercises").select(
-                "id, exercise_name, is_rehab, muscle_group, exercise_order"
+                "id, exercise_name, is_rehab, muscle_group, exercise_order, notes"
             ).eq("session_id", session["id"]).order("exercise_order").execute()
 
             exercises = []
@@ -6154,12 +6170,14 @@ async def dashboard_workout_detail(date: str):
                     "exercise_name": ex["exercise_name"],
                     "is_rehab": ex.get("is_rehab", False),
                     "muscle_group": ex.get("muscle_group"),
+                    "notes": ex.get("notes"),
                     "sets": sets_result.data,
                 })
 
             sessions.append({
                 "title": session.get("title", "Workout"),
                 "duration_seconds": session.get("duration_seconds", 0),
+                "notes": session.get("notes"),
                 "exercise_count": len(exercises),
                 "set_count": sum(len(e["sets"]) for e in exercises),
                 "exercises": exercises,
@@ -6307,9 +6325,10 @@ async def withings_webhook_notify(request: Request, background_tasks: Background
         data_type = appli_map.get(appli)
         if data_type:
             background_tasks.add_task(run_withings_sync, supabase, days=3, data_type=data_type)
-            # Run custom sleep staging after sleep data sync
+            # Run custom sleep staging after sleep data sync, then trigger briefing
             if data_type == "sleep":
                 background_tasks.add_task(run_post_withings_staging, supabase)
+                background_tasks.add_task(run_sleep_briefing_if_needed, supabase)
             log_sync_event("withings_webhook", "info",
                            f"Webhook received: appli={appli} ({data_type}), triggering sync")
         else:
@@ -6479,6 +6498,129 @@ async def get_health_sleep_details(days: int = 7):
         return {"data": result.data, "count": len(result.data)}
     except Exception as e:
         logger.error(f"Failed to fetch sleep details: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Health Charts ---
+
+@app.post("/health-data/charts/{chart_type}")
+async def generate_health_chart(
+    chart_type: str,
+    date: str | None = None,
+    days: int = 14,
+    send_telegram: bool = True,
+):
+    """Generate a health chart and optionally send via Telegram.
+
+    Args:
+        chart_type: One of: hypnogram, trends, hr_hrv, dashboard
+        date: Sleep date for single-night charts (YYYY-MM-DD). Defaults to most recent.
+        days: Number of nights for multi-night charts (default 14).
+        send_telegram: If True, send photo to Telegram. If False, return base64 PNG.
+    """
+    import base64 as b64
+    from lib.health_charts import (
+        generate_hypnogram,
+        generate_multi_night_trends,
+        generate_hr_hrv_overlay,
+        generate_weekly_dashboard,
+    )
+    from lib.telegram_client import send_telegram_photo
+
+    try:
+        if chart_type in ("hypnogram", "hr_hrv"):
+            # Single-night charts: fetch epochs from health_sleep_custom
+            if date:
+                result = supabase.table("health_sleep_custom").select(
+                    "sleep_date,epochs,custom_sleep_score"
+                ).eq("sleep_date", date).limit(1).execute()
+            else:
+                result = supabase.table("health_sleep_custom").select(
+                    "sleep_date,epochs,custom_sleep_score"
+                ).order("sleep_date", desc=True).limit(1).execute()
+
+            if not result.data or not result.data[0].get("epochs"):
+                raise HTTPException(status_code=404, detail="No epoch data found")
+
+            epochs = result.data[0]["epochs"]
+            sleep_date = result.data[0]["sleep_date"]
+
+            if chart_type == "hypnogram":
+                png_bytes = await run_in_threadpool(generate_hypnogram, epochs)
+                caption = f"Hypnogram: {sleep_date}"
+            else:
+                png_bytes = await run_in_threadpool(generate_hr_hrv_overlay, epochs)
+                caption = f"HR/HRV: {sleep_date}"
+
+        elif chart_type == "trends":
+            result = supabase.table("health_sleep_custom").select(
+                "sleep_date,duration_deep_s,duration_light_s,duration_rem_s,"
+                "duration_awake_s,duration_total_s,custom_sleep_score"
+            ).order("sleep_date", desc=True).limit(days).execute()
+
+            if not result.data:
+                raise HTTPException(status_code=404, detail="No sleep data found")
+
+            png_bytes = await run_in_threadpool(generate_multi_night_trends, result.data, days)
+            caption = f"Sleep trends (last {len(result.data)} nights)"
+
+        elif chart_type == "dashboard":
+            sleep_result = supabase.table("health_sleep_custom").select(
+                "sleep_date,duration_total_s,duration_awake_s,duration_deep_s,"
+                "duration_rem_s,rmssd_mean,custom_sleep_score"
+            ).order("sleep_date", desc=True).limit(days).execute()
+
+            activity_result = supabase.table("health_activity").select(
+                "date,steps,calories_active"
+            ).order("date", desc=True).limit(days).execute()
+
+            temp_result = supabase.table("health_temperature").select(
+                "date,temp_avg_c,temp_min_c,temp_max_c"
+            ).order("date", desc=True).limit(days).execute()
+
+            png_bytes = await run_in_threadpool(
+                generate_weekly_dashboard,
+                sleep_result.data or [],
+                activity_result.data or [],
+                temp_result.data or [],
+            )
+            caption = f"Health dashboard (last {days} days)"
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown chart type: {chart_type}. Use: hypnogram, trends, hr_hrv, dashboard")
+
+        if send_telegram:
+            await send_telegram_photo(png_bytes, caption=caption)
+            return {"status": "sent", "chart_type": chart_type, "caption": caption}
+        else:
+            return {
+                "status": "generated",
+                "chart_type": chart_type,
+                "image_base64": b64.b64encode(png_bytes).decode(),
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Chart generation failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Data Freshness Monitor ---
+
+@app.post("/health-data/check-freshness")
+async def check_data_freshness():
+    """Check if today's sleep data has synced. Send reminder if missing.
+
+    Called via cron at 22:00 SGT. If no sleep data for today,
+    sends Telegram reminder to open Withings app.
+    """
+    from lib.staleness_monitor import check_withings_freshness
+    try:
+        result = await run_in_threadpool(check_withings_freshness, supabase)
+        return result
+    except Exception as e:
+        logger.error(f"Freshness check failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

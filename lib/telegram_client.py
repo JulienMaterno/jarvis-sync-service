@@ -1,4 +1,5 @@
 import os
+import base64
 import httpx
 import logging
 import asyncio
@@ -97,6 +98,61 @@ async def send_telegram_message(text: str, force: bool = False):
             response.raise_for_status()
     except Exception as e:
         logger.error(f"Failed to send Telegram message: {e}")
+
+async def send_telegram_photo(photo_bytes: bytes, caption: str = "", force: bool = False):
+    """
+    Send a photo/image to the configured Telegram chat.
+
+    Args:
+        photo_bytes: Raw PNG or JPEG bytes.
+        caption: Optional caption (supports Markdown).
+        force: If True, bypass notification settings.
+    """
+    if not NOTIFICATIONS_ENABLED and not force:
+        logger.info("Telegram notifications disabled. Skipping photo.")
+        return
+
+    if not TELEGRAM_CHAT_ID:
+        logger.warning("TELEGRAM_CHAT_ID not configured. Skipping photo.")
+        return
+
+    photo_b64 = base64.b64encode(photo_bytes).decode()
+
+    if TELEGRAM_BOT_SERVICE_URL:
+        url = f"{TELEGRAM_BOT_SERVICE_URL}/send_photo"
+        payload = {
+            "chat_id": int(TELEGRAM_CHAT_ID),
+            "photo_base64": photo_b64,
+            "caption": caption or None,
+        }
+        headers = {}
+        if INTERNAL_API_KEY:
+            headers["X-API-Key"] = INTERNAL_API_KEY
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, json=payload, headers=headers, timeout=30.0)
+                response.raise_for_status()
+            logger.info(f"Telegram photo sent ({len(photo_bytes)} bytes)")
+        except Exception as e:
+            logger.error(f"Failed to send Telegram photo via bot service: {e}")
+    elif TELEGRAM_BOT_TOKEN:
+        # Direct Telegram API fallback (multipart upload)
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        try:
+            async with httpx.AsyncClient() as client:
+                files = {"photo": ("chart.png", photo_bytes, "image/png")}
+                data = {"chat_id": TELEGRAM_CHAT_ID}
+                if caption:
+                    data["caption"] = caption
+                    data["parse_mode"] = "Markdown"
+                response = await client.post(url, data=data, files=files, timeout=30.0)
+                response.raise_for_status()
+            logger.info(f"Telegram photo sent directly ({len(photo_bytes)} bytes)")
+        except Exception as e:
+            logger.error(f"Failed to send Telegram photo via direct API: {e}")
+    else:
+        logger.warning("Telegram credentials not configured. Skipping photo.")
+
 
 async def notify_error(context: str, error: str):
     """

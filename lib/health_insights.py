@@ -1702,21 +1702,27 @@ def _avg_from_jsonb(ts_data: Any) -> Optional[float]:
 
 DAILY_MODEL = "claude-haiku-4-5-20251001"
 
-DAILY_SYSTEM_PROMPT = """You are a concise health analyst for a personal health dashboard.
-You generate a short daily morning briefing based on last night's sleep and yesterday's activity,
-compared against the user's 30-day baselines.
+DAILY_SYSTEM_PROMPT = """You are a concise health analyst. The stats (sleep stages, vitals, activity)
+are shown separately. You ONLY write the insight commentary: what's notable, what to do today.
 
 Rules:
-- Be EXTREMELY concise. 2-5 short lines max.
-- Only mention what's NOTEWORTHY. If everything is normal, say so in one line.
-- Use specific numbers (e.g., "7.2h sleep, score 82").
-- Compare to baselines with arrows or deltas (e.g., "+12% vs avg", "below your 65 avg").
-- If data is missing, say "no data" for that metric, don't speculate.
-- Never repeat what you said yesterday. The previous briefing is provided, avoid redundancy.
+- 2-4 sentences max. No stats repetition (those are shown above your text).
+- Focus on: what changed, what's concerning, what to do today.
+- End with one actionable line (train/rest/hydrate/etc.).
 - Address the user as "you". No greetings, no sign-offs.
-- If there are long-term patterns detected, mention the most relevant one briefly.
-- Include a one-line readiness assessment at the end (e.g., "Good day to train" or "Consider rest today").
-- No markdown headers. Just clean lines with emoji sparingly."""
+- Never repeat yesterday's briefing.
+
+CRITICAL:
+- NEVER use em dashes. Not one. Use commas, periods, colons, or "and" instead.
+- Avoid: "However", "Moreover", "Furthermore", "Additionally".
+- Write like a sharp human coach, not an AI report.
+
+ILLNESS AND RECOVERY:
+- You receive 7 nights of trend data. ALWAYS look at the trend.
+- If ILLNESS/RECOVERY is flagged, lead with health status.
+- A good night after illness = RECOVERY, not "great sleep".
+- NEVER recommend exercise within 3 days of fever.
+- After illness: rest, gradual return, hydration."""
 
 
 def _fetch_daily_data(supabase: Client) -> dict[str, Any]:
@@ -1779,11 +1785,16 @@ def _fetch_daily_data(supabase: Client) -> dict[str, Any]:
 
         # Custom sleep staging (our own algorithm, more accurate than Withings)
         try:
-            custom_resp = supabase.table("health_sleep_custom").select(
+            # Fetch last 7 nights for trend context (not just last night)
+            custom_recent = supabase.table("health_sleep_custom").select(
                 "sleep_date,duration_deep_s,duration_light_s,duration_rem_s,"
-                "duration_awake_s,duration_total_s,custom_sleep_score,algorithm_version"
-            ).order("sleep_date", desc=True).limit(1).execute()
-            data["last_custom_sleep"] = custom_resp.data[0] if custom_resp.data else None
+                "duration_awake_s,duration_total_s,custom_sleep_score,"
+                "hr_mean,hr_min,hr_max,rmssd_mean,parasympathetic_pct,"
+                "svb_ratio,sleep_efficiency_pct,algorithm_version"
+            ).order("sleep_date", desc=True).limit(7).execute()
+            recent_nights = custom_recent.data or []
+            data["last_custom_sleep"] = recent_nights[0] if recent_nights else None
+            data["recent_custom_nights"] = recent_nights
 
             custom_baseline = supabase.table("health_sleep_custom").select(
                 "custom_sleep_score,duration_total_s,duration_deep_s,duration_rem_s"
@@ -1791,7 +1802,17 @@ def _fetch_daily_data(supabase: Client) -> dict[str, Any]:
             data["custom_sleep_baseline"] = custom_baseline.data or []
         except Exception:
             data["last_custom_sleep"] = None
+            data["recent_custom_nights"] = []
             data["custom_sleep_baseline"] = []
+
+        # Recent temperature data (last 7 nights for illness detection)
+        try:
+            temp_recent = supabase.table("health_temperature").select(
+                "date,temp_avg_c,temp_max_c,hr_resting,rmssd_start_avg"
+            ).order("date", desc=True).limit(7).execute()
+            data["recent_temps"] = temp_recent.data or []
+        except Exception:
+            data["recent_temps"] = []
 
         # 30-day HRV baseline
         hrv_baseline = supabase.table("health_sleep_details").select(
@@ -2124,11 +2145,112 @@ def generate_daily_briefing(supabase: Client) -> dict[str, Any]:
             "NOTE: Sleep stages from our custom HRV-based algorithm (validated, kappa>0.5). "
             "Withings native staging has kappa=0.22, do NOT use Withings stage durations."
         )
-        # Add temperature if available
+        # ANS metrics from custom staging
+        if cs.get("hr_mean") is not None:
+            prompt_parts.append(
+                f"ANS METRICS: HR mean={cs.get('hr_mean')}bpm (min={cs.get('hr_min')}, max={cs.get('hr_max')}), "
+                f"RMSSD={cs.get('rmssd_mean')}ms, parasympathetic={cs.get('parasympathetic_pct')}%, "
+                f"SVB ratio={cs.get('svb_ratio')}, efficiency={cs.get('sleep_efficiency_pct')}%"
+            )
+
+        # --- RECENT TREND (last 7 nights) for illness/recovery context ---
+        recent_nights = daily.get("recent_custom_nights", [])
+        if len(recent_nights) > 1:
+            trend_lines = []
+            for n in reversed(recent_nights):  # oldest first
+                nd = str(n.get("sleep_date", ""))[:10]
+                ns = n.get("custom_sleep_score", "?")
+                nhr = n.get("hr_mean", "?")
+                nrmssd = n.get("rmssd_mean", "?")
+                trend_lines.append(f"  {nd}: score={ns}, HR={nhr}, RMSSD={nrmssd}")
+            prompt_parts.append("RECENT 7-NIGHT TREND (oldest to newest):\n" + "\n".join(trend_lines))
+
+        # --- RECENT TEMPERATURE TREND for illness detection ---
+        recent_temps = daily.get("recent_temps", [])
+        if recent_temps:
+            temp_lines = []
+            for t in reversed(recent_temps):  # oldest first
+                td = str(t.get("date", ""))[:10]
+                tavg = t.get("temp_avg_c", "?")
+                tmax = t.get("temp_max_c", "?")
+                thr = t.get("hr_resting", "?")
+                temp_lines.append(f"  {td}: avg={tavg}C, max={tmax}C, resting_HR={thr}")
+            prompt_parts.append("RECENT TEMPERATURE TREND:\n" + "\n".join(temp_lines))
+
+        # --- ILLNESS / RECOVERY DETECTION ---
+        # Check if ANY of the last 5 nights had illness markers
+        alerts = []
+        illness_detected = False
+        illness_nights = []
+        for n in recent_nights:
+            nd = str(n.get("sleep_date", ""))[:10]
+            nhr = float(n.get("hr_mean") or 0)
+            nrmssd = float(n.get("rmssd_mean") or 0)
+            nscore = int(n.get("custom_sleep_score") or 100)
+            if nhr > 55 or nrmssd < 60 or nscore < 80:
+                illness_detected = True
+                reasons = []
+                if nhr > 55:
+                    reasons.append(f"HR {nhr:.0f}")
+                if nrmssd < 60:
+                    reasons.append(f"RMSSD {nrmssd:.0f}")
+                if nscore < 80:
+                    reasons.append(f"score {nscore}")
+                illness_nights.append(f"{nd} ({', '.join(reasons)})")
+
+        # Check temperature for fever
+        fever_nights = []
+        for t in recent_temps:
+            td = str(t.get("date", ""))[:10]
+            tmax = float(t.get("temp_max_c") or 0)
+            if tmax > 37.5:
+                illness_detected = True
+                fever_nights.append(f"{td} (max {tmax:.1f}C)")
+
+        if illness_detected:
+            alert_msg = "ILLNESS/RECOVERY DETECTED in recent nights."
+            if illness_nights:
+                alert_msg += f" Bad sleep nights: {'; '.join(illness_nights)}."
+            if fever_nights:
+                alert_msg += f" Fever nights: {'; '.join(fever_nights)}."
+
+            # Determine if currently recovering or still sick
+            last_hr = float(cs.get("hr_mean") or 0)
+            last_rmssd = float(cs.get("rmssd_mean") or 0)
+            last_score = int(cs.get("custom_sleep_score") or 0)
+            if last_hr < 50 and last_rmssd > 70 and last_score > 85:
+                alert_msg += (
+                    " Last night's vitals have improved, suggesting RECOVERY. "
+                    "Frame the briefing as recovery progress, NOT 'great sleep'. "
+                    "Recommend continued rest, NO intense exercise for at least 2-3 more days. "
+                    "The body needs time even when vitals normalize."
+                )
+            else:
+                alert_msg += (
+                    " Illness appears ONGOING. Lead with this. "
+                    "Recommend rest, hydration, no exercise. Suggest seeing a doctor if persisting."
+                )
+            prompt_parts.append(alert_msg)
+        else:
+            # Single-night early warning (no trend context needed)
+            hr_m = cs.get("hr_mean")
+            rmssd_m = cs.get("rmssd_mean")
+            if hr_m and float(hr_m) > 55:
+                alerts.append(f"HR mean {hr_m}bpm is elevated (baseline ~43)")
+            if rmssd_m and float(rmssd_m) < 60:
+                alerts.append(f"RMSSD {rmssd_m}ms is depressed (baseline ~90)")
+            if alerts:
+                prompt_parts.append(
+                    "EARLY WARNING: " + "; ".join(alerts) + ". "
+                    "This may indicate illness onset, stress, or poor recovery. "
+                    "Flag this prominently in the briefing with specific advice."
+                )
+
+        # Add last night temperature
         nt = daily.get("last_night_temp")
         if nt:
             prompt_parts.append(
-                f"BODY TEMP (sleep): avg={nt.get('temp_avg_c')}°C, "
+                f"BODY TEMP (last night): avg={nt.get('temp_avg_c')}°C, "
                 f"min={nt.get('temp_min_c')}°C, max={nt.get('temp_max_c')}°C"
             )
     elif s:
@@ -2224,7 +2346,7 @@ def generate_daily_briefing(supabase: Client) -> dict[str, Any]:
     try:
         response = client.messages.create(
             model=DAILY_MODEL,
-            max_tokens=500,
+            max_tokens=300,
             system=DAILY_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -2232,7 +2354,7 @@ def generate_daily_briefing(supabase: Client) -> dict[str, Any]:
         # Fallback to Sonnet if Haiku not available
         response = client.messages.create(
             model=ANALYSIS_MODEL,
-            max_tokens=500,
+            max_tokens=300,
             system=DAILY_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -2249,6 +2371,8 @@ def generate_daily_briefing(supabase: Client) -> dict[str, Any]:
         "prompt_tokens": response.usage.input_tokens,
         "completion_tokens": response.usage.output_tokens,
         "generation_time_ms": generation_time,
+        # Raw data for structured Telegram formatting
+        "_daily_data": daily,
     }
 
     try:
@@ -2272,6 +2396,94 @@ def generate_daily_briefing(supabase: Client) -> dict[str, Any]:
 
 
 def format_daily_telegram(result: dict[str, Any]) -> str:
-    """Format daily briefing for Telegram."""
-    text = result.get("briefing_text", "No briefing generated.")
-    return f"☀️ *Morning Health Check*\n\n{text}"
+    """Format daily briefing for Telegram with structured stats block.
+
+    Builds a reliable stats overview programmatically, then appends
+    Claude's analysis as the insight commentary below.
+    """
+    daily = result.get("_daily_data", {})
+    cs = daily.get("last_custom_sleep")
+    s = daily.get("last_sleep")
+    a = daily.get("last_activity")
+    nt = daily.get("last_night_temp") if daily.get("last_night_temp") else (daily.get("recent_temps", [{}])[0] if daily.get("recent_temps") else {})
+    baseline = daily.get("custom_sleep_baseline", [])
+
+    lines = ["*Morning Health Check*", ""]
+
+    # --- Sleep stats ---
+    if cs:
+        score = cs.get("custom_sleep_score", "?")
+        total_h = round(int(cs.get("duration_total_s") or 0) / 3600, 1)
+        deep_h = round(int(cs.get("duration_deep_s") or 0) / 3600, 1)
+        rem_h = round(int(cs.get("duration_rem_s") or 0) / 3600, 1)
+        light_h = round(int(cs.get("duration_light_s") or 0) / 3600, 1)
+        awake_m = round(int(cs.get("duration_awake_s") or 0) / 60)
+        eff = cs.get("sleep_efficiency_pct", "?")
+
+        # Timing from Withings native
+        timing = ""
+        if s and s.get("start_at") and s.get("end_at"):
+            from datetime import datetime as _dt, timedelta as _td
+            try:
+                start = _dt.fromisoformat(str(s["start_at"])) + _td(hours=8)
+                end = _dt.fromisoformat(str(s["end_at"])) + _td(hours=8)
+                timing = f"{start.strftime('%H:%M')} - {end.strftime('%H:%M')}"
+            except Exception:
+                timing = ""
+
+        # Baselines for comparison
+        bl_scores = [x["custom_sleep_score"] for x in baseline if x.get("custom_sleep_score")]
+        avg_score = round(sum(bl_scores) / len(bl_scores), 1) if bl_scores else None
+        delta = f" ({'+' if score > avg_score else ''}{score - avg_score:.0f} vs avg)" if avg_score and score != "?" else ""
+
+        lines.append(f"*Sleep* {score}/100{delta}")
+        lines.append(f"`{timing}  ({total_h}h total)`" if timing else f"`{total_h}h total`")
+        lines.append(f"`Deep {deep_h}h  REM {rem_h}h  Light {light_h}h`")
+        lines.append(f"`Awake {awake_m}m  Efficiency {eff}%`")
+
+    # --- Vitals ---
+    hr = cs.get("hr_mean") if cs else None
+    hr_min = cs.get("hr_min") if cs else None
+    rmssd = cs.get("rmssd_mean") if cs else None
+    para = cs.get("parasympathetic_pct") if cs else None
+    temp = nt.get("temp_avg_c") if nt else None
+    temp_max = nt.get("temp_max_c") if nt else None
+
+    if any(v is not None for v in [hr, rmssd, temp]):
+        lines.append("")
+        lines.append("*Vitals*")
+        vitals_parts = []
+        if hr is not None:
+            vitals_parts.append(f"HR {hr}bpm (min {hr_min})")
+        if rmssd is not None:
+            vitals_parts.append(f"RMSSD {rmssd}ms")
+        if vitals_parts:
+            lines.append(f"`{('  '.join(vitals_parts))}`")
+        vitals_parts2 = []
+        if para is not None:
+            vitals_parts2.append(f"Para {para}%")
+        if temp is not None:
+            t_str = f"Temp {temp}C"
+            if temp_max and float(temp_max) > 37.5:
+                t_str += f" (max {temp_max}C)"
+            vitals_parts2.append(t_str)
+        if vitals_parts2:
+            lines.append(f"`{('  '.join(vitals_parts2))}`")
+
+    # --- Activity ---
+    if a:
+        steps = a.get("steps", 0)
+        cal = a.get("calories_active", 0)
+        ab = daily.get("activity_baseline", [])
+        avg_steps = round(sum(x["steps"] for x in ab if x.get("steps")) / max(len([x for x in ab if x.get("steps")]), 1)) if ab else None
+        delta_steps = f" ({'+' if steps > avg_steps else ''}{round((steps - avg_steps) / avg_steps * 100)}%)" if avg_steps and steps else ""
+        lines.append("")
+        lines.append(f"*Activity*  {steps} steps{delta_steps}, {cal} cal")
+
+    # --- AI Analysis ---
+    lines.append("")
+    insight = result.get("briefing_text", "").strip()
+    if insight:
+        lines.append(f"_{insight}_")
+
+    return "\n".join(lines)

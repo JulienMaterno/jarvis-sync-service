@@ -23,7 +23,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 EPOCH_SECONDS = 30
-ALGORITHM_VERSION = "heuristic_v1"
+ALGORITHM_VERSION = "heuristic_v4"
 STAGE_NAMES = {0: "Wake", 1: "Light", 2: "Deep", 3: "REM"}
 
 
@@ -91,14 +91,18 @@ def resample_to_epochs(
     """Resample irregular time series to uniform epoch grid."""
     epoch_starts = pd.date_range(start=sleep_start, end=sleep_end, freq=f"{epoch_sec}s")
 
+    # Guard against empty series with non-datetime index (causes comparison errors)
+    has_rmssd = len(rmssd) > 0 and isinstance(rmssd.index, pd.DatetimeIndex)
+    has_sdnn = len(sdnn) > 0 and isinstance(sdnn.index, pd.DatetimeIndex)
+
     rows = []
     for i in range(len(epoch_starts) - 1):
         t0 = epoch_starts[i]
         t1 = epoch_starts[i + 1]
 
         hr_epoch = hr[(hr.index >= t0) & (hr.index < t1)]
-        rmssd_epoch = rmssd[(rmssd.index >= t0) & (rmssd.index < t1)]
-        sdnn_epoch = sdnn[(sdnn.index >= t0) & (sdnn.index < t1)]
+        rmssd_epoch = rmssd[(rmssd.index >= t0) & (rmssd.index < t1)] if has_rmssd else pd.Series(dtype=float)
+        sdnn_epoch = sdnn[(sdnn.index >= t0) & (sdnn.index < t1)] if has_sdnn else pd.Series(dtype=float)
 
         row = {
             "epoch_start": t0,
@@ -290,12 +294,18 @@ def run_custom_staging(supabase_client: Any, sleep_date: str) -> dict[str, Any] 
         return None
 
     # Check if already processed with current algorithm version
-    existing = supabase_client.table("health_sleep_custom").select("id,algorithm_version").eq(
-        "sleep_date", sleep_date
-    ).execute()
+    existing = supabase_client.table("health_sleep_custom").select(
+        "id,algorithm_version,rmssd_mean"
+    ).eq("sleep_date", sleep_date).execute()
     if existing.data and existing.data[0].get("algorithm_version") == ALGORITHM_VERSION:
-        logger.debug(f"Already processed {sleep_date} with {ALGORITHM_VERSION}")
-        return None
+        # Allow reprocessing if the previous run had no RMSSD data
+        # (staging was degraded, better data may have arrived since)
+        prev_rmssd = existing.data[0].get("rmssd_mean")
+        if prev_rmssd is not None and float(prev_rmssd) > 0:
+            logger.debug(f"Already processed {sleep_date} with {ALGORITHM_VERSION} (has RMSSD)")
+            return None
+        else:
+            logger.info(f"Reprocessing {sleep_date}: previous run had no RMSSD, checking for new data")
 
     try:
         # Extract time series
@@ -303,6 +313,50 @@ def run_custom_staging(supabase_client: Any, sleep_date: str) -> dict[str, Any] 
         if len(hr) < 10:
             logger.debug(f"Insufficient HR data for {sleep_date}: {len(hr)} samples")
             return None
+
+        # Don't process if RMSSD data is missing: staging quality is too degraded
+        # without HRV data (can't distinguish deep from REM). Wait for next sync
+        # cycle when Withings may have uploaded the detailed data.
+        if len(rmssd) < 10:
+            logger.info(
+                f"Skipping {sleep_date}: only {len(rmssd)} RMSSD samples "
+                f"(need 10+). Will retry on next sync when more data may be available."
+            )
+            return None
+
+        # Split into sessions: if there's a gap >3h between consecutive epochs,
+        # they belong to different sleep sessions. Keep only the longest session
+        # (the main overnight sleep).
+        withings_stages_df = withings_stages_df.sort_values("start").reset_index(drop=True)
+        session_ids = [0]
+        for i in range(1, len(withings_stages_df)):
+            gap = (withings_stages_df.loc[i, "start"] - withings_stages_df.loc[i - 1, "end"]).total_seconds()
+            if gap > 3 * 3600:
+                session_ids.append(session_ids[-1] + 1)
+            else:
+                session_ids.append(session_ids[-1])
+        withings_stages_df["session"] = session_ids
+
+        if withings_stages_df["session"].nunique() > 1:
+            # Pick the longest session by total duration
+            session_durations = {}
+            for sid, grp in withings_stages_df.groupby("session"):
+                dur = (grp["end"].max() - grp["start"].min()).total_seconds()
+                session_durations[sid] = dur
+            main_session = max(session_durations, key=session_durations.get)
+            dropped = len(withings_stages_df) - (withings_stages_df["session"] == main_session).sum()
+            withings_stages_df = withings_stages_df[withings_stages_df["session"] == main_session].reset_index(drop=True)
+            logger.info(
+                f"Split {sleep_date}: {len(session_durations)} sessions detected, "
+                f"kept session {main_session} ({session_durations[main_session] / 3600:.1f}h), "
+                f"dropped {dropped} epochs from other sessions"
+            )
+            # Re-extract time series for the main session only
+            main_epochs = [e for i, e in enumerate(epochs) if session_ids[i] == main_session]
+            hr, rmssd, sdnn, _ = extract_timeseries(main_epochs)
+            if len(hr) < 10:
+                logger.debug(f"Insufficient HR data after session split for {sleep_date}")
+                return None
 
         sleep_start = withings_stages_df["start"].min()
         sleep_end = withings_stages_df["end"].max()
@@ -328,15 +382,41 @@ def run_custom_staging(supabase_client: Any, sleep_date: str) -> dict[str, Any] 
         duration_total_s = total_epochs * EPOCH_SECONDS
 
         # Compute custom sleep score (0-100)
+        # Structure (60%): efficiency + deep + REM proportions
+        # Autonomic health (40%): HR, RMSSD, parasympathetic compared to baselines
         sleep_pct = (duration_total_s - duration_awake_s) / max(duration_total_s, 1)
         deep_pct = duration_deep_s / max(duration_total_s - duration_awake_s, 1)
         rem_pct = duration_rem_s / max(duration_total_s - duration_awake_s, 1)
-        # Score: efficiency (40%) + deep proportion (30%) + REM proportion (30%)
-        # Targets: efficiency > 85%, deep 15-25%, REM 20-25%
-        eff_score = min(sleep_pct / 0.85, 1.0) * 40
-        deep_score = min(deep_pct / 0.20, 1.0) * 30
-        rem_score = min(rem_pct / 0.22, 1.0) * 30
-        custom_sleep_score = int(min(100, eff_score + deep_score + rem_score))
+
+        # Structure sub-score (0-60)
+        eff_sub = min(sleep_pct / 0.85, 1.0) * 24
+        deep_sub = min(deep_pct / 0.20, 1.0) * 18
+        rem_sub = min(rem_pct / 0.22, 1.0) * 18
+        structure_score = eff_sub + deep_sub + rem_sub
+
+        # Autonomic sub-score (0-40): penalize elevated HR, low RMSSD, low para%
+        # Baselines: HR ~43 bpm, RMSSD ~90, parasympathetic ~55%
+        # These are Aaron's personal baselines from healthy nights.
+        ans_score = 40.0
+        hr_vals_for_score = epoch_df["hr_mean"].dropna()
+        rmssd_vals_for_score = epoch_df["rmssd_mean"].dropna()
+
+        if len(hr_vals_for_score) > 0:
+            hr_mean = float(hr_vals_for_score.mean())
+            # Penalty: each bpm above 50 costs 1 point (max 20 penalty)
+            # Normal nights ~43 bpm = 0 penalty. Fever at 67 bpm = 17 penalty.
+            hr_penalty = min(max(hr_mean - 50, 0) * 1.0, 20)
+            ans_score -= hr_penalty
+
+        if len(rmssd_vals_for_score) > 0:
+            rmssd_mean = float(rmssd_vals_for_score.mean())
+            # Penalty: each ms below 70 costs 0.5 points (max 15 penalty)
+            # Normal nights ~90 = 0 penalty. Fever at 40 = 15 penalty.
+            rmssd_penalty = min(max(70 - rmssd_mean, 0) * 0.5, 15)
+            ans_score -= rmssd_penalty
+
+        ans_score = max(ans_score, 0)
+        custom_sleep_score = int(min(100, structure_score + ans_score))
 
         # Build epochs JSONB array for dashboard hypnograms
         epoch_records = []
@@ -347,6 +427,83 @@ def run_custom_staging(supabase_client: Any, sleep_date: str) -> dict[str, Any] 
                 "hr": round(row["hr_mean"], 1) if pd.notna(row["hr_mean"]) else None,
                 "rmssd": round(row["rmssd_mean"], 1) if pd.notna(row["rmssd_mean"]) else None,
             })
+
+        # --- Compute ANS metrics for pattern recognition ---
+        hr_vals = epoch_df["hr_mean"].dropna()
+        rmssd_vals = epoch_df["rmssd_mean"].dropna()
+        sdnn_vals = epoch_df.get("sdnn_mean", pd.Series(dtype=float)).dropna()
+
+        # SVB ratio (sympathovagal balance): SDNN/RMSSD as LF/HF proxy
+        if len(sdnn_vals) > 0 and len(rmssd_vals) > 0:
+            svb_ratio = round(float(sdnn_vals.mean() / max(rmssd_vals.mean(), 1)), 2)
+        else:
+            svb_ratio = None
+
+        # Parasympathetic dominance: % of epochs where RMSSD > SDNN
+        if len(sdnn_vals) > 0 and len(rmssd_vals) > 0:
+            aligned = pd.DataFrame({"rmssd": epoch_df["rmssd_mean"], "sdnn": epoch_df.get("sdnn_mean", pd.Series(dtype=float))}).dropna()
+            if len(aligned) > 0:
+                para_pct = round(float((aligned["rmssd"] > aligned["sdnn"]).mean() * 100), 1)
+            else:
+                para_pct = None
+        else:
+            para_pct = None
+
+        # RMSSD trend slope (positive = improving recovery through the night)
+        if len(rmssd_vals) > 10:
+            x = np.arange(len(rmssd_vals))
+            slope = float(np.polyfit(x, rmssd_vals.values, 1)[0])
+            rmssd_trend = round(slope, 4)
+        else:
+            rmssd_trend = None
+
+        # HR stats
+        hr_mean_val = round(float(hr_vals.mean()), 1) if len(hr_vals) > 0 else None
+        hr_min_val = round(float(hr_vals.min()), 1) if len(hr_vals) > 0 else None
+        hr_max_val = round(float(hr_vals.max()), 1) if len(hr_vals) > 0 else None
+
+        # Micro-awakenings: HR spikes > mean + 3*std during sleep
+        micro_awakenings = []
+        if len(hr_vals) > 20:
+            hr_threshold = hr_vals.mean() + 3 * hr_vals.std()
+            for idx_ma, row_ma in epoch_df.iterrows():
+                if pd.notna(row_ma["hr_mean"]) and row_ma["hr_mean"] > hr_threshold:
+                    if custom_stages.iloc[idx_ma] != 0:  # Not already wake
+                        micro_awakenings.append({
+                            "ts": row_ma["epoch_start"].isoformat(),
+                            "hr": round(row_ma["hr_mean"], 1),
+                        })
+        micro_count = len(micro_awakenings)
+
+        # Sleep efficiency
+        actual_sleep_s = duration_total_s - duration_awake_s
+        sleep_eff = round(actual_sleep_s / max(duration_total_s, 1) * 100, 1)
+
+        # Deep in first 3 hours
+        first_3h_epochs = min(int(3 * 3600 / EPOCH_SECONDS), len(custom_stages))
+        first_3h_deep = int((custom_stages.iloc[:first_3h_epochs] == 2).sum())
+        deep_first_3h = round(first_3h_deep / max(first_3h_epochs, 1) * 100, 1)
+
+        # Per-stage ANS metrics
+        per_stage_ans = {}
+        for stage_code, stage_name in STAGE_NAMES.items():
+            mask = custom_stages == stage_code
+            if mask.sum() > 0:
+                stage_hr = epoch_df.loc[mask, "hr_mean"].dropna()
+                stage_rmssd = epoch_df.loc[mask, "rmssd_mean"].dropna()
+                stage_sdnn = epoch_df.loc[mask, "sdnn_mean"].dropna() if "sdnn_mean" in epoch_df else pd.Series(dtype=float)
+                stage_svb = round(float(stage_sdnn.mean() / max(stage_rmssd.mean(), 1)), 2) if len(stage_sdnn) > 0 and len(stage_rmssd) > 0 else None
+                per_stage_ans[stage_name] = {
+                    "hr": round(float(stage_hr.mean()), 1) if len(stage_hr) > 0 else None,
+                    "rmssd": round(float(stage_rmssd.mean()), 1) if len(stage_rmssd) > 0 else None,
+                    "svb": stage_svb,
+                }
+
+        logger.info(
+            f"ANS metrics {sleep_date}: SVB={svb_ratio}, Para={para_pct}%, "
+            f"HR={hr_mean_val}/{hr_min_val}-{hr_max_val}, "
+            f"micro-awakenings={micro_count}, eff={sleep_eff}%"
+        )
 
         # Upsert to health_sleep_custom
         record = {
@@ -361,6 +518,19 @@ def run_custom_staging(supabase_client: Any, sleep_date: str) -> dict[str, Any] 
             "epoch_count": len(epoch_records),
             "algorithm_version": ALGORITHM_VERSION,
             "processed_at": datetime.now(timezone.utc).isoformat(),
+            "svb_ratio": svb_ratio,
+            "parasympathetic_pct": para_pct,
+            "rmssd_mean": round(float(rmssd_vals.mean()), 1) if len(rmssd_vals) > 0 else None,
+            "rmssd_trend_slope": rmssd_trend,
+            "hr_mean": hr_mean_val,
+            "hr_min": hr_min_val,
+            "hr_max": hr_max_val,
+            "micro_awakening_count": micro_count,
+            "micro_awakenings": micro_awakenings if micro_awakenings else None,
+            "cycle_count": None,  # Computed by analytics, not staging
+            "deep_first_3h_pct": deep_first_3h,
+            "sleep_efficiency_pct": sleep_eff,
+            "per_stage_ans": per_stage_ans if per_stage_ans else None,
         }
 
         supabase_client.table("health_sleep_custom").upsert(
